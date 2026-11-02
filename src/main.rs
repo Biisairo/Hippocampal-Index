@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use smem::backends::{build_embedder, build_vector_store};
+use smem::backends::{build_embedder, vector_source};
 use smem::client::{request, run_hook};
 use smem::config::{Config, Paths};
 use smem::daemon;
@@ -51,6 +51,8 @@ enum Command {
     Daemon,
     /// 데몬 상태
     Status,
+    /// 현재 설정의 임베더와 벡터 저장소로 전체를 다시 색인한다.
+    Reindex,
     /// settings.json에 넣을 hook 설정
     HooksConfig,
     /// launchd plist
@@ -123,6 +125,7 @@ fn main() -> ExitCode {
             },
         ),
         Command::Status => query_daemon(&paths, &Request::Status),
+        Command::Reindex => query_daemon(&paths, &Request::Reindex),
         Command::Daemon => run_daemon(paths),
         Command::HooksConfig => {
             let budget_ms = match Config::load(&paths.config()) {
@@ -157,18 +160,11 @@ fn query_daemon(paths: &Paths, req: &Request) -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Response::Status(s)) => {
-            println!("iterations: {}", s.iterations);
-            println!("results: {}", s.results);
-            println!("embed_jobs: {}", s.embed_jobs);
-            println!("spool_pending: {}", s.spool_pending);
-            println!("vectors: {}", s.vectors);
-            println!("embed_model: {}", s.embed_model);
-            println!("compatibility: {}", s.compatibility);
-            if s.compatibility == "mismatch" {
-                println!(
-                    "벡터 저장소의 모델 또는 차원이 설정과 다릅니다. 재색인이 필요합니다. 그동안 키워드 검색만 동작합니다."
-                );
-            }
+            print!("{}", s.render());
+            ExitCode::SUCCESS
+        }
+        Ok(Response::Done) => {
+            println!("재색인을 시작했습니다. 진행 상태는 `smem status`로 확인할 수 있습니다.");
             ExitCode::SUCCESS
         }
         Ok(Response::Error { message }) => fail(&message),
@@ -186,11 +182,11 @@ fn run_daemon(paths: Paths) -> ExitCode {
         Ok(e) => e,
         Err(e) => return fail(&e.to_string()),
     };
-    let vectors = match build_vector_store(&config, &paths) {
-        Ok(v) => v,
+    let source = match vector_source(&config, &paths) {
+        Ok(s) => s,
         Err(e) => return fail(&e.to_string()),
     };
-    match daemon::start(paths, config, embedder, vectors) {
+    match daemon::start(paths, config, embedder, source) {
         Ok(handle) => {
             handle.wait();
             ExitCode::SUCCESS

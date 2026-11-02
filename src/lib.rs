@@ -6,6 +6,7 @@ pub mod daemon;
 pub mod embed_text;
 pub mod embedder;
 pub mod fsutil;
+pub mod generations;
 pub mod indexer;
 pub mod ingest;
 pub mod lance;

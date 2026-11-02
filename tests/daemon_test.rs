@@ -2,11 +2,12 @@ mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::*;
 use serde_json::json;
+use smem::backends::{VectorSource, vector_source};
 use smem::client::{request, run_hook};
 use smem::config::{Config, Paths};
 use smem::daemon::{DaemonError, DaemonHandle, start};
@@ -48,9 +49,26 @@ fn config() -> Config {
     .unwrap()
 }
 
+/// 첫 번째 열기에는 주어진 저장소를, 이후(재색인 세대)에는 새 메모리 저장소를 돌려준다.
+fn memory_source(paths: &Paths, initial: Arc<dyn VectorStore>) -> VectorSource {
+    let first = Mutex::new(Some(initial));
+    VectorSource {
+        base: paths.vectors("default"),
+        open: Arc::new(move |_dir: &Path| {
+            let initial = first.lock().unwrap().take();
+            Ok(initial.unwrap_or_else(|| Arc::new(MemoryVectorStore::default())))
+        }),
+    }
+}
+
 fn launch(paths: &Paths, vectors: Arc<dyn VectorStore>) -> Result<DaemonHandle, DaemonError> {
     let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(256, 8_000));
-    start(paths.clone(), config(), embedder, vectors)
+    start(
+        paths.clone(),
+        config(),
+        embedder,
+        memory_source(paths, vectors),
+    )
 }
 
 fn status(paths: &Paths) -> StatusInfo {
@@ -301,5 +319,158 @@ fn ingest_error_is_reported_and_daemon_keeps_running() {
         fs::read_dir(e.paths.logs()).unwrap().count() > 0,
         "오류 로그 기록"
     );
+    handle.shutdown();
+}
+
+// ---- FR-SWP-5, 9, 10 ----
+
+fn wait_reindex(paths: &Paths) -> StatusInfo {
+    let mut last = status(paths);
+    wait_until(|| {
+        last = status(paths);
+        last.reindex != "running" && last.reindex != "idle"
+    });
+    last
+}
+
+fn mismatched_store() -> MemoryVectorStore {
+    let vectors = MemoryVectorStore::default();
+    vectors
+        .upsert(&[VectorRecord {
+            kind: RecordKind::Iteration,
+            ref_id: "old".into(),
+            chunk_index: 0,
+            vector: vec![1.0, 0.0, 0.0],
+            embed_model: "other-model".into(),
+            cwd: None,
+            session_id: None,
+            ts: String::new(),
+        }])
+        .unwrap();
+    vectors
+}
+
+#[test]
+fn reindex_recovers_from_mismatch() {
+    let e = env();
+    let handle = launch(&e.paths, Arc::new(mismatched_store())).unwrap();
+    ingest(&e.paths, &e.transcript, HookEvent::Stop);
+    assert_eq!(status(&e.paths).compatibility, "mismatch");
+    assert_eq!(
+        request(&e.paths.socket(), &Request::Reindex, TIMEOUT).unwrap(),
+        Response::Done
+    );
+    let done = wait_reindex(&e.paths);
+    assert_eq!(done.reindex, "done");
+    assert_eq!(done.compatibility, "compatible");
+    wait_until(|| status(&e.paths).embed_jobs == 0);
+    assert_eq!(
+        status(&e.paths).vectors,
+        4,
+        "반복 2 + 결과 2, 이전 모델 벡터 없음"
+    );
+
+    let embed_text = RecordStore::open(&e.paths.records())
+        .unwrap()
+        .iterations_for_prompt("8f64252a-0037-484d-a451-35aa2c0076ed")
+        .unwrap()[1]
+        .embed_text
+        .clone();
+    let input = json!({"session_id": "other", "transcript_path": "/t", "cwd": S2_CWD, "prompt": embed_text}).to_string();
+    assert!(
+        run_hook(
+            &e.paths,
+            Duration::from_secs(5),
+            "user-prompt-submit",
+            &input
+        )
+        .is_some()
+    );
+    handle.shutdown();
+}
+
+struct SlowEmbedder(HashEmbedder);
+
+impl Embedder for SlowEmbedder {
+    fn model_id(&self) -> &str {
+        self.0.model_id()
+    }
+    fn dimension(&self) -> usize {
+        self.0.dimension()
+    }
+    fn max_input_tokens(&self) -> usize {
+        self.0.max_input_tokens()
+    }
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, smem::embedder::EmbedError> {
+        std::thread::sleep(Duration::from_millis(150));
+        self.0.embed(texts)
+    }
+}
+
+#[test]
+fn concurrent_reindex_is_rejected() {
+    let e = env();
+    let embedder: Arc<dyn Embedder> = Arc::new(SlowEmbedder(HashEmbedder::new(256, 8_000)));
+    let handle = start(
+        e.paths.clone(),
+        config(),
+        embedder,
+        memory_source(&e.paths, Arc::new(MemoryVectorStore::default())),
+    )
+    .unwrap();
+    ingest(&e.paths, &e.transcript, HookEvent::Stop);
+    assert_eq!(
+        request(&e.paths.socket(), &Request::Reindex, TIMEOUT).unwrap(),
+        Response::Done
+    );
+    assert!(matches!(
+        request(&e.paths.socket(), &Request::Reindex, TIMEOUT).unwrap(),
+        Response::Error { .. }
+    ));
+    assert_eq!(wait_reindex(&e.paths).reindex, "done");
+    handle.shutdown();
+}
+
+#[test]
+fn lancedb_reindex_switches_generation_and_survives_restart() {
+    let e = env();
+    let config = Config::parse(
+        "[embedder]\nbackend = \"hash\"\ndimension = 256\n[vector]\nbackend = \"lancedb\"\n",
+    )
+    .unwrap();
+    let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(256, 8_000));
+    let handle = start(
+        e.paths.clone(),
+        config.clone(),
+        embedder.clone(),
+        vector_source(&config, &e.paths).unwrap(),
+    )
+    .unwrap();
+    ingest(&e.paths, &e.transcript, HookEvent::Stop);
+    wait_until(|| status(&e.paths).embed_jobs == 0);
+    let base = e.paths.vectors("default");
+    let before = fs::read_to_string(base.join("ACTIVE")).unwrap();
+    request(&e.paths.socket(), &Request::Reindex, TIMEOUT).unwrap();
+    assert_eq!(wait_reindex(&e.paths).reindex, "done");
+    let after = fs::read_to_string(base.join("ACTIVE")).unwrap();
+    assert_ne!(before, after);
+    assert_eq!(status(&e.paths).vectors, 4);
+    handle.shutdown();
+
+    let handle = start(
+        e.paths.clone(),
+        config.clone(),
+        embedder,
+        vector_source(&config, &e.paths).unwrap(),
+    )
+    .unwrap();
+    let st = status(&e.paths);
+    assert_eq!((st.vectors, st.compatibility.as_str()), (4, "compatible"));
+    let generations = fs::read_dir(&base)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|d| d.path().is_dir())
+        .count();
+    assert_eq!(generations, 1, "시작할 때 이전 세대 정리");
     handle.shutdown();
 }

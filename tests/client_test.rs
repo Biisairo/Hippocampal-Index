@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use smem::backends::{BackendError, build_embedder, build_vector_store};
+use smem::backends::{BackendError, build_embedder, vector_source};
 use smem::client::{HookAction, inject_output, parse_hook, run_hook};
 use smem::config::{Config, Paths};
+use smem::generations::active_dir;
 use smem::ingest::{HookEvent, IngestRequest};
 use smem::protocol::{Request, Response, StatusInfo};
 use smem::search::{SearchKind, SearchRequest};
@@ -142,6 +143,7 @@ fn protocol_roundtrip() {
         vectors: 4,
         embed_model: "m".into(),
         compatibility: "compatible".into(),
+        reindex: "idle".into(),
     });
     for r in [
         Response::Done,
@@ -307,23 +309,22 @@ fn backend_selection() {
         "[embedder]\nbackend = \"hash\"\ndimension = 16\n[vector]\nbackend = \"memory\"\n",
     )
     .unwrap();
-    let e = build_embedder(&config).unwrap();
-    assert_eq!(e.dimension(), 16);
-    assert_eq!(
-        build_vector_store(&config, &paths)
-            .unwrap()
-            .count()
-            .unwrap(),
-        0
-    );
+    assert_eq!(build_embedder(&config).unwrap().dimension(), 16);
+    let memory = vector_source(&config, &paths).unwrap();
+    let store = (memory.open)(&active_dir(&memory.base).unwrap()).unwrap();
+    assert_eq!(store.count().unwrap(), 0);
+
     let real = Config::default();
     assert_eq!(
         build_embedder(&real).unwrap().model_id(),
         "qwen3-embedding:0.6b"
     );
-    let lance = build_vector_store(&real, &paths).unwrap();
-    assert_eq!(lance.count().unwrap(), 0);
-    assert!(paths.vectors("default").exists(), "LanceDB 디렉터리 생성");
+    let lance = vector_source(&real, &paths).unwrap();
+    assert_eq!(lance.base, paths.vectors("default"));
+    let generation = active_dir(&lance.base).unwrap();
+    assert_eq!((lance.open)(&generation).unwrap().count().unwrap(), 0);
+    assert!(generation.starts_with(paths.vectors("default")));
+
     config.embedder.backend = "nope".into();
     assert!(matches!(
         build_embedder(&config),
@@ -331,7 +332,51 @@ fn backend_selection() {
     ));
     config.vector.backend = "nope".into();
     assert!(matches!(
-        build_vector_store(&config, &paths),
+        vector_source(&config, &paths),
         Err(BackendError::Unknown(_))
     ));
+}
+
+// ---- FR-SWP-10 ----
+
+fn status_info(iterations: u64, vectors: u64, compatibility: &str, reindex: &str) -> StatusInfo {
+    StatusInfo {
+        iterations,
+        results: 0,
+        embed_jobs: 0,
+        spool_pending: 0,
+        vectors,
+        embed_model: "m".into(),
+        compatibility: compatibility.into(),
+        reindex: reindex.into(),
+    }
+}
+
+#[test]
+fn status_render_shows_fields_and_reindex_hints() {
+    let ok = status_info(3, 5, "compatible", "idle").render();
+    assert!(ok.contains("iterations: 3") && ok.contains("reindex: idle"));
+    assert!(!ok.contains("smem reindex"));
+    assert!(
+        status_info(3, 0, "empty", "idle")
+            .render()
+            .contains("smem reindex"),
+        "벡터 0개 + 반복 있음"
+    );
+    assert!(
+        status_info(3, 5, "mismatch", "idle")
+            .render()
+            .contains("smem reindex")
+    );
+    assert!(
+        !status_info(3, 5, "mismatch", "running")
+            .render()
+            .contains("smem reindex"),
+        "진행 중이면 안내 생략"
+    );
+    assert!(
+        !status_info(0, 0, "empty", "idle")
+            .render()
+            .contains("smem reindex")
+    );
 }

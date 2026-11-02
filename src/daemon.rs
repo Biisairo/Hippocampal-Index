@@ -5,23 +5,25 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::backends::VectorSource;
 use crate::config::{Config, Paths};
 use crate::embedder::Embedder;
 use crate::fsutil::{ensure_private_dir, open_private_append, set_private_file};
-use crate::indexer::{ChunkConfig, Compatibility, compatibility, process_embed_jobs};
+use crate::generations::{activate, active_dir, cleanup_inactive, new_generation};
+use crate::indexer::{ChunkConfig, Compatibility, compatibility, process_embed_jobs, reindex};
 use crate::ingest::{IngestOptions, IngestRequest, ingest};
-use crate::protocol::{Request, Response, StatusInfo};
+use crate::protocol::{COMPAT_MISMATCH, REINDEX_RUNNING, Request, Response, StatusInfo};
 use crate::redact::Redactor;
 use crate::search::{
     InjectConfig, VectorBackends, build_injection, render_hits, render_turn, search,
 };
 use crate::spool;
 use crate::store::RecordStore;
-use crate::vector::VectorStore;
+use crate::vector::{VectorError, VectorStore};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
@@ -35,6 +37,8 @@ pub enum DaemonError {
     Store(#[from] crate::store::StoreError),
     #[error(transparent)]
     Index(#[from] crate::indexer::IndexError),
+    #[error(transparent)]
+    Vector(#[from] VectorError),
 }
 
 const POLL: Duration = Duration::from_millis(20);
@@ -42,7 +46,10 @@ const INGEST_POLL: Duration = Duration::from_millis(100);
 const EMBED_IDLE: Duration = Duration::from_secs(1);
 const EMBED_RETRY: Duration = Duration::from_secs(5);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+const REINDEX_PAGE: usize = 256;
 const LOG_FILE: &str = "smemd.log";
+const REINDEX_IDLE: &str = "idle";
+const REINDEX_DONE: &str = "done";
 
 type IngestJob = (IngestRequest, Sender<Response>);
 
@@ -50,13 +57,21 @@ struct Shared {
     paths: Paths,
     config: Config,
     embedder: Arc<dyn Embedder>,
-    vectors: Arc<dyn VectorStore>,
+    source: VectorSource,
+    vectors: RwLock<Arc<dyn VectorStore>>,
     compat: Mutex<Compatibility>,
     ingest_tx: Sender<IngestJob>,
+    notify_tx: Sender<()>,
+    reindexing: AtomicBool,
+    reindex_state: Mutex<String>,
     stop: AtomicBool,
 }
 
 impl Shared {
+    fn vectors(&self) -> Option<Arc<dyn VectorStore>> {
+        self.vectors.read().ok().map(|v| Arc::clone(&v))
+    }
+
     fn compat(&self) -> Compatibility {
         self.compat.lock().map_or(
             Compatibility::Mismatch {
@@ -68,13 +83,37 @@ impl Shared {
     }
 
     /// 호환되지 않으면 벡터 검색을 끄고 FTS 전용으로 동작한다. (FR-SWP-6)
-    fn backends(&self) -> Option<VectorBackends<'_>> {
+    fn backends<'a>(&'a self, vectors: &'a dyn VectorStore) -> Option<VectorBackends<'a>> {
         match self.compat() {
             Compatibility::Mismatch { .. } => None,
             Compatibility::Empty | Compatibility::Compatible => Some(VectorBackends {
                 embedder: self.embedder.as_ref(),
-                vectors: self.vectors.as_ref(),
+                vectors,
             }),
+        }
+    }
+
+    fn refresh_compat(&self) {
+        let Some(vectors) = self.vectors() else {
+            return;
+        };
+        if let Ok(c) = compatibility(self.embedder.as_ref(), vectors.as_ref())
+            && let Ok(mut current) = self.compat.lock()
+        {
+            *current = c;
+        }
+    }
+
+    fn chunking(&self) -> ChunkConfig {
+        ChunkConfig {
+            max_tokens: self.config.chunking.max_tokens,
+            chars_per_token: self.config.chunking.chars_per_token,
+        }
+    }
+
+    fn set_reindex_state(&self, state: &str) {
+        if let Ok(mut s) = self.reindex_state.lock() {
+            *s = state.to_string();
         }
     }
 
@@ -116,7 +155,7 @@ pub fn start(
     paths: Paths,
     config: Config,
     embedder: Arc<dyn Embedder>,
-    vectors: Arc<dyn VectorStore>,
+    source: VectorSource,
 ) -> Result<DaemonHandle, DaemonError> {
     for dir in [paths.root.clone(), paths.spool(), paths.logs()] {
         ensure_private_dir(&dir)?;
@@ -135,6 +174,9 @@ pub fn start(
         kind: e.kind,
         message: e.message,
     })?;
+    let active = active_dir(&source.base)?;
+    let removed = cleanup_inactive(&source.base)?;
+    let vectors = (source.open)(&active)?;
     let socket = paths.socket();
     if fs::symlink_metadata(&socket).is_ok() {
         fs::remove_file(&socket)?;
@@ -150,22 +192,26 @@ pub fn start(
         paths,
         config,
         embedder,
-        vectors,
+        source,
+        vectors: RwLock::new(vectors),
         compat: Mutex::new(compat),
         ingest_tx,
+        notify_tx,
+        reindexing: AtomicBool::new(false),
+        reindex_state: Mutex::new(REINDEX_IDLE.to_string()),
         stop: AtomicBool::new(false),
     });
+    for dir in removed {
+        shared.log(&format!(
+            "removed inactive vector generation {}",
+            dir.display()
+        ));
+    }
     let ingest_store = RecordStore::open(&shared.paths.records())?;
     let embed_store = RecordStore::open(&shared.paths.records())?;
 
     let threads = vec![
-        spawn_ingest(
-            Arc::clone(&shared),
-            ingest_store,
-            redactor,
-            ingest_rx,
-            notify_tx,
-        ),
+        spawn_ingest(Arc::clone(&shared), ingest_store, redactor, ingest_rx),
         spawn_embed(Arc::clone(&shared), embed_store, notify_rx),
         spawn_accept(Arc::clone(&shared), listener),
     ];
@@ -182,7 +228,6 @@ fn spawn_ingest(
     mut store: RecordStore,
     redactor: Redactor,
     rx: Receiver<IngestJob>,
-    notify: Sender<()>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let options = IngestOptions {
@@ -198,7 +243,7 @@ fn spawn_ingest(
                     }
                 }
             };
-            let _ = notify.send(());
+            let _ = shared.notify_tx.send(());
             resp
         };
         match spool::take_all(&shared.paths.spool()) {
@@ -226,36 +271,38 @@ fn spawn_ingest(
     })
 }
 
-/// 임베딩 작업 스레드. 수집이 끝날 때마다 깨어나고, 실패하면 일정 시간 뒤 재시도한다. (FR-STO-7, FR-DMN-6)
+/// 임베딩 작업 스레드. 수집이 끝날 때마다 깨어나고, 실패하면 일정 시간 뒤 재시도한다.
+/// 호환되지 않거나 재색인 중이면 작업을 처리하지 않는다. (FR-STO-7, FR-DMN-6, FR-SWP-5)
 fn spawn_embed(
     shared: Arc<Shared>,
     mut store: RecordStore,
     notify: Receiver<()>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        let chunking = ChunkConfig {
-            max_tokens: shared.config.chunking.max_tokens,
-            chars_per_token: shared.config.chunking.chars_per_token,
-        };
+        let chunking = shared.chunking();
         let batch = shared.config.index.job_batch;
         let threshold = shared.config.index.vector_index_threshold;
         let mut next_index_at = threshold;
         while !shared.stop.load(Ordering::SeqCst) {
             let mut wait = EMBED_IDLE;
-            if !matches!(shared.compat(), Compatibility::Mismatch { .. }) {
+            let paused = shared.reindexing.load(Ordering::SeqCst)
+                || matches!(shared.compat(), Compatibility::Mismatch { .. });
+            if let (false, Some(vectors)) = (paused, shared.vectors()) {
                 loop {
-                    if shared.stop.load(Ordering::SeqCst) {
-                        return;
+                    if shared.stop.load(Ordering::SeqCst)
+                        || shared.reindexing.load(Ordering::SeqCst)
+                    {
+                        break;
                     }
                     match process_embed_jobs(
                         &mut store,
                         shared.embedder.as_ref(),
-                        shared.vectors.as_ref(),
+                        vectors.as_ref(),
                         chunking,
                         batch,
                     ) {
                         Ok(0) => break,
-                        Ok(_) => refresh_compat(&shared),
+                        Ok(_) => shared.refresh_compat(),
                         Err(e) => {
                             shared.log(&format!("embedding failed: {e}"));
                             wait = EMBED_RETRY;
@@ -263,10 +310,10 @@ fn spawn_embed(
                         }
                     }
                 }
-                if let Ok(count) = shared.vectors.count()
+                if let Ok(count) = vectors.count()
                     && count >= next_index_at
                 {
-                    match shared.vectors.ensure_index() {
+                    match vectors.ensure_index() {
                         Ok(()) => next_index_at = count.saturating_mul(2),
                         Err(e) => shared.log(&format!("vector index failed: {e}")),
                     }
@@ -285,12 +332,49 @@ fn spawn_embed(
     })
 }
 
-fn refresh_compat(shared: &Shared) {
-    if let Ok(c) = compatibility(shared.embedder.as_ref(), shared.vectors.as_ref())
-        && let Ok(mut current) = shared.compat.lock()
-    {
-        *current = c;
+/// 새 세대에 전체를 다시 색인하고 ACTIVE를 바꿔 전환한다. (FR-SWP-5)
+fn start_reindex(shared: &Arc<Shared>) -> Response {
+    if shared.reindexing.swap(true, Ordering::SeqCst) {
+        return Response::Error {
+            message: "reindex already running".into(),
+        };
     }
+    shared.set_reindex_state(REINDEX_RUNNING);
+    let shared = Arc::clone(shared);
+    thread::spawn(move || {
+        let outcome = (|| -> Result<Arc<dyn VectorStore>, String> {
+            let generation = new_generation(&shared.source.base).map_err(|e| e.to_string())?;
+            let target = (shared.source.open)(&generation).map_err(|e| e.to_string())?;
+            let records = RecordStore::open(&shared.paths.records()).map_err(|e| e.to_string())?;
+            reindex(
+                &records,
+                shared.embedder.as_ref(),
+                target.as_ref(),
+                shared.chunking(),
+                REINDEX_PAGE,
+            )
+            .map_err(|e| e.to_string())?;
+            activate(&shared.source.base, &generation).map_err(|e| e.to_string())?;
+            Ok(target)
+        })();
+        match outcome {
+            Ok(target) => {
+                if let Ok(mut current) = shared.vectors.write() {
+                    *current = target;
+                }
+                shared.refresh_compat();
+                shared.set_reindex_state(REINDEX_DONE);
+                shared.log("reindex done");
+            }
+            Err(message) => {
+                shared.log(&format!("reindex failed: {message}"));
+                shared.set_reindex_state(&format!("failed: {message}"));
+            }
+        }
+        shared.reindexing.store(false, Ordering::SeqCst);
+        let _ = shared.notify_tx.send(());
+    });
+    Response::Done
 }
 
 fn spawn_accept(shared: Arc<Shared>, listener: UnixListener) -> JoinHandle<()> {
@@ -311,7 +395,7 @@ fn spawn_accept(shared: Arc<Shared>, listener: UnixListener) -> JoinHandle<()> {
     })
 }
 
-fn handle_connection(shared: &Shared, stream: UnixStream) {
+fn handle_connection(shared: &Arc<Shared>, stream: UnixStream) {
     if stream.set_nonblocking(false).is_err()
         || stream.set_read_timeout(Some(CONNECTION_TIMEOUT)).is_err()
     {
@@ -337,30 +421,39 @@ fn handle_connection(shared: &Shared, stream: UnixStream) {
     }
 }
 
-fn handle_request(shared: &Shared, req: Request) -> Response {
-    if let Request::Ingest(ingest_req) = req {
-        let (tx, rx) = mpsc::channel();
-        if shared.ingest_tx.send((ingest_req, tx)).is_err() {
-            return Response::Error {
-                message: "ingest worker stopped".into(),
-            };
+fn handle_request(shared: &Arc<Shared>, req: Request) -> Response {
+    match req {
+        Request::Ingest(ingest_req) => {
+            let (tx, rx) = mpsc::channel();
+            if shared.ingest_tx.send((ingest_req, tx)).is_err() {
+                return Response::Error {
+                    message: "ingest worker stopped".into(),
+                };
+            }
+            return rx
+                .recv_timeout(CONNECTION_TIMEOUT)
+                .unwrap_or_else(|_| Response::Error {
+                    message: "ingest timed out".into(),
+                });
         }
-        return rx
-            .recv_timeout(CONNECTION_TIMEOUT)
-            .unwrap_or_else(|_| Response::Error {
-                message: "ingest timed out".into(),
-            });
+        Request::Reindex => return start_reindex(shared),
+        Request::Inject { .. } | Request::Search(_) | Request::Show { .. } | Request::Status => {}
     }
-    let records = match RecordStore::open(&shared.paths.records()) {
-        Ok(r) => r,
-        Err(e) => {
+    let (records, vectors) = match (RecordStore::open(&shared.paths.records()), shared.vectors()) {
+        (Ok(r), Some(v)) => (r, v),
+        (Err(e), _) => {
             return Response::Error {
                 message: e.to_string(),
             };
         }
+        (_, None) => {
+            return Response::Error {
+                message: "vector store unavailable".into(),
+            };
+        }
     };
+    let backends = shared.backends(vectors.as_ref());
     let result: Result<Response, String> = match req {
-        Request::Ingest(_) => Ok(Response::Done),
         Request::Inject {
             prompt,
             cwd,
@@ -376,7 +469,7 @@ fn handle_request(shared: &Shared, req: Request) -> Response {
             let deadline = Instant::now() + Duration::from_millis(c.budget_ms);
             build_injection(
                 &records,
-                shared.backends(),
+                backends,
                 &prompt,
                 &cwd,
                 &session_id,
@@ -386,7 +479,7 @@ fn handle_request(shared: &Shared, req: Request) -> Response {
             .map(|context| Response::Inject { context })
             .map_err(|e| e.to_string())
         }
-        Request::Search(search_req) => search(&records, shared.backends(), &search_req, None)
+        Request::Search(search_req) => search(&records, backends, &search_req, None)
             .map_err(|e| e.to_string())
             .and_then(|hits| render_hits(&records, &hits).map_err(|e| e.to_string()))
             .map(|text| Response::Text { text }),
@@ -396,7 +489,8 @@ fn handle_request(shared: &Shared, req: Request) -> Response {
         } => render_turn(&records, &prompt_id, with_results)
             .map(|text| Response::Text { text })
             .map_err(|e| e.to_string()),
-        Request::Status => status(shared, &records).map(Response::Status),
+        Request::Status => status(shared, &records, vectors.as_ref()).map(Response::Status),
+        Request::Ingest(_) | Request::Reindex => Ok(Response::Done),
     };
     result.unwrap_or_else(|message| {
         shared.log(&format!("request failed: {message}"));
@@ -404,20 +498,28 @@ fn handle_request(shared: &Shared, req: Request) -> Response {
     })
 }
 
-fn status(shared: &Shared, records: &RecordStore) -> Result<StatusInfo, String> {
+fn status(
+    shared: &Shared,
+    records: &RecordStore,
+    vectors: &dyn VectorStore,
+) -> Result<StatusInfo, String> {
     let counts = records.counts().map_err(|e| e.to_string())?;
     let compatibility = match shared.compat() {
         Compatibility::Empty => "empty",
         Compatibility::Compatible => "compatible",
-        Compatibility::Mismatch { .. } => "mismatch",
+        Compatibility::Mismatch { .. } => COMPAT_MISMATCH,
     };
     Ok(StatusInfo {
         iterations: counts.iterations,
         results: counts.results,
         embed_jobs: counts.embed_jobs,
         spool_pending: spool::pending_count(&shared.paths.spool()),
-        vectors: shared.vectors.count().map_err(|e| e.to_string())?,
+        vectors: vectors.count().map_err(|e| e.to_string())?,
         embed_model: shared.embedder.model_id().to_string(),
         compatibility: compatibility.to_string(),
+        reindex: shared
+            .reindex_state
+            .lock()
+            .map_or_else(|_| REINDEX_IDLE.to_string(), |s| s.clone()),
     })
 }

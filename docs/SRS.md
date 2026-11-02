@@ -83,7 +83,7 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 - C-1 구현 언어는 Rust로 한다.
 - C-2 원본 저장소는 SQLite(FTS5)로 한다. 벡터 저장소의 기본 백엔드는 LanceDB Rust SDK(임베디드)로 한다.
 - C-3 임베더의 기본 백엔드는 Ollama `qwen3-embedding:0.6b`, 출력 차원 1024로 한다.
-- C-4 데이터를 로컬 장비 밖으로 전송하지 않는다. 네트워크 통신은 `localhost`의 Ollama로 한정한다. 설정의 임베더 URL host가 `localhost`, `127.0.0.1`, `::1`이 아니면 설정 오류로 거부한다.
+- C-4 데이터를 로컬 장비 밖으로 전송하지 않는다. 네트워크 통신은 `localhost`의 Ollama로 한정한다. 임베더 URL은 URL 파서로 해석하며, 스킴이 `http`/`https`가 아니거나, host가 `localhost`, `127.0.0.1`, `::1`이 아니거나, userinfo(`@`)·쿼리·프래그먼트가 있으면 거부한다. 이 검사는 설정을 읽을 때와 임베더를 만들 때 모두 수행한다. HTTP 리다이렉트는 따르지 않는다.
 - C-5 MCP 서버를 사용하지 않는다. (사내 규정상 새 MCP 서버는 정보보호팀 승인 대상)
 - C-6 1차 대상 플랫폼은 macOS(darwin)이다.
 - C-7 `~/.claude` 설정 파일을 자동으로 수정하지 않는다. hook 설정은 사용자가 직접 적용한다.
@@ -132,7 +132,7 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 | ID | 요구사항 | 우선순위 |
 |----|----------|----------|
 | IF-SK-1 | 데몬은 `~/.session-memory/smem.sock` Unix socket으로 줄 단위 JSON 요청과 응답을 주고받아야 한다. | M |
-| IF-SK-2 | 요청 종류는 `ingest`(hook 이벤트 전달), `inject`(자동 주입 텍스트 생성), `search`, `show`, `status`이다. 연결 하나에 요청 하나, 응답 하나를 주고받는다. | M |
+| IF-SK-2 | 요청 종류는 `ingest`(hook 이벤트 전달), `inject`(자동 주입 텍스트 생성), `search`, `show`, `status`, `reindex`이다. 연결 하나에 요청 하나, 응답 하나를 주고받는다. | M |
 
 #### 3.1.4 Skill
 | ID | 요구사항 | 우선순위 |
@@ -209,7 +209,9 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 | FR-SWP-2 | 벡터 저장소는 `VectorStore` 트레이트로 추상화해야 한다. 트레이트는 최소한 `info`, `upsert`, `delete`, `search(vector, filter, limit)`, `count`, `ensure_index`를 제공한다. 필터는 백엔드 중립 타입(`kind`, `cwd`, `session_id` 제외, `embed_model`)으로 표현한다. 벡터 레코드 id는 `<kind>:<ref_id>#<chunk_index>`이다. 결과 벡터에는 `cwd`와 `session_id`를 넣지 않는다. 검색 점수는 코사인 유사도이며 클수록 가깝다. 저장소는 처음 저장한 벡터의 `embed_model`과 차원을 `info`로 돌려주고, 차원이 다른 벡터의 저장은 오류로 거부해야 한다. | M |
 | FR-SWP-3 | 사용할 임베더 백엔드, 모델, 차원과 벡터 저장소 백엔드는 `config.toml`로 선택해야 한다. 백엔드를 추가할 때 수집, 해석, 검색 로직을 수정하지 않아야 한다. | M |
 | FR-SWP-4 | 원본 저장소는 벡터 없이도 반복, 결과, 임베딩 대상 텍스트를 모두 보관해야 한다. 벡터 저장소의 내용은 원본 저장소에서 다시 만들 수 있어야 한다. | M |
-| FR-SWP-5 | `smem reindex [--embedder <설정명>] [--store <설정명>]`는 원본 저장소를 기준으로 새 벡터 저장소를 만들어야 한다. 재색인 중에도 기존 벡터 저장소로 검색할 수 있어야 하며, 완료 후 활성 저장소를 전환한다. | M |
+| FR-SWP-5 | `smem reindex`는 데몬에 재색인을 요청하고, 데몬은 현재 설정의 임베더와 벡터 저장소 백엔드로 원본 저장소 전체를 새 세대 디렉터리(`vectors/<이름>/<세대>/`)에 다시 색인해야 한다. 재색인은 백그라운드로 실행하며 그동안 기존 저장소로 검색할 수 있어야 한다(호환되지 않으면 FTS 전용). 재색인 중에는 임베딩 작업 스레드를 멈춰, 그 사이 들어온 작업이 전환 후 새 저장소에 반영되게 한다. 완료하면 `vectors/<이름>/ACTIVE` 포인터를 원자적으로 바꿔 전환하고 호환성을 다시 판정한다. 이미 재색인 중이면 오류를 돌려준다. 교체 절차: 설정 변경 → 데몬 재시작 → `smem reindex`. | M |
+| FR-SWP-9 | 데몬은 시작할 때 `ACTIVE`가 가리키지 않는 세대 디렉터리를 지워야 한다. `ACTIVE`가 없으면 첫 세대를 만들어 가리키게 한다. | M |
+| FR-SWP-10 | `smem status`는 재색인 상태(`idle`, `running`, `done`, `failed: <사유>`)를 보여야 한다. 벡터가 0개인데 반복이 있으면 재색인이 필요하다고 안내한다. | M |
 | FR-SWP-6 | 데몬은 시작할 때 활성 벡터 저장소의 `embed_model`, 차원과 설정의 임베더가 다르면 수집은 계속하되, 벡터 검색을 끄고 FTS 검색만 수행하며(이 상태에서는 자동 주입을 하지 않는다) `smem status`와 로그에 재색인 필요를 표시해야 한다. | M |
 | FR-SWP-7 | 하이브리드 검색의 FTS 부분은 원본 저장소(SQLite FTS5)에서 수행해 벡터 저장소 백엔드와 무관하게 동작해야 한다. | M |
 | FR-SWP-8 | 테스트용으로 결정론적 `Embedder`와 메모리 기반 `VectorStore` 백엔드를 제공하고, 모든 백엔드에 같은 계약 테스트를 적용해야 한다. | M |
@@ -235,7 +237,7 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 ### 3.4 논리 데이터 요구사항
 | ID | 요구사항 |
 |----|----------|
-| DR-1 | 데이터 루트는 `~/.session-memory/`이며 하위에 `records.sqlite`(원본 저장소. 세션 해석기 상태, 백그라운드 기록, 임베딩 작업 큐 포함), `vectors/<저장소명>/`(벡터 저장소), `spool/`, `logs/`, `config.toml`을 둔다. |
+| DR-1 | 데이터 루트는 `~/.session-memory/`이며 하위에 `records.sqlite`(원본 저장소. 세션 해석기 상태, 백그라운드 기록, 임베딩 작업 큐 포함), `vectors/<저장소명>/<세대>/`(벡터 저장소)와 `vectors/<저장소명>/ACTIVE`(사용 중인 세대), `spool/`, `logs/`, `config.toml`을 둔다. |
 | DR-2 | 데이터 루트의 권한은 `0700`이어야 한다. |
 | DR-3 | 모든 벡터 행은 생성에 쓴 `embed_model`과 차원을 기록해야 한다. |
 
