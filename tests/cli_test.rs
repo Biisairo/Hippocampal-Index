@@ -173,3 +173,112 @@ fn daemon_refuses_invalid_config() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("localhost"));
 }
+
+// ---- IF-CLI-6 ----
+
+#[test]
+fn install_and_uninstall_project_scope() {
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let project = dir.path().join("proj");
+    fs::create_dir_all(&project).unwrap();
+    let p = project.to_string_lossy().to_string();
+    let target = project.join(".claude/settings.local.json");
+
+    let dry = smem(
+        dir.path(),
+        &[
+            "install",
+            "--scope",
+            "project",
+            "--project",
+            &p,
+            "--dry-run",
+        ],
+        "",
+    );
+    assert!(dry.status.success());
+    assert!(!target.exists());
+    assert!(String::from_utf8_lossy(&dry.stdout).contains("hook stop"));
+
+    assert!(
+        smem(
+            dir.path(),
+            &["install", "--scope", "project", "--project", &p],
+            ""
+        )
+        .status
+        .success()
+    );
+    let v: Value = serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+    assert!(
+        v["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("smem hook stop")
+    );
+
+    let again = smem(
+        dir.path(),
+        &["install", "--scope", "project", "--project", &p],
+        "",
+    );
+    assert!(String::from_utf8_lossy(&again.stdout).contains("변경 없음"));
+
+    assert!(
+        smem(
+            dir.path(),
+            &["uninstall", "--scope", "project", "--project", &p],
+            ""
+        )
+        .status
+        .success()
+    );
+    let v: Value = serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+    assert_eq!(v, serde_json::json!({}));
+}
+
+#[test]
+fn install_user_scope_uses_home() {
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let out = Command::new(BIN)
+        .env("HOME", dir.path())
+        .args([
+            "--root",
+            &dir.path().join("root").to_string_lossy(),
+            "install",
+            "--scope",
+            "user",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(dir.path().join(".claude/settings.json").exists());
+}
+
+#[test]
+fn install_refuses_invalid_settings() {
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let project = dir.path().join("proj/.claude");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("settings.local.json"), "{ broken").unwrap();
+    let out = smem(
+        dir.path(),
+        &[
+            "install",
+            "--scope",
+            "project",
+            "--project",
+            &dir.path().join("proj").to_string_lossy(),
+        ],
+        "",
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        fs::read_to_string(project.join("settings.local.json")).unwrap(),
+        "{ broken"
+    );
+}

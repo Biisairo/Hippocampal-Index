@@ -9,6 +9,7 @@ pub mod fsutil;
 pub mod generations;
 pub mod indexer;
 pub mod ingest;
+pub mod install;
 pub mod lance;
 pub mod ollama;
 pub mod protocol;

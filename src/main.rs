@@ -8,6 +8,7 @@ use smem::backends::{build_embedder, vector_source};
 use smem::client::{request, run_hook};
 use smem::config::{Config, Paths};
 use smem::daemon;
+use smem::install::{Action, Scope, apply, target_file};
 use smem::protocol::{Request, Response};
 use smem::search::{SearchKind, SearchRequest};
 use smem::setup::{hooks_config, launchd_plist};
@@ -57,6 +58,28 @@ enum Command {
     HooksConfig,
     /// launchd plist
     LaunchdPlist,
+    /// Claude Code 설정 파일에 hook을 병합한다.
+    Install(InstallArgs),
+    /// Claude Code 설정 파일에서 smem hook을 제거한다.
+    Uninstall(InstallArgs),
+}
+
+#[derive(clap::Args)]
+struct InstallArgs {
+    #[arg(long, value_enum)]
+    scope: ScopeArg,
+    /// 프로젝트 경로 (기본: 현재 디렉터리)
+    #[arg(long)]
+    project: Option<PathBuf>,
+    /// 변경 내용만 출력하고 쓰지 않는다.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ScopeArg {
+    User,
+    Project,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -127,22 +150,21 @@ fn main() -> ExitCode {
         Command::Status => query_daemon(&paths, &Request::Status),
         Command::Reindex => query_daemon(&paths, &Request::Reindex),
         Command::Daemon => run_daemon(paths),
-        Command::HooksConfig => {
-            let budget_ms = match Config::load(&paths.config()) {
-                Ok(c) => c.inject.budget_ms,
-                Err(e) => return fail(&e.to_string()),
-            };
-            let exe = match std::env::current_exe() {
-                Ok(exe) => exe,
-                Err(e) => return fail(&e.to_string()),
-            };
-            let timeout = budget_ms.div_ceil(1_000) + INJECT_TIMEOUT_MARGIN_SECS;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&hooks_config(&exe, timeout)).unwrap_or_default()
-            );
-            ExitCode::SUCCESS
-        }
+        Command::HooksConfig => match hook_settings(&paths) {
+            Ok(hooks) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&hooks).unwrap_or_default()
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e),
+        },
+        Command::Install(args) => match hook_settings(&paths) {
+            Ok(hooks) => run_install(&args, Action::Install(hooks)),
+            Err(e) => fail(&e),
+        },
+        Command::Uninstall(args) => run_install(&args, Action::Uninstall),
         Command::LaunchdPlist => match std::env::current_exe() {
             Ok(exe) => {
                 print!("{}", launchd_plist(&exe, &paths));
@@ -151,6 +173,48 @@ fn main() -> ExitCode {
             Err(e) => fail(&e.to_string()),
         },
     }
+}
+
+/// 실행 중인 smem 경로로 hook 설정을 만든다. UserPromptSubmit timeout은 시간 예산보다 여유를 둔다.
+fn hook_settings(paths: &Paths) -> Result<serde_json::Value, String> {
+    let budget_ms = Config::load(&paths.config())
+        .map_err(|e| e.to_string())?
+        .inject
+        .budget_ms;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let timeout = budget_ms.div_ceil(1_000) + INJECT_TIMEOUT_MARGIN_SECS;
+    Ok(hooks_config(&exe, timeout))
+}
+
+fn run_install(args: &InstallArgs, action: Action) -> ExitCode {
+    let scope = match args.scope {
+        ScopeArg::User => Scope::User,
+        ScopeArg::Project => match args.project.clone().map_or_else(std::env::current_dir, Ok) {
+            Ok(dir) => Scope::Project(dir),
+            Err(e) => return fail(&e.to_string()),
+        },
+    };
+    let outcome = match target_file(&scope).and_then(|path| apply(&path, &action, args.dry_run)) {
+        Ok(o) => o,
+        Err(e) => return fail(&e.to_string()),
+    };
+    if !outcome.changed {
+        println!("변경 없음: {}", outcome.path.display());
+        return ExitCode::SUCCESS;
+    }
+    print!("{}", outcome.diff);
+    if args.dry_run {
+        println!(
+            "(dry-run) 파일을 쓰지 않았습니다: {}",
+            outcome.path.display()
+        );
+    } else {
+        println!("적용했습니다: {}", outcome.path.display());
+        if let Some(backup) = outcome.backup {
+            println!("백업: {}", backup.display());
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 fn query_daemon(paths: &Paths, req: &Request) -> ExitCode {

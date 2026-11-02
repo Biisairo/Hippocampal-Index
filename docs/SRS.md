@@ -86,7 +86,7 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 - C-4 데이터를 로컬 장비 밖으로 전송하지 않는다. 네트워크 통신은 `localhost`의 Ollama로 한정한다. 임베더 URL은 URL 파서로 해석하며, 스킴이 `http`/`https`가 아니거나, host가 `localhost`, `127.0.0.1`, `::1`이 아니거나, userinfo(`@`)·쿼리·프래그먼트가 있으면 거부한다. 이 검사는 설정을 읽을 때와 임베더를 만들 때 모두 수행한다. HTTP 리다이렉트는 따르지 않는다.
 - C-5 MCP 서버를 사용하지 않는다. (사내 규정상 새 MCP 서버는 정보보호팀 승인 대상)
 - C-6 1차 대상 플랫폼은 macOS(darwin)이다.
-- C-7 `~/.claude` 설정 파일을 자동으로 수정하지 않는다. hook 설정은 사용자가 직접 적용한다.
+- C-7 Claude Code 설정 파일은 사용자가 `smem install`/`smem uninstall`을 실행할 때만 수정한다. 그 밖의 명령과 데몬은 설정 파일을 수정하지 않는다.
 
 ### 2.5 가정과 의존성
 - A-1 Claude Code의 hook 입력 스키마와 transcript JSONL 형식은 부록 A의 실측 결과(Claude Code 2.1.316)와 같다. 버전이 바뀌면 재검증한다.
@@ -126,6 +126,7 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 | IF-CLI-2 | `smem show <prompt_id>`는 해당 턴의 반복을 순서대로 복원해 출력해야 한다. `--with-results` 옵션을 주면 연결된 결과 원문도 출력한다. | M |
 | IF-CLI-3 | `smem daemon`은 데몬을 포그라운드로 실행해야 한다. | M |
 | IF-CLI-4 | `smem launchd-plist`는 데몬 자동 실행용 launchd plist를 stdout에 출력해야 한다. | S |
+| IF-CLI-6 | `smem install --scope user\|project [--project <경로>] [--dry-run]`는 hook 설정을 Claude Code 설정 파일에 병합해야 한다. `smem uninstall`은 같은 옵션으로 smem hook만 제거해야 한다. | M |
 | IF-CLI-5 | `smem status`는 데몬 상태, 스풀 대기 건수, 임베딩 대기 건수, 테이블별 행 수를 출력해야 한다. | S |
 
 #### 3.1.3 데몬 소켓 인터페이스
@@ -201,6 +202,16 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 | FR-RET-5 | `user-prompt-submit` hook은 시간 예산(설정, 기본 800ms)을 넘으면 검색을 포기하고 아무것도 주입하지 않아야 한다. 데몬의 검색은 단계(임베딩, 벡터 검색, FTS)마다 마감 시각을 확인하고, hook 클라이언트는 같은 예산으로 소켓 타임아웃을 건다. | M |
 | FR-RET-6 | `smem search`는 IF-CLI-1의 옵션에 따라 범위와 종류를 바꿔 검색해야 한다. `--kind result` 결과에는 그 결과를 참조하는 반복의 `prompt_id`를 함께 출력한다. | M |
 | FR-RET-7 | `smem show`는 `prompt_id`의 반복을 `iteration_index` 순서로 출력하고, 반복에 백그라운드 시작 호출이 있으면 그 작업의 완료 기록(순번, 상태, 요약, 결과 id)을 함께 표시해야 한다. | M |
+
+#### 3.2.8 설치 (INS)
+| ID | 요구사항 | 우선순위 |
+|----|----------|----------|
+| FR-INS-1 | 대상 파일은 `--scope user`면 `$HOME/.claude/settings.json`, `--scope project`면 `<프로젝트>/.claude/settings.local.json`이다. 프로젝트 경로는 `--project`로 주며, 없으면 현재 디렉터리를 쓴다. | M |
+| FR-INS-2 | smem hook 항목은 `command`가 `smem hook <post-tool-batch\|stop\|stop-failure\|session-end\|user-prompt-submit>`로 끝나고, 실행 파일 이름이 `smem`인 항목으로 식별한다. 설정 파일에 별도 표식 키를 넣지 않는다. | M |
+| FR-INS-3 | 설치는 기존 smem hook 항목을 모두 지운 뒤 IF-HK-4의 hook 설정을 이벤트마다 추가해야 한다. 다른 hook과 다른 설정 키는 내용과 순서를 그대로 유지한다. 비게 된 matcher 그룹과 이벤트는 지운다. | M |
+| FR-INS-4 | 제거는 smem hook 항목만 지워야 한다. 비게 된 matcher 그룹, 이벤트, `hooks` 키는 지운다. | M |
+| FR-INS-5 | 결과가 기존 내용과 같으면 파일을 쓰지 않고 "변경 없음"을 출력한다. 다르면 변경 내용(diff)을 출력하고, 기존 파일이 있으면 `<파일>.smem-backup-<유닉스 시각>`(이미 있으면 `-<번호>`를 붙임)으로 백업한 뒤 임시 파일에 쓰고 이름을 바꿔 원자적으로 교체한다. 기존 파일 권한을 유지한다. 임시 파일은 같은 디렉터리에 무작위 이름으로 배타적으로 만들고, 백업은 링크를 따르지 않는 배타적 생성(권한 0600)으로 만든다. 설정 파일이나 바로 위 디렉터리가 심볼릭 링크이면 수정하지 않고 오류로 끝낸다. `--dry-run`이면 diff만 출력하고 아무것도 쓰지 않는다. | M |
+| FR-INS-6 | 기존 파일이 JSON으로 해석되지 않거나, 최상위가 객체가 아니거나, `hooks`가 객체가 아니면 수정하지 않고 오류로 끝낸다. 파일이 없으면 새로 만든다(디렉터리 포함). | M |
 
 #### 3.2.6 교체 가능성 (SWP)
 | ID | 요구사항 | 우선순위 |
