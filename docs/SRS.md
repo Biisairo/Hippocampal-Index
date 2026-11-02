@@ -178,14 +178,15 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 #### 3.2.4 저장 (STO)
 | ID | 요구사항 | 우선순위 |
 |----|----------|----------|
-| FR-STO-1 | 원본 저장소의 `iterations` 테이블에 반복마다 행 1개를 저장해야 한다. 필드: `id`, `session_id`, `prompt_id`, `message_id`, `iteration_index`(턴 안 순번), `cwd`, `ts`, `input_text`, `tool_calls`(JSON), `response_text`, `result_ids`, `bg_links`, `embed_text`. 벡터 저장소에는 `id`, `vector`, `embed_model`과 필터용 메타데이터(`cwd`, `session_id`, `ts`)를 저장한다. | M |
+| FR-STO-1 | 원본 저장소의 `iterations` 테이블에 반복마다 행 1개를 저장해야 한다. 필드: `id`(`<session_id>:<message_id>`), `session_id`, `prompt_id`, `message_id`, `iteration_index`(턴 안 순번), `cwd`, `ts`, `inputs`(JSON), `tool_calls`(JSON: `id`, `name`, `input`, `is_error`. 결과 원문은 넣지 않는다), `response_text`, `embed_text`. 반복과 결과의 연결은 `iteration_results`(`iteration_id`, `tool_use_id`, `result_id`)에 저장한다. 벡터 저장소에는 `id`, `vector`, `embed_model`과 필터용 메타데이터(`cwd`, `session_id`, `ts`)를 저장한다. | M |
 | FR-STO-2 | `embed_text`는 다음 순서로 만든다. 비어 있는 섹션은 넣지 않는다.<br>`[입력] <반복 입력>` (입력마다 1줄. 완료 알림은 `<status>: <summary>`)<br>`[툴] <name>(<input compact JSON>)` (호출마다 1줄. JSON이 설정 길이(기본 500자)를 넘으면 그 길이에서 자르고 `…`를 붙인다. 원문 입력은 `tool_calls`에 그대로 남는다)<br>`[응답] <text 블록을 개행으로 이어 붙임>` | M |
-| FR-STO-3 | 원본 저장소의 `results` 테이블에 결과 원문을 저장해야 한다. 필드: `id`, `content_hash`(SHA-256), `tool_name`, `text`, `chunk_index`, `first_seen_ts`. 벡터는 벡터 저장소에 청크 단위로 저장한다. | M |
+| FR-STO-3 | 원본 저장소의 `results` 테이블에 결과 원문을 원문 단위로 저장해야 한다. 필드: `id`(원문의 SHA-256 hex), `tool_name`(처음 저장한 도구), `text`, `first_seen_ts`. 빈 원문은 저장하지 않는다. 벡터는 벡터 저장소에 청크 단위로 저장한다. | M |
 | FR-STO-4 | 같은 `content_hash`가 이미 있으면 결과를 새로 저장하거나 임베딩하지 않고 기존 결과 id를 반복에 연결해야 한다. | M |
 | FR-STO-5 | 결과 원문이나 반복의 `embed_text`가 청크 한도를 넘으면 여러 청크로 나눠 청크마다 벡터를 만들어야 한다. 청크 한도(문자 수)는 임베더의 `max_input_tokens()`와 설정값(기본 8,000) 중 작은 값에 `chars_per_token`(기본 1.0)을 곱한 값이다. 청크는 한도 안에서 마지막 개행 위치에서 나누고, 개행이 없으면 한도에서 나눈다. 청크를 순서대로 이어 붙이면 원문과 같아야 한다. | M |
-| FR-STO-6 | 저장과 임베딩 전에 비밀값 패턴을 `[REDACTED:<종류>]`로 치환해야 한다. 기본 패턴: API 키(`sk-` 뒤 20자 이상, `gh[pousr]_` 뒤 36자 이상, `xox[abprs]-`, `AKIA` 뒤 16자), `Bearer <토큰 16자 이상>`, PEM 개인 키 블록, 이름이 `KEY`/`TOKEN`/`SECRET`/`PASSWORD`로 끝나는(대소문자 무시) `이름=값` 또는 `이름: 값`의 값(8자 이상, 이름은 남김). 마스킹은 반복 입력, 응답 텍스트, 도구 입력 JSON의 모든 문자열, 결과 원문에 적용한다. 패턴은 설정 파일로 추가할 수 있어야 하며, 잘못된 패턴은 시작 시 오류로 보고한다. | M |
+| FR-STO-6 | 저장과 임베딩 전에 비밀값 패턴을 `[REDACTED:<종류>]`로 치환해야 한다. 기본 패턴: API 키(`sk-` 뒤 20자 이상, `gh[pousr]_` 뒤 36자 이상, `xox[abprs]-`, `AKIA` 뒤 16자), `Bearer <토큰 16자 이상>`, PEM 개인 키 블록(END 마커가 없으면 BEGIN부터 원문 끝까지), 이름이 `KEY`/`TOKEN`/`SECRET`/`PASSWORD`로 끝나는(대소문자 무시) `이름=값` 또는 `이름: 값`의 값(8자 이상, 이름은 남김). 마스킹은 반복 입력, 응답 텍스트, 도구 입력 JSON의 모든 문자열, 결과 원문에 적용한다. 패턴은 설정 파일로 추가할 수 있어야 하며, 잘못된 패턴은 시작 시 오류로 보고한다. | M |
 | FR-STO-7 | 임베딩은 반복 저장과 분리된 작업 큐로 처리해야 한다. Ollama가 응답하지 않으면 작업을 큐에 남기고 재시도해야 한다. | M |
-| FR-STO-8 | 원본 저장소에서 `iterations.embed_text`와 `results.text`에 SQLite FTS5 인덱스(trigram 토크나이저)를 만들어야 한다. | M |
+| FR-STO-8 | 원본 저장소에서 `iterations.embed_text`와 `results.text`에 SQLite FTS5 인덱스(trigram 토크나이저)를 만들어야 한다. FTS 검색어는 공백으로 나눈 토큰 중 3자 이상인 것을 OR로 묶는다. 해당 토큰이 없으면 FTS 결과는 비어 있다. | M |
+| FR-STO-10 | 반복, 결과, 반복-결과 연결, 백그라운드 기록, 임베딩 작업, 세션 해석기 상태의 변경은 한 처리 단위마다 하나의 트랜잭션으로 반영해야 한다. | M |
 | FR-STO-9 | 벡터 행 수가 설정된 기준(기본 10만)을 넘으면 `VectorStore::ensure_index`를 호출해야 한다. | S |
 
 #### 3.2.5 검색 (RET)
@@ -197,7 +198,7 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 | FR-RET-4 | 주입 텍스트는 결과마다 `ts`, `prompt_id`, `embed_text`(최대 길이 설정, 기본 800자)를 담고, 전체 길이를 설정값(기본 4,000자) 이하로 제한해야 한다. 끝에 `smem show <prompt_id>`로 상세 내용을 볼 수 있다는 안내를 붙인다. | M |
 | FR-RET-5 | `user-prompt-submit` hook은 시간 예산(설정, 기본 800ms)을 넘으면 검색을 포기하고 아무것도 주입하지 않아야 한다. | M |
 | FR-RET-6 | `smem search`는 IF-CLI-1의 옵션에 따라 범위와 종류를 바꿔 검색해야 한다. `--kind result` 결과에는 그 결과를 참조하는 반복의 `prompt_id`를 함께 출력한다. | M |
-| FR-RET-7 | `smem show`는 `prompt_id`의 반복을 `iteration_index` 순서로 출력하고, 백그라운드 연결(`bg_links`)이 있으면 완료 결과가 저장된 반복을 함께 표시해야 한다. | M |
+| FR-RET-7 | `smem show`는 `prompt_id`의 반복을 `iteration_index` 순서로 출력하고, 반복에 백그라운드 시작 호출이 있으면 그 작업의 완료 기록(순번, 상태, 요약, 결과 id)을 함께 표시해야 한다. | M |
 
 #### 3.2.6 교체 가능성 (SWP)
 | ID | 요구사항 | 우선순위 |
@@ -230,7 +231,7 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 ### 3.4 논리 데이터 요구사항
 | ID | 요구사항 |
 |----|----------|
-| DR-1 | 데이터 루트는 `~/.session-memory/`이며 하위에 `records.sqlite`(원본 저장소), `vectors/<저장소명>/`(벡터 저장소), `spool/`, `state/`(세션 offset, 대기 기록, 임베딩 큐), `logs/`, `config.toml`을 둔다. |
+| DR-1 | 데이터 루트는 `~/.session-memory/`이며 하위에 `records.sqlite`(원본 저장소. 세션 해석기 상태, 백그라운드 기록, 임베딩 작업 큐 포함), `vectors/<저장소명>/`(벡터 저장소), `spool/`, `logs/`, `config.toml`을 둔다. |
 | DR-2 | 데이터 루트의 권한은 `0700`이어야 한다. |
 | DR-3 | 모든 벡터 행은 생성에 쓴 `embed_model`과 차원을 기록해야 한다. |
 
