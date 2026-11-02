@@ -6,6 +6,7 @@ use common::*;
 use hippo::bg::TaskNotification;
 use hippo::embed_text::build_embed_text;
 use hippo::embedder::{EmbedError, Embedder};
+use hippo::i18n::Lang;
 use hippo::indexer::{ChunkConfig, process_embed_jobs};
 use hippo::search::{
     InjectConfig, ProjectSearch, SearchError, SearchKind, SearchRequest, VectorBackends,
@@ -118,17 +119,10 @@ impl Env {
     }
 }
 
-fn req(
-    query: &str,
-    kind: SearchKind,
-    cwd: Option<&str>,
-    exclude: Option<&str>,
-    limit: usize,
-) -> SearchRequest {
+fn req(query: &str, kind: SearchKind, exclude: Option<&str>, limit: usize) -> SearchRequest {
     SearchRequest {
         query: query.into(),
         kind,
-        cwd: cwd.map(str::to_string),
         exclude_session: exclude.map(str::to_string),
         limit,
     }
@@ -155,26 +149,19 @@ fn fuse_ranks_items_in_both_lists_first() {
 }
 
 #[test]
-fn hybrid_search_respects_scope_and_session() {
+fn hybrid_search_excludes_current_session() {
     let env = Env::standard();
     let hits = search(
         &env.records,
         env.backends(),
-        &req(
-            RELEVANT,
-            SearchKind::Iteration,
-            Some("/proj/a"),
-            Some("s-cur"),
-            10,
-        ),
+        &req(RELEVANT, SearchKind::Iteration, Some("s-cur"), 10),
         None,
     )
     .unwrap();
-    assert_eq!(hits[0].id, "s-old:m1");
-    assert!(hits[0].similarity.unwrap() > 0.55);
     let ids = hit_ids(&hits);
-    assert!(!ids.contains(&"s-other:m3".to_string()));
-    assert!(!ids.contains(&"s-cur:m4".to_string()));
+    let old = hits.iter().find(|h| h.id == "s-old:m1").unwrap();
+    assert!(old.similarity.unwrap() > 0.55);
+    assert!(!ids.contains(&"s-cur:m4".to_string()), "현재 세션 제외");
     assert!(hits.windows(2).all(|w| w[0].score >= w[1].score));
 }
 
@@ -184,18 +171,14 @@ fn fts_only_mode_without_backends() {
     let hits = search(
         &env.records,
         None,
-        &req(
-            "validateToken",
-            SearchKind::Iteration,
-            Some("/proj/a"),
-            Some("s-cur"),
-            10,
-        ),
+        &req("validateToken", SearchKind::Iteration, Some("s-cur"), 10),
         None,
     )
     .unwrap();
-    assert_eq!(hit_ids(&hits), ["s-old:m1"]);
-    assert_eq!(hits[0].similarity, None);
+    let mut ids = hit_ids(&hits);
+    ids.sort();
+    assert_eq!(ids, ["s-old:m1", "s-other:m3"]);
+    assert!(hits.iter().all(|h| h.similarity.is_none()));
 }
 
 #[test]
@@ -207,7 +190,6 @@ fn result_search_is_filtered_through_links() {
         &req(
             "fn validateToken(exp) { exp < now }",
             SearchKind::Result,
-            Some("/proj/a"),
             None,
             10,
         ),
@@ -216,20 +198,22 @@ fn result_search_is_filtered_through_links() {
     .unwrap();
     assert_eq!(in_a.len(), 1);
     assert_eq!(in_a[0].kind, RecordKind::Result);
-    let in_b = search(
+    let linked_only_to_excluded = search(
         &env.records,
         env.backends(),
         &req(
             "fn validateToken(exp) { exp < now }",
             SearchKind::Result,
-            Some("/proj/b"),
-            None,
+            Some("s-old"),
             10,
         ),
         None,
     )
     .unwrap();
-    assert!(in_b.is_empty());
+    assert!(
+        linked_only_to_excluded.is_empty(),
+        "결과를 참조하는 반복이 모두 제외 세션이면 제외"
+    );
 }
 
 #[test]
@@ -238,7 +222,7 @@ fn both_kinds_and_limit() {
     let both = search(
         &env.records,
         env.backends(),
-        &req(RELEVANT, SearchKind::Both, None, None, 10),
+        &req(RELEVANT, SearchKind::Both, None, 10),
         None,
     )
     .unwrap();
@@ -248,7 +232,7 @@ fn both_kinds_and_limit() {
         search(
             &env.records,
             env.backends(),
-            &req(RELEVANT, SearchKind::Both, None, None, 2),
+            &req(RELEVANT, SearchKind::Both, None, 2),
             None
         )
         .unwrap()
@@ -269,7 +253,7 @@ fn chunked_record_appears_once() {
     let hits = search(
         &env.records,
         env.backends(),
-        &req("청크 단어", SearchKind::Result, None, None, 10),
+        &req("청크 단어", SearchKind::Result, None, 10),
         None,
     )
     .unwrap();
@@ -282,7 +266,7 @@ fn past_deadline_is_reported() {
     let err = search(
         &env.records,
         env.backends(),
-        &req(RELEVANT, SearchKind::Iteration, None, None, 10),
+        &req(RELEVANT, SearchKind::Iteration, None, 10),
         Some(Instant::now() - Duration::from_millis(1)),
     )
     .unwrap_err();
@@ -311,7 +295,6 @@ fn result_in_scope_checks_links() {
             .result_in_scope(
                 &rid,
                 &FtsFilter {
-                    cwd: Some("/proj/a".into()),
                     exclude_session: None
                 }
             )
@@ -322,7 +305,6 @@ fn result_in_scope_checks_links() {
             .result_in_scope(
                 &rid,
                 &FtsFilter {
-                    cwd: Some("/proj/a".into()),
                     exclude_session: Some("s-old".into())
                 }
             )
@@ -496,17 +478,20 @@ fn render_turn_lists_iterations_and_results() {
             bulk: false,
         })
         .unwrap();
-    let plain = render_turn(&records, &prompt_id, false).unwrap();
+    let plain = render_turn(&records, &prompt_id, false, Lang::En).unwrap();
     assert!(plain.contains(&prompt_id));
     assert!(plain.contains("[0]") && plain.contains("[1]"));
     assert!(plain.contains("Read"));
     assert!(!plain.contains("import json"));
-    let full = render_turn(&records, &prompt_id, true).unwrap();
+    let full = render_turn(&records, &prompt_id, true, Lang::En).unwrap();
     assert!(full.contains("import json"));
+    assert!(plain.contains("[response]"), "{plain}");
+    let korean = render_turn(&records, &prompt_id, false, Lang::Ko).unwrap();
+    assert!(korean.contains("[응답]"), "{korean}");
     assert!(
-        render_turn(&records, "nope", false)
+        render_turn(&records, "nope", false, Lang::En)
             .unwrap()
-            .contains("없음")
+            .contains("no records")
     );
 }
 
@@ -549,7 +534,7 @@ fn render_turn_shows_background_completions() {
             bulk: false,
         })
         .unwrap();
-    let out = render_turn(&records, &prompt_id, true).unwrap();
+    let out = render_turn(&records, &prompt_id, true, Lang::En).unwrap();
     assert!(out.contains("exit code 0"));
     assert!(out.contains("bg-done"));
 }
@@ -563,18 +548,24 @@ fn render_hits_shows_prompt_ids_for_results() {
         &req(
             "fn validateToken(exp) { exp < now }",
             SearchKind::Both,
-            Some("/proj/a"),
             None,
             10,
         ),
         None,
     )
     .unwrap();
-    let out = render_hits(&env.records, &hits).unwrap();
+    let out = render_hits(&env.records, &hits, Lang::En).unwrap();
     assert!(out.contains("[result]"));
     assert!(out.contains("[iteration]"));
     assert!(out.contains("p-m1"));
-    assert_eq!(render_hits(&env.records, &[]).unwrap().trim(), "결과 없음");
+    assert_eq!(
+        render_hits(&env.records, &[], Lang::En).unwrap().trim(),
+        "No results"
+    );
+    assert_eq!(
+        render_hits(&env.records, &[], Lang::Ko).unwrap().trim(),
+        "결과 없음"
+    );
 }
 
 // ---- 보안: 저장된 인젝션, 제어 문자 ----
@@ -596,7 +587,11 @@ fn injection_wraps_items_as_untrusted_memory() {
     )
     .unwrap()
     .unwrap();
-    assert!(text.contains("지시가 아니"), "헤더에 데이터임을 명시");
+    assert!(text.contains("not instructions"), "헤더에 데이터임을 명시");
+    assert!(
+        text.starts_with("[hippo] The <memory> blocks"),
+        "영어 고정 (FR-UI-2): {text}"
+    );
     assert_eq!(text.matches("<memory ").count(), 1);
     assert_eq!(
         text.matches("</memory>").count(),
@@ -619,19 +614,19 @@ fn rendered_output_escapes_control_characters() {
         HashEmbedder::new(64, 8_000),
     );
     let prompt_id = "p-m1";
-    let shown = render_turn(&env.records, prompt_id, true).unwrap();
+    let shown = render_turn(&env.records, prompt_id, true, Lang::En).unwrap();
     let hits = search(
         &env.records,
         env.backends(),
-        &req("정상 빨강 끝", SearchKind::Both, None, None, 10),
+        &req("정상 빨강 끝", SearchKind::Both, None, 10),
         None,
     )
     .unwrap();
-    let listed = render_hits(&env.records, &hits).unwrap();
+    let listed = render_hits(&env.records, &hits, Lang::En).unwrap();
     let injected = build_injection(
         &env.records,
         env.backends(),
-        "[입력] 질문 [응답] 정상 빨강 끝",
+        "[input] 질문 [response] 정상 빨강 끝",
         "other",
         CONFIG,
         far_deadline(),
@@ -693,11 +688,7 @@ fn all_scope_fuses_project_lists_and_labels_hits() {
             backends: b.backends(),
         },
     ];
-    let out = search_projects(
-        &projects,
-        &req(RELEVANT, SearchKind::Iteration, None, None, 2),
-    )
-    .unwrap();
+    let out = search_projects(&projects, &req(RELEVANT, SearchKind::Iteration, None, 2)).unwrap();
     let mut got: Vec<(String, String)> = out
         .hits
         .iter()
@@ -712,10 +703,10 @@ fn all_scope_fuses_project_lists_and_labels_hits() {
         ]
     );
     assert!(out.fallbacks.is_empty());
-    let text = render_project_hits(&projects, &out).unwrap();
+    let text = render_project_hits(&projects, &out, Lang::En).unwrap();
     assert!(text.contains("project=pa"), "{text}");
     assert!(text.contains("project=pb"), "{text}");
-    assert!(!text.contains("벡터 검색을 쓰지 못해"), "{text}");
+    assert!(!text.contains("vector search unavailable"), "{text}");
 }
 
 #[test]
@@ -739,7 +730,7 @@ fn all_scope_falls_back_to_keywords_per_project() {
     ];
     let out = search_projects(
         &projects,
-        &req("validateToken", SearchKind::Iteration, None, None, 10),
+        &req("validateToken", SearchKind::Iteration, None, 10),
     )
     .unwrap();
     assert_eq!(out.fallbacks.len(), 1);
@@ -750,14 +741,17 @@ fn all_scope_falls_back_to_keywords_per_project() {
             .any(|h| h.project == "pb" && h.hit.id == "s2:m3")
     );
     assert!(out.hits.iter().any(|h| h.project == "pa"));
-    let text = render_project_hits(&projects, &out).unwrap();
+    let text = render_project_hits(&projects, &out, Lang::En).unwrap();
     assert!(text.lines().next().unwrap().contains("pb"), "{text}");
-    assert!(text.contains("벡터 검색을 쓰지 못해"), "{text}");
+    assert!(text.contains("vector search unavailable"), "{text}");
 }
 
 #[test]
 fn all_scope_without_projects_reports_no_results() {
-    let out = search_projects(&[], &req(RELEVANT, SearchKind::Iteration, None, None, 5)).unwrap();
+    let out = search_projects(&[], &req(RELEVANT, SearchKind::Iteration, None, 5)).unwrap();
     assert!(out.hits.is_empty());
-    assert_eq!(render_project_hits(&[], &out).unwrap(), "결과 없음\n");
+    assert_eq!(
+        render_project_hits(&[], &out, Lang::En).unwrap(),
+        "No results\n"
+    );
 }

@@ -35,7 +35,6 @@ pub fn vector_id(kind: RecordKind, ref_id: &str, chunk_index: u32) -> String {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct VectorFilter {
     pub kind: Option<RecordKind>,
-    pub cwd: Option<String>,
     pub exclude_session: Option<String>,
     pub embed_model: Option<String>,
 }

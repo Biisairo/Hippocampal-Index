@@ -168,14 +168,14 @@ fn daemon_serves_status_search_show() {
     assert!(search.status.success());
     assert_eq!(
         String::from_utf8(search.stdout).unwrap().trim(),
-        "결과 없음"
+        "No results"
     );
     let show = hippo(&root, &["show", "nope", "--with-results"], "");
     assert!(show.status.success());
     assert!(
         String::from_utf8(show.stdout)
             .unwrap()
-            .contains("기록 없음")
+            .contains("no records")
     );
 }
 
@@ -245,7 +245,7 @@ fn install_and_uninstall_project_scope() {
         &["install", "--scope", "project", "--project", &p],
         "",
     );
-    assert!(String::from_utf8_lossy(&again.stdout).contains("변경 없음"));
+    assert!(String::from_utf8_lossy(&again.stdout).contains("No change"));
 
     assert!(
         hippo(
@@ -280,6 +280,49 @@ fn install_user_scope_uses_home() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(dir.path().join(".claude/settings.json").exists());
+    let memory = dir.path().join(".claude/CLAUDE.md");
+    assert!(
+        fs::read_to_string(&memory)
+            .unwrap()
+            .contains("<!-- hippo:begin -->"),
+        "안내 블록도 함께 설치 (FR-INS-7)"
+    );
+    let printed = String::from_utf8_lossy(&out.stdout);
+    assert!(printed.contains("Applied:"), "기본 출력은 영어: {printed}");
+
+    let project = dir.path().join("proj");
+    fs::create_dir_all(&project).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&project)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let run = |args: &[&str]| {
+        Command::new(BIN)
+            .env("HOME", dir.path())
+            .arg("--root")
+            .arg(dir.path().join("root"))
+            .args(args)
+            .arg("--project")
+            .arg(&project)
+            .output()
+            .unwrap()
+    };
+    let installed = run(&["install", "--scope", "project"]);
+    let printed = String::from_utf8_lossy(&installed.stdout);
+    assert!(
+        printed.contains("Warning:"),
+        "무시되지 않는 CLAUDE.local.md 경고: {printed}"
+    );
+    assert!(project.join("CLAUDE.local.md").exists());
+    assert!(run(&["uninstall", "--scope", "project"]).status.success());
+    assert!(
+        !project.join("CLAUDE.local.md").exists(),
+        "블록만 있던 파일은 지움"
+    );
 }
 
 #[test]
@@ -414,7 +457,7 @@ fn project_commands_and_scopes_use_current_directory() {
         "상대 경로 범위: {relative}"
     );
     let elsewhere = stdout(&hippo_in(&root, dir.path(), &["search", "병렬로"], ""));
-    assert!(elsewhere.contains("프로젝트 없음"), "{elsewhere}");
+    assert!(elsewhere.contains("No project"), "{elsewhere}");
 
     let shown = stdout(&hippo_in(
         &root,
@@ -441,11 +484,28 @@ fn project_commands_and_scopes_use_current_directory() {
     fs::write(past_dir.join("old-session.jsonl"), past).unwrap();
     let imported = stdout(&hippo_in(&root, &work, &["import"], ""));
     assert!(
-        imported.contains("[1/1] old-sess 가져옴 반복 2"),
+        imported.contains("[1/1] old-sess imported  iterations 2"),
         "{imported}"
     );
     let again = stdout(&hippo_in(&root, &work, &["import", "--from", "."], ""));
-    assert!(again.contains("[1/1] old-sess 변경 없음"), "{again}");
+    assert!(again.contains("[1/1] old-sess unchanged"), "{again}");
+    let config = fs::read_to_string(root.join("config.toml")).unwrap();
+    fs::write(
+        root.join("config.toml"),
+        format!("{config}[ui]\nlanguage = \"ko\"\n"),
+    )
+    .unwrap();
+    let korean = stdout(&hippo_in(&root, &work, &["import"], ""));
+    assert!(
+        korean.contains("[1/1] old-sess 변경 없음") && korean.contains("합계"),
+        "{korean}"
+    );
+    let korean_none = stdout(&hippo_in(&root, dir.path(), &["search", "병렬로"], ""));
+    assert!(
+        korean_none.contains("프로젝트 없음"),
+        "데몬 출력도 설정을 따름: {korean_none}"
+    );
+    fs::write(root.join("config.toml"), config).unwrap();
     let unknown = stdout(&hippo_in(
         &root,
         &work,

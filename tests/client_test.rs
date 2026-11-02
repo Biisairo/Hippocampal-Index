@@ -6,6 +6,7 @@ use hippo::backends::{BackendError, build_embedder, vector_source};
 use hippo::client::{HookAction, inject_output, launch_disabled, parse_hook, run_hook};
 use hippo::config::{Config, Paths};
 use hippo::generations::active_dir;
+use hippo::i18n::Lang;
 use hippo::import::Candidate;
 use hippo::ingest::{HookEvent, ImportOutcome, IngestRequest};
 use hippo::protocol::{ImportSessionReport, ProjectStatus, Request, Response, Scope, StatusInfo};
@@ -407,33 +408,34 @@ fn status_info(iterations: u64, vectors: u64, compatibility: &str, reindex: &str
 
 #[test]
 fn status_render_shows_fields_and_reindex_hints() {
-    let ok = status_info(3, 5, "compatible", "idle").render();
+    let ok = status_info(3, 5, "compatible", "idle").render(Lang::En);
     assert!(ok.contains("iterations: 3") && ok.contains("reindex: idle"));
     assert!(ok.contains("projects: 1") && ok.contains("[p1] /w"), "{ok}");
-    assert!(!ok.contains("위치 없음") && !ok.contains("hippo reindex"));
+    assert!(!ok.contains("location missing") && !ok.contains("hippo reindex"));
     let mut gone = status_info(3, 5, "compatible", "idle");
     gone.projects[0].exists = false;
-    assert!(gone.render().contains("위치 없음"));
+    assert!(gone.render(Lang::En).contains("location missing"));
+    assert!(gone.render(Lang::Ko).contains("위치 없음"));
     assert!(
         status_info(3, 0, "empty", "idle")
-            .render()
+            .render(Lang::En)
             .contains("hippo reindex"),
         "벡터 0개 + 반복 있음"
     );
     assert!(
         status_info(3, 5, "mismatch", "idle")
-            .render()
+            .render(Lang::En)
             .contains("hippo reindex")
     );
     assert!(
         !status_info(3, 5, "mismatch", "running")
-            .render()
+            .render(Lang::En)
             .contains("hippo reindex"),
         "진행 중이면 안내 생략"
     );
     assert!(
         !status_info(0, 0, "empty", "idle")
-            .render()
+            .render(Lang::En)
             .contains("hippo reindex")
     );
 }
@@ -476,7 +478,7 @@ fn ensure_daemon_gives_up_after_wait() {
 fn status_render_escapes_control_characters_in_location() {
     let mut st = status_info(1, 1, "compatible", "idle");
     st.projects[0].location = "/w\u{1b}[31m".into();
-    let out = st.render();
+    let out = st.render(Lang::En);
     assert!(!out.contains('\u{1b}'), "{out:?}");
     assert!(out.contains("\\u{1b}"), "{out:?}");
 }

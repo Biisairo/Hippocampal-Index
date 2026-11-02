@@ -399,14 +399,14 @@ fn fts_matches_korean_and_code_tokens_with_filters() {
     assert_eq!(ids(all), vec!["s1:m1", "s1:m2", "s2:m3"]);
 
     let filter = FtsFilter {
-        cwd: Some("/proj/a".into()),
         exclude_session: Some("s2".into()),
     };
     assert_eq!(
         ids(store
             .search_iterations_fts("validateToken", &filter, 10)
             .unwrap()),
-        vec!["s1:m1"]
+        vec!["s1:m1", "s1:m2"],
+        "제외한 세션만 빠짐"
     );
     assert_eq!(
         ids(store
@@ -446,7 +446,6 @@ fn fts_limit_and_results_search() {
         .search_results_fts(
             "validateToken",
             &FtsFilter {
-                cwd: Some("/proj/a".into()),
                 exclude_session: None,
             },
             10,
@@ -458,8 +457,7 @@ fn fts_limit_and_results_search() {
             .search_results_fts(
                 "validateToken",
                 &FtsFilter {
-                    cwd: Some("/proj/b".into()),
-                    exclude_session: None
+                    exclude_session: Some("s1".into())
                 },
                 10
             )

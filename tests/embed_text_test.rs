@@ -48,18 +48,18 @@ fn full_iteration_format() {
     );
     assert_eq!(
         build_embed_text(&it, 500),
-        "[입력] 로그인 버그 고쳐줘\n[툴] Read({\"file_path\":\"auth.ts\"})\n[툴] Grep({\"pattern\":\"token\"})\n[응답] 확인하겠습니다\n두 번째 문단"
+        "[input] 로그인 버그 고쳐줘\n[tool] Read({\"file_path\":\"auth.ts\"})\n[tool] Grep({\"pattern\":\"token\"})\n[response] 확인하겠습니다\n두 번째 문단"
     );
 }
 
 #[test]
 fn empty_sections_are_omitted() {
     let it = iteration(vec![], vec![], vec!["답만 있음"]);
-    assert_eq!(build_embed_text(&it, 500), "[응답] 답만 있음");
+    assert_eq!(build_embed_text(&it, 500), "[response] 답만 있음");
     let tools_only = iteration(vec![], vec![call("Bash", json!({"command": "ls"}))], vec![]);
     assert_eq!(
         build_embed_text(&tools_only, 500),
-        "[툴] Bash({\"command\":\"ls\"})"
+        "[tool] Bash({\"command\":\"ls\"})"
     );
     assert_eq!(
         build_embed_text(&iteration(vec![], vec![], vec![]), 500),
@@ -87,7 +87,7 @@ fn notification_and_agent_message_inputs() {
     );
     assert_eq!(
         build_embed_text(&it, 500),
-        "[입력] completed: npm test completed (exit code 0)\n[입력] 보고: 24\n[응답] 24"
+        "[input] completed: npm test completed (exit code 0)\n[input] 보고: 24\n[response] 24"
     );
 }
 
@@ -101,7 +101,7 @@ fn long_tool_input_is_truncated_in_embed_text_only() {
     );
     let text = build_embed_text(&it, 20);
     let json_part = text
-        .strip_prefix("[툴] Write(")
+        .strip_prefix("[tool] Write(")
         .unwrap()
         .strip_suffix(')')
         .unwrap();

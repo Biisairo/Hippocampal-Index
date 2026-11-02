@@ -174,9 +174,6 @@ fn filter_expr(filter: &VectorFilter) -> Option<String> {
     if let Some(kind) = filter.kind {
         parts.push(format!("kind = {}", quote(kind.as_str())));
     }
-    if let Some(cwd) = &filter.cwd {
-        parts.push(format!("cwd = {}", quote(cwd)));
-    }
     if let Some(session) = &filter.exclude_session {
         parts.push(format!(
             "(session_id IS NULL OR session_id <> {})",

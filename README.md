@@ -232,11 +232,12 @@ What `install` does:
 - It prints a diff. With `--dry-run`, it writes nothing.
 - Before it writes, it saves a backup: `<file>.hippo-backup-<unix time>`.
 - It writes atomically and keeps the file permissions.
-- If you run it again, nothing changes ("변경 없음" = no change).
+- If you run it again, nothing changes ("No change").
 - It refuses to write through a symbolic link, and it does not touch a settings file that is not valid JSON.
 - The file is rewritten as 2-space-indented JSON. Key order and values are kept, but the original formatting may change. The backup keeps the original.
+- It adds an English guide block to a memory file, so Claude knows it can run `hippo search` and `hippo show`. `--scope user` uses `~/.claude/CLAUDE.md`, and `--scope project` uses `<project>/CLAUDE.local.md` (the personal file the official docs recommend). The block sits between `<!-- hippo:begin -->` and `<!-- hippo:end -->`. Claude Code strips these markers before they reach the context, so they cost no tokens. Text outside the block is kept. If `CLAUDE.local.md` is not ignored by git, it prints a warning but does not change `.gitignore`.
 
-You can also print the hook block and add it by hand: `hippo hooks-config`.
+You can also print the hook block and add it by hand: `hippo hooks-config`. `uninstall` removes only the hook entries and the guide block. A memory file that held only the guide block is deleted.
 
 Start a new Claude Code session after you install the hooks.
 
@@ -269,7 +270,7 @@ hippo search "deploy" --scope ~/work/my-app --limit 5    # the project that cont
 | `--kind` | `iteration`, `result`, `both` | `iteration` |
 | `--limit` | number | `10` |
 
-Each hit shows the RRF score, the vector similarity (`sim=-` means a keyword-only hit), the `prompt_id`, and a preview. For a result hit, the output lists the prompts that produced it. `--scope all` searches each project, merges the lists with RRF, and labels each hit with `project=<id>`. If the current directory belongs to no project, the output is "프로젝트 없음" (no project).
+Each hit shows the RRF score, the vector similarity (`sim=-` means a keyword-only hit), the `prompt_id`, and a preview. For a result hit, the output lists the prompts that produced it. `--scope all` searches each project, merges the lists with RRF, and labels each hit with `project=<id>`. If the current directory belongs to no project, the output is "No project".
 
 ### 4.2 Show a whole turn
 
@@ -294,11 +295,11 @@ reindex: idle                     # idle | running | done | failed: <project id>
 projects: 2
 [3f9c…] /Users/me/work/app/.git
   iterations: 1520  results: 980  embed_jobs: 0  vectors: 2610  compatibility: compatible
-[a71d…] /Users/me/notes  (위치 없음)
+[a71d…] /Users/me/notes  (location missing)
   iterations: 40  results: 12  embed_jobs: 0  vectors: 52  compatibility: compatible
 ```
 
-`embed_jobs` counts iterations and results still waiting for embedding. `compatibility` is `empty`, `compatible`, or `mismatch`. `(위치 없음)` means the location no longer exists. If a project needs a reindex, `status` tells you.
+`embed_jobs` counts iterations and results still waiting for embedding. `compatibility` is `empty`, `compatible`, or `mismatch`. `(location missing)` means the location no longer exists. If a project needs a reindex, `status` tells you.
 
 ### 4.4 Projects and importing past records
 
@@ -316,33 +317,29 @@ hippo import --from <project id> --to ~/work/app
 - **Sessions already captured live**: only the part before the point where live capture started is filled in. Iterations that already exist are not stored again.
 - **The iteration at the end of a transcript**: stored if every tool call has its result. If a tool call has no result yet, it is held. A held iteration is processed when the session is reopened or when you run `import` again.
 - **Copies from branched sessions**: an iteration is skipped if an iteration with the same `message.id` already exists under another session.
-- **Sessions fixed to another project**: skipped and reported as "다른 프로젝트" (other project).
+- **Sessions fixed to another project**: skipped and reported as "other project".
 
-Progress is printed one line per session (the CLI output is in Korean):
+Progress is printed one line per session:
 
 ```
-후보 세션 120개
-[1/120] d767e162 가져옴 반복 42  남은 임베딩 310
-[2/120] 2f74fd43 가져옴 반복 3  남은 임베딩 318
+Candidate sessions: 120
+[1/120] d767e162 imported  iterations 42  pending embeddings 310
+[2/120] 2f74fd43 imported  iterations 3  pending embeddings 318
 ...
-합계: 세션 120개 중 가져옴 118, 변경 없음 2, 다른 프로젝트 0, 오류 0. 반복 2410개 저장, fork 복사본 101개 건너뜀.
+Total: 120 sessions; imported 118, unchanged 2, other project 0, errors 0. Stored 2410 iterations, skipped 101 fork copies.
 ```
 
-You can stop with Ctrl-C at any time. Run the same command again and finished sessions pass as "변경 없음" (unchanged) while the rest continue. The daemon keeps working on the remaining embedding jobs. It always handles live capture and its embeddings before import work, so your current conversation is still stored and searchable while an import runs.
+You can stop with Ctrl-C at any time. Run the same command again and finished sessions pass as "unchanged" while the rest continue. The daemon keeps working on the remaining embedding jobs. It always handles live capture and its embeddings before import work, so your current conversation is still stored and searchable while an import runs.
 
 ### 4.5 Let Claude use the memory
 
-Automatic injection gives Claude only the best few matches. For more, Claude can call the CLI. Add a line like this to your `CLAUDE.md`:
-
-```
-To look up past sessions, run `hippo search "<query>"` or `hippo show <prompt_id>` with Bash.
-```
+Automatic injection gives Claude only the best few matches. For more, Claude can call the CLI. `hippo install` puts a guide block that tells Claude how into the memory file (see [3.5](#35-register-the-hooks)), so you do not need to write it yourself.
 
 ---
 
 ## 5. Configuration
 
-File: `~/.hippo/config.toml`. Every key is optional. Unknown keys are an error, so typos are caught. Restart the daemon after you change it.
+File: `~/.hippo/config.toml`. Every key is optional. Unknown keys are an error, so typos are caught. Restart the daemon after you change it. Only `[ui] language` takes effect from the next command without a restart.
 
 ```toml
 [embedder]
@@ -387,6 +384,9 @@ git_timeout_ms = 1000              # time limit for git; if exceeded, the folder
 
 [import]
 transcripts_dir = "/Users/me/.claude/projects"   # where past transcripts are found. Default: $HOME/.claude/projects (`~` is not expanded)
+
+[ui]
+language = "en"                    # CLI output language: en (default) or ko. Text for Claude and --help are always English
 
 [[redact.patterns]]                # extra secret patterns (regex)
 kind = "internal"
@@ -452,7 +452,7 @@ Security measures:
 |---------|-------|
 | `hippo: daemon not reachable` | The daemon could not start. See `~/.hippo/logs/daemon.err` (for example, a config error). With `autostart = false`, start it yourself. |
 | `embed_jobs` does not go down | Is the model pulled (`ollama list`)? Could `hippo` start Ollama (see `~/.hippo/logs/ollama.log` and `hippo.log`)? Jobs are retried every 5 s. |
-| Search says "벡터 검색을 쓰지 못해 키워드 검색 결과만 표시합니다" | Embedding failed (Ollama could not start, or the model is missing). Results are keyword-only until it works again. |
+| Search says "vector search unavailable, showing keyword results only" | Embedding failed (Ollama could not start, or the model is missing). Results are keyword-only until it works again. |
 | `compatibility: mismatch` | The model or dimension changed. Run `hippo reindex`. |
 | Nothing is injected | Lower `[inject] threshold`. Injection uses only the same project and other sessions. |
 | Build fails in `lance-*` / `protoc` | `brew reinstall protobuf` and check `protoc --version` |
@@ -474,7 +474,7 @@ Security measures:
 | `transcript.rs` | Parses transcript JSONL into iterations, safe offsets |
 | `bg.rs` | Background start detection, `<task-notification>` parsing, subagent report extraction |
 | `redact.rs` | Secret redaction |
-| `embed_text.rs` | Text to embed (`[입력]`/`[툴]`/`[응답]` lines), chunking |
+| `embed_text.rs` | Text to embed (`[input]`/`[tool]`/`[response]` lines), chunking |
 | `store.rs` | SQLite source store, deduplication, FTS5, project merge |
 | `project.rs` | path normalization, git information, project location |
 | `registry.rs` | registry: project resolution, session binding, relocation, absorption |

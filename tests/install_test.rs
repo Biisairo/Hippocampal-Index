@@ -299,3 +299,138 @@ fn backup_and_result_are_owner_only_when_new() {
     assert_eq!(mode(&path), 0o644, "기존 권한 유지");
     assert_eq!(mode(&out.backup.unwrap()), 0o600);
 }
+
+// ---- FR-INS-7, IF-SKL-1: Claude 안내 블록 ----
+
+use hippo::install::{
+    GUIDE_BEGIN, GUIDE_END, apply_memory, guide_block, memory_file, remove_block, upsert_block,
+    warn_untracked,
+};
+
+#[test]
+fn memory_files_follow_hook_scope() {
+    assert_eq!(
+        memory_file(&Scope::Project(PathBuf::from("/p"))).unwrap(),
+        PathBuf::from("/p/CLAUDE.local.md")
+    );
+    assert!(
+        memory_file(&Scope::User)
+            .unwrap()
+            .ends_with(".claude/CLAUDE.md")
+    );
+}
+
+#[test]
+fn guide_block_is_english_and_marked() {
+    let block = guide_block();
+    assert!(block.starts_with(&format!("{GUIDE_BEGIN}\n")));
+    assert!(block.ends_with(&format!("{GUIDE_END}\n")));
+    assert!(block.contains("hippo search") && block.contains("hippo show"));
+    assert!(
+        !block.chars().any(|c| ('가'..='힣').contains(&c)),
+        "영어 고정 (FR-UI-2)"
+    );
+}
+
+#[test]
+fn block_is_appended_replaced_and_removed_without_touching_other_text() {
+    let original = "# Mine\nkeep this\n";
+    let installed = upsert_block(original).unwrap();
+    assert_eq!(installed, format!("{original}\n{}", guide_block()));
+    assert_eq!(
+        upsert_block(&installed).unwrap(),
+        installed,
+        "다시 넣어도 같음"
+    );
+    let stale = installed.replace("hippo show", "old text");
+    assert_eq!(upsert_block(&stale).unwrap(), installed, "이전 블록은 교체");
+    assert_eq!(remove_block(&installed).unwrap(), original);
+
+    let middle = format!("top\n\n{}\nbottom\n", guide_block());
+    assert_eq!(remove_block(&middle).unwrap(), "top\n\nbottom\n");
+    assert_eq!(upsert_block("").unwrap(), guide_block());
+    assert_eq!(remove_block("no block\n").unwrap(), "no block\n");
+}
+
+#[test]
+fn unclosed_block_is_rejected() {
+    let broken = format!("a\n{GUIDE_BEGIN}\nhalf\n");
+    assert!(matches!(
+        upsert_block(&broken),
+        Err(InstallError::UnclosedBlock)
+    ));
+    assert!(matches!(
+        remove_block(&broken),
+        Err(InstallError::UnclosedBlock)
+    ));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("CLAUDE.md");
+    fs::write(&path, &broken).unwrap();
+    assert!(apply_memory(&path, true, false).is_err());
+    assert_eq!(fs::read_to_string(&path).unwrap(), broken, "수정하지 않음");
+}
+
+#[test]
+fn memory_file_roundtrip_backup_dry_run_and_delete_when_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("CLAUDE.local.md");
+    let dry = apply_memory(&path, true, true).unwrap();
+    assert!(dry.changed && !path.exists());
+
+    let created = apply_memory(&path, true, false).unwrap();
+    assert!(created.changed && created.backup.is_none());
+    assert_eq!(fs::read_to_string(&path).unwrap(), guide_block());
+    assert!(!apply_memory(&path, true, false).unwrap().changed);
+
+    let removed = apply_memory(&path, false, false).unwrap();
+    assert!(removed.changed && removed.backup.is_some());
+    assert!(!path.exists(), "공백만 남으면 파일을 지움");
+    assert!(!apply_memory(&path, false, false).unwrap().changed);
+
+    fs::write(&path, "mine\n").unwrap();
+    apply_memory(&path, true, false).unwrap();
+    apply_memory(&path, false, false).unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "mine\n");
+}
+
+#[test]
+fn symlinked_memory_file_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real.md");
+    fs::write(&real, "x\n").unwrap();
+    let link = dir.path().join("CLAUDE.md");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert!(matches!(
+        apply_memory(&link, true, false),
+        Err(InstallError::Symlink(_))
+    ));
+    assert_eq!(fs::read_to_string(&real).unwrap(), "x\n");
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let ok = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap()
+        .status
+        .success();
+    assert!(ok, "{args:?}");
+}
+
+#[test]
+fn warns_when_local_memory_file_is_not_git_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = dir.path().join("plain");
+    fs::create_dir_all(&plain).unwrap();
+    assert!(!warn_untracked(&plain), "git이 아니면 경고 없음");
+    let repo = dir.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    assert!(warn_untracked(&repo));
+    fs::write(repo.join(".gitignore"), "CLAUDE.local.md\n").unwrap();
+    assert!(!warn_untracked(&repo));
+}

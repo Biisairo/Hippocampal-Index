@@ -10,12 +10,16 @@ use hippo::client::{
 };
 use hippo::config::{Config, Paths};
 use hippo::daemon;
+use hippo::i18n::Lang;
 use hippo::ingest::ImportOutcome;
-use hippo::install::{Action, Scope, apply, target_file};
+use hippo::install::{
+    Action, Outcome, Scope, apply, apply_memory, memory_file, target_file, warn_untracked,
+};
 use hippo::protocol::{ImportSessionReport, Request, Response, Scope as QueryScope};
 use hippo::registry::is_project_id;
 use hippo::search::{SearchKind, escape_control};
 use hippo::setup::{hooks_config, launchd_plist};
+use hippo::tr;
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// UserPromptSubmit hook timeout(초)은 시간 예산보다 이만큼 여유를 둔다.
@@ -24,10 +28,10 @@ const INJECT_TIMEOUT_MARGIN_SECS: u64 = 2;
 #[derive(Parser)]
 #[command(
     name = "hippo",
-    about = "Hippocampal Index: Claude Code 세션을 위한 장기 기억"
+    about = "Hippocampal Index: long-term memory for Claude Code sessions"
 )]
 struct Cli {
-    /// 데이터 루트 (기본: ~/.hippo)
+    /// Data root (default: ~/.hippo)
     #[arg(long, global = true)]
     root: Option<PathBuf>,
     #[command(subcommand)]
@@ -36,12 +40,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Claude Code hook 진입점. stdin으로 hook 입력을 받는다.
+    /// Claude Code hook entry point. Reads the hook input from stdin.
     Hook { event: String },
-    /// 기억 검색
+    /// Search memory
     Search {
         query: String,
-        /// project(현재 디렉터리의 프로젝트), all, 또는 경로
+        /// project (the current directory's project), all, or a path
         #[arg(long, default_value = SCOPE_PROJECT)]
         scope: String,
         #[arg(long, value_enum, default_value = "iteration")]
@@ -49,50 +53,50 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
-    /// 한 턴의 반복을 순서대로 보여준다.
+    /// Show the iterations of one turn in order
     Show {
         prompt_id: String,
         #[arg(long)]
         with_results: bool,
-        /// project 또는 경로. 없으면 현재 프로젝트를 먼저 찾고 나머지 프로젝트를 찾는다.
+        /// project or a path. Without it, the current project is searched first, then the others
         #[arg(long)]
         scope: Option<String>,
     },
-    /// 데몬을 포그라운드로 실행한다.
+    /// Run the daemon in the foreground
     Daemon,
-    /// 데몬 상태
+    /// Daemon status
     Status,
-    /// 현재 설정의 임베더와 벡터 저장소로 다시 색인한다.
+    /// Rebuild vector indexes with the configured embedder and vector store
     Reindex {
-        /// all, project, 또는 경로
+        /// all, project, or a path
         #[arg(long, default_value = SCOPE_ALL)]
         scope: String,
     },
-    /// 프로젝트 목록
+    /// Project commands
     #[command(subcommand)]
     Project(ProjectCommand),
-    /// 과거 세션 기록을 프로젝트로 가져온다. 생략한 인자는 현재 디렉터리이다.
+    /// Import past session records into a project. Omitted arguments default to the current directory
     Import {
-        /// 가져올 기록의 경로(이전 경로 가능) 또는 프로젝트 id
+        /// Path the records came from (an old path is fine) or a project id
         #[arg(long)]
         from: Option<String>,
-        /// 기록을 넣을 프로젝트의 경로
+        /// Path of the project that receives the records
         #[arg(long)]
         to: Option<String>,
     },
-    /// settings.json에 넣을 hook 설정
+    /// Print the hook settings for settings.json
     HooksConfig,
-    /// launchd plist
+    /// Print a launchd plist
     LaunchdPlist,
-    /// Claude Code 설정 파일에 hook을 병합한다.
+    /// Add hippo hooks and the memory guide to Claude Code
     Install(InstallArgs),
-    /// Claude Code 설정 파일에서 hippo hook을 제거한다.
+    /// Remove hippo hooks and the memory guide from Claude Code
     Uninstall(InstallArgs),
 }
 
 #[derive(Subcommand)]
 enum ProjectCommand {
-    /// 프로젝트 목록
+    /// List projects
     List,
 }
 
@@ -103,10 +107,10 @@ const SCOPE_ALL: &str = "all";
 struct InstallArgs {
     #[arg(long, value_enum)]
     scope: ScopeArg,
-    /// 프로젝트 경로 (기본: 현재 디렉터리)
+    /// Project path (default: current directory)
     #[arg(long)]
     project: Option<PathBuf>,
-    /// 변경 내용만 출력하고 쓰지 않는다.
+    /// Print the changes without writing
     #[arg(long)]
     dry_run: bool,
 }
@@ -213,10 +217,10 @@ fn main() -> ExitCode {
             Err(e) => fail(&e),
         },
         Command::Install(args) => match hook_settings(&paths) {
-            Ok(hooks) => run_install(&args, Action::Install(hooks)),
+            Ok(hooks) => run_install(&args, Action::Install(hooks), ui_lang(&paths)),
             Err(e) => fail(&e),
         },
-        Command::Uninstall(args) => run_install(&args, Action::Uninstall),
+        Command::Uninstall(args) => run_install(&args, Action::Uninstall, ui_lang(&paths)),
         Command::LaunchdPlist => match std::env::current_exe() {
             Ok(exe) => {
                 print!("{}", launchd_plist(&exe, &paths));
@@ -257,7 +261,8 @@ fn hook_settings(paths: &Paths) -> Result<serde_json::Value, String> {
     Ok(hooks_config(&exe, timeout))
 }
 
-fn run_install(args: &InstallArgs, action: Action) -> ExitCode {
+/// hook 설정과 메모리 파일의 안내 블록을 함께 바꾼다. (IF-CLI-6, FR-INS-7)
+fn run_install(args: &InstallArgs, action: Action, lang: Lang) -> ExitCode {
     let scope = match args.scope {
         ScopeArg::User => Scope::User,
         ScopeArg::Project => match args.project.clone().map_or_else(std::env::current_dir, Ok) {
@@ -265,27 +270,63 @@ fn run_install(args: &InstallArgs, action: Action) -> ExitCode {
             Err(e) => return fail(&e.to_string()),
         },
     };
-    let outcome = match target_file(&scope).and_then(|path| apply(&path, &action, args.dry_run)) {
-        Ok(o) => o,
+    let install = matches!(action, Action::Install(_));
+    let settings = target_file(&scope).and_then(|path| apply(&path, &action, args.dry_run));
+    let memory = settings.and_then(|settings| {
+        memory_file(&scope)
+            .and_then(|path| apply_memory(&path, install, args.dry_run))
+            .map(|memory| (settings, memory))
+    });
+    let (settings, memory) = match memory {
+        Ok(pair) => pair,
         Err(e) => return fail(&e.to_string()),
     };
-    if !outcome.changed {
-        println!("변경 없음: {}", outcome.path.display());
-        return ExitCode::SUCCESS;
-    }
-    print!("{}", outcome.diff);
-    if args.dry_run {
+    print_outcome(&settings, args.dry_run, lang);
+    print_outcome(&memory, args.dry_run, lang);
+    if let Scope::Project(dir) = &scope
+        && install
+        && warn_untracked(dir)
+    {
+        let path = memory.path.display();
         println!(
-            "(dry-run) 파일을 쓰지 않았습니다: {}",
-            outcome.path.display()
+            "{}",
+            tr!(
+                lang,
+                "Warning: {path} is not ignored by git and may be committed. Add it to .gitignore if it should stay private.",
+                "경고: {path}이(가) git에서 무시되지 않아 커밋될 수 있습니다. 개인 파일로 두려면 .gitignore에 추가하십시오."
+            )
         );
-    } else {
-        println!("적용했습니다: {}", outcome.path.display());
-        if let Some(backup) = outcome.backup {
-            println!("백업: {}", backup.display());
-        }
     }
     ExitCode::SUCCESS
+}
+
+fn print_outcome(outcome: &Outcome, dry_run: bool, lang: Lang) {
+    let path = outcome.path.display();
+    if !outcome.changed {
+        println!("{}", tr!(lang, "No change: {path}", "변경 없음: {path}"));
+        return;
+    }
+    print!("{}", outcome.diff);
+    if dry_run {
+        println!(
+            "{}",
+            tr!(
+                lang,
+                "(dry-run) Nothing written: {path}",
+                "(dry-run) 파일을 쓰지 않았습니다: {path}"
+            )
+        );
+        return;
+    }
+    println!("{}", tr!(lang, "Applied: {path}", "적용했습니다: {path}"));
+    if let Some(backup) = &outcome.backup {
+        let backup = backup.display();
+        println!("{}", tr!(lang, "Backup: {backup}", "백업: {backup}"));
+    }
+}
+
+fn ui_lang(paths: &Paths) -> Lang {
+    Config::load(&paths.config()).map_or(Lang::En, |c| c.ui.language)
 }
 
 /// 설정에 따라 데몬을 띄우는 방법을 고른다. (FR-DMN-7)
@@ -309,11 +350,18 @@ fn query_daemon(paths: &Paths, req: &Request) -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Response::Status(s)) => {
-            print!("{}", s.render());
+            print!("{}", s.render(config.ui.language));
             ExitCode::SUCCESS
         }
         Ok(Response::Done) => {
-            println!("재색인을 시작했습니다. 진행 상태는 `hippo status`로 확인할 수 있습니다.");
+            println!(
+                "{}",
+                tr!(
+                    config.ui.language,
+                    "Reindex started. Check progress with `hippo status`.",
+                    "재색인을 시작했습니다. 진행 상태는 `hippo status`로 확인할 수 있습니다."
+                )
+            );
             ExitCode::SUCCESS
         }
         Ok(Response::Error { message }) => fail(&message),
@@ -334,6 +382,7 @@ fn run_import(paths: &Paths, cwd: &str, from: Option<String>, to: Option<String>
         Ok(c) => c,
         Err(e) => return fail(&e.to_string()),
     };
+    let lang = config.ui.language;
     ensure_daemon(paths, launcher(&config), STARTUP_WAIT);
     let (project_id, summary, sessions) = match request(
         &paths.socket(),
@@ -351,7 +400,10 @@ fn run_import(paths: &Paths, cwd: &str, from: Option<String>, to: Option<String>
     };
     print!("{}", escape_control(&summary));
     let total = sessions.len();
-    println!("후보 세션 {total}개");
+    println!(
+        "{}",
+        tr!(lang, "Candidate sessions: {total}", "후보 세션 {total}개")
+    );
     let mut tally = ImportTally::default();
     for (n, c) in sessions.into_iter().enumerate() {
         let short: String = c.session_id.chars().take(SESSION_ID_SHORT).collect();
@@ -363,16 +415,18 @@ fn run_import(paths: &Paths, cwd: &str, from: Option<String>, to: Option<String>
         let line = match request(&paths.socket(), &req, QUERY_TIMEOUT) {
             Ok(Response::ImportSession(r)) => {
                 tally.add(&r);
-                format!(
+                tr!(
+                    lang,
+                    "{}  iterations {}  pending embeddings {}",
                     "{} 반복 {}  남은 임베딩 {}",
-                    outcome_label(r.outcome),
+                    outcome_label(r.outcome, lang),
                     r.iterations,
                     r.pending_embeds
                 )
             }
             Ok(Response::Error { message }) => {
                 tally.errors += 1;
-                format!("오류: {message}")
+                tr!(lang, "error: {message}", "오류: {message}")
             }
             Ok(other) => return fail(&format!("unexpected response: {other:?}")),
             Err(e) => return fail(&e.to_string()),
@@ -383,18 +437,28 @@ fn run_import(paths: &Paths, cwd: &str, from: Option<String>, to: Option<String>
         );
     }
     println!(
-        "합계: 세션 {total}개 중 가져옴 {}, 변경 없음 {}, 다른 프로젝트 {}, 오류 {}. 반복 {}개 저장, fork 복사본 {}개 건너뜀.",
-        tally.imported,
-        tally.unchanged,
-        tally.other,
-        tally.errors,
-        tally.iterations,
-        tally.fork_skipped
+        "{}",
+        tr!(
+            lang,
+            "Total: {total} sessions; imported {}, unchanged {}, other project {}, errors {}. Stored {} iterations, skipped {} fork copies.",
+            "합계: 세션 {total}개 중 가져옴 {}, 변경 없음 {}, 다른 프로젝트 {}, 오류 {}. 반복 {}개 저장, fork 복사본 {}개 건너뜀.",
+            tally.imported,
+            tally.unchanged,
+            tally.other,
+            tally.errors,
+            tally.iterations,
+            tally.fork_skipped
+        )
     );
     if tally.pending_embeds > 0 {
         println!(
-            "남은 임베딩 작업 {}개는 데몬이 계속 처리합니다. 진행 상태는 `hippo status`로 확인할 수 있습니다.",
-            tally.pending_embeds
+            "{}",
+            tr!(
+                lang,
+                "The daemon keeps working on the {} pending embedding jobs. Check progress with `hippo status`.",
+                "남은 임베딩 작업 {}개는 데몬이 계속 처리합니다. 진행 상태는 `hippo status`로 확인할 수 있습니다.",
+                tally.pending_embeds
+            )
         );
     }
     ExitCode::SUCCESS
@@ -426,11 +490,14 @@ impl ImportTally {
     }
 }
 
-fn outcome_label(outcome: ImportOutcome) -> &'static str {
-    match outcome {
-        ImportOutcome::Imported => "가져옴",
-        ImportOutcome::Unchanged => "변경 없음",
-        ImportOutcome::OtherProject => "다른 프로젝트",
+fn outcome_label(outcome: ImportOutcome, lang: Lang) -> &'static str {
+    match (outcome, lang) {
+        (ImportOutcome::Imported, Lang::En) => "imported",
+        (ImportOutcome::Unchanged, Lang::En) => "unchanged",
+        (ImportOutcome::OtherProject, Lang::En) => "other project",
+        (ImportOutcome::Imported, Lang::Ko) => "가져옴",
+        (ImportOutcome::Unchanged, Lang::Ko) => "변경 없음",
+        (ImportOutcome::OtherProject, Lang::Ko) => "다른 프로젝트",
     }
 }
 

@@ -111,7 +111,6 @@ fn processes_jobs_into_vectors_with_metadata() {
 
     let it_filter = VectorFilter {
         kind: Some(RecordKind::Iteration),
-        cwd: Some("/w".into()),
         ..Default::default()
     };
     let q = e

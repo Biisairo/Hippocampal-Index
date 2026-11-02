@@ -2,7 +2,7 @@
 
 | 항목 | 값 |
 |------|----|
-| 문서 버전 | 0.3 (실시간 수집 기준 턴, 과거 기록 가져오기) |
+| 문서 버전 | 0.4 (설치 시 Claude 안내문, 출력 언어, cwd 필터 제거) |
 | 작성일 | 2026-11-02 |
 | 작성자 | biisairo |
 | 준거 표준 | ISO/IEC/IEEE 29148:2018 |
@@ -97,7 +97,7 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 - C-4 데이터를 로컬 장비 밖으로 전송하지 않는다. 네트워크 통신은 `localhost`의 Ollama로 한정한다. 임베더 URL은 URL 파서로 해석하며, 스킴이 `http`/`https`가 아니거나, host가 `localhost`, `127.0.0.1`, `::1`이 아니거나, userinfo(`@`)·쿼리·프래그먼트가 있으면 거부한다. 이 검사는 설정을 읽을 때와 임베더를 만들 때 모두 수행한다. HTTP 리다이렉트는 따르지 않는다.
 - C-5 MCP 서버를 사용하지 않는다. (사내 규정상 새 MCP 서버는 정보보호팀 승인 대상)
 - C-6 1차 대상 플랫폼은 macOS(darwin)이다.
-- C-7 Claude Code 설정 파일은 사용자가 `hippo install`/`hippo uninstall`을 실행할 때만 수정한다. 그 밖의 명령과 데몬은 설정 파일을 수정하지 않는다.
+- C-7 Claude Code 설정 파일과 메모리 파일(FR-INS-7)은 사용자가 `hippo install`/`hippo uninstall`을 실행할 때만 수정한다. 그 밖의 명령과 데몬은 설정 파일을 수정하지 않는다.
 
 ### 2.5 가정과 의존성
 - A-1 Claude Code의 hook 입력 스키마와 transcript JSONL 형식은 부록 A의 실측 결과(Claude Code 2.1.316)와 같다. 버전이 바뀌면 재검증한다.
@@ -159,10 +159,16 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 | IF-SK-1 | 데몬은 `~/.hippo/hippo.sock` Unix socket으로 줄 단위 JSON 요청과 응답을 주고받아야 한다. | M |
 | IF-SK-2 | 요청 종류는 `ingest`(hook 이벤트 전달), `inject`(자동 주입 텍스트 생성), `search`, `show`, `status`, `reindex`, `project_list`, `import_prepare`, `import_session`이다. `ingest`를 뺀 요청은 판정에 쓸 `cwd`를 담는다. 연결 하나에 요청 하나, 응답 하나를 주고받는다. | M |
 
-#### 3.1.4 Skill
+#### 3.1.4 Claude 안내문
 | ID | 요구사항 | 우선순위 |
 |----|----------|----------|
-| IF-SKL-1 | Claude가 과거 기억이 필요할 때 `hippo search`와 `hippo show`를 Bash로 호출하는 방법을 안내하는 skill 문서(`SKILL.md`)를 제공해야 한다. | M |
+| IF-SKL-1 | Claude가 과거 기억이 필요할 때 `hippo search`와 `hippo show`를 Bash로 호출하는 방법을 안내하는 블록을, `hippo install`이 hook 범위에 맞는 Claude 메모리 파일에 넣어야 한다(FR-INS-7). 블록 내용은 영어로 고정한다(FR-UI-2). | M |
+
+#### 3.1.5 출력 언어
+| ID | 요구사항 | 우선순위 |
+|----|----------|----------|
+| FR-UI-1 | 사람이 읽는 출력(CLI 출력, 데몬이 만드는 `search`/`show`/`status`/`project list`/가져오기 결과 텍스트, 오류 메시지, 설치 안내)은 설정 `[ui] language`(`en` 또는 `ko`, 기본 `en`)의 언어로 만들어야 한다. 데몬은 텍스트를 만드는 요청마다 `config.toml`의 `[ui] language`를 다시 읽는다. 파일을 읽지 못하면 시작할 때의 설정을 쓴다. | M |
+| FR-UI-2 | Claude가 읽는 텍스트(자동 주입 블록, FR-INS-7의 안내 블록, `embed_text`의 섹션 이름)와 `--help`의 명령 설명은 언어 설정과 관계없이 영어로 만든다. | M |
 
 ### 3.2 기능 요구사항
 
@@ -207,8 +213,8 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 #### 3.2.4 저장 (STO)
 | ID | 요구사항 | 우선순위 |
 |----|----------|----------|
-| FR-STO-1 | 원본 저장소의 `iterations` 테이블에 반복마다 행 1개를 저장해야 한다. 필드: `id`(`<session_id>:<message_id>`), `session_id`, `prompt_id`, `message_id`, `iteration_index`(턴 안 순번), `cwd`, `ts`, `inputs`(JSON), `tool_calls`(JSON: `id`, `name`, `input`, `is_error`. 결과 원문은 넣지 않는다), `response_text`, `embed_text`. 반복과 결과의 연결은 `iteration_results`(`iteration_id`, `tool_use_id`, `result_id`)에 저장한다. 벡터 저장소에는 `id`, `vector`, `embed_model`과 필터용 메타데이터(`cwd`, `session_id`, `ts`)를 저장한다. `ts`는 반복 시각(FR-EXT-11)이며 가져오기에서도 transcript의 원래 값을 쓴다. 자동 주입(FR-RET-4)과 `show` 출력에 이 시각을 표시해 같은 주제의 기록 사이 선후를 알 수 있게 한다. | M |
-| FR-STO-2 | `embed_text`는 다음 순서로 만든다. 비어 있는 섹션은 넣지 않는다.<br>`[입력] <반복 입력>` (입력마다 1줄. 완료 알림은 `<status>: <summary>`)<br>`[툴] <name>(<input compact JSON>)` (호출마다 1줄. JSON이 설정 길이(기본 500자)를 넘으면 그 길이에서 자르고 `…`를 붙인다. 원문 입력은 `tool_calls`에 그대로 남는다)<br>`[응답] <text 블록을 개행으로 이어 붙임>` | M |
+| FR-STO-1 | 원본 저장소의 `iterations` 테이블에 반복마다 행 1개를 저장해야 한다. 필드: `id`(`<session_id>:<message_id>`), `session_id`, `prompt_id`, `message_id`, `iteration_index`(턴 안 순번), `cwd`, `ts`, `inputs`(JSON), `tool_calls`(JSON: `id`, `name`, `input`, `is_error`. 결과 원문은 넣지 않는다), `response_text`, `embed_text`. 반복과 결과의 연결은 `iteration_results`(`iteration_id`, `tool_use_id`, `result_id`)에 저장한다. 벡터 저장소에는 `id`, `vector`, `embed_model`과 메타데이터(`cwd`, `session_id`, `ts`)를 저장한다. `ts`는 반복 시각(FR-EXT-11)이며 가져오기에서도 transcript의 원래 값을 쓴다. 자동 주입(FR-RET-4)과 `show` 출력에 이 시각을 표시해 같은 주제의 기록 사이 선후를 알 수 있게 한다. | M |
+| FR-STO-2 | `embed_text`는 다음 순서로 만든다. 비어 있는 섹션은 넣지 않는다.<br>`[input] <반복 입력>` (입력마다 1줄. 완료 알림은 `<status>: <summary>`)<br>`[tool] <name>(<input compact JSON>)` (호출마다 1줄. JSON이 설정 길이(기본 500자)를 넘으면 그 길이에서 자르고 `…`를 붙인다. 원문 입력은 `tool_calls`에 그대로 남는다)<br>`[response] <text 블록을 개행으로 이어 붙임>` | M |
 | FR-STO-3 | 원본 저장소의 `results` 테이블에 결과 원문을 원문 단위로 저장해야 한다. 필드: `id`(원문의 SHA-256 hex), `tool_name`(처음 저장한 도구), `text`, `first_seen_ts`. 빈 원문은 저장하지 않는다. 벡터는 벡터 저장소에 청크 단위로 저장한다. | M |
 | FR-STO-4 | 같은 프로젝트 저장소에 같은 `content_hash`가 이미 있으면 결과를 새로 저장하거나 임베딩하지 않고 기존 결과 id를 반복에 연결해야 한다. | M |
 | FR-STO-5 | 결과 원문이나 반복의 `embed_text`가 청크 한도를 넘으면 여러 청크로 나눠 청크마다 벡터를 만들어야 한다. 청크 한도(문자 수)는 임베더의 `max_input_tokens()`와 설정값(기본 8,000) 중 작은 값에 `chars_per_token`(기본 1.0)을 곱한 값이다. 청크는 한도 안에서 마지막 개행 위치에서 나누고, 개행이 없으면 한도에서 나눈다. 청크를 순서대로 이어 붙이면 원문과 같아야 한다. | M |
@@ -224,7 +230,7 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 | FR-RET-1 | `user-prompt-submit` hook은 프롬프트로 현재 세션의 프로젝트 저장소에서 `iterations`를 검색해야 한다. 현재 세션의 프로젝트는 목록 DB의 세션 고정값이며, 고정값이 없으면 요청의 `cwd`로 FR-PRJ-5의 조회 전용 판정을 한다. 프로젝트가 없으면 아무것도 주입하지 않는다. `session_id`가 현재 세션과 같은 반복은 제외한다. 다른 프로젝트는 검색하지 않는다. | M |
 | FR-RET-2 | 검색은 벡터 검색과 FTS 결과를 합친 하이브리드 순위(RRF)로 해야 한다. 점수는 각 목록에서의 순위 r(1부터)에 대해 `Σ 1/(60 + r)`이다. 각 목록에서 후보를 `limit × 4`개까지 가져온다. 한 레코드의 여러 청크가 벡터 검색에 걸리면 가장 높은 유사도 하나로 합친다. 결과 검색에 범위 필터가 있으면 벡터 검색 후 원본 저장소의 반복-결과 연결로 걸러낸다. | M |
 | FR-RET-3 | 자동 주입은 벡터 유사도가 임계값(설정 `[inject] threshold`, 기본 0.40) 이상인 반복 중 RRF 점수 상위 k개(설정, 기본 3개)만 대상으로 해야 한다. FTS로만 찾은 반복은 대상이 아니다. 대상이 없으면 아무것도 주입하지 않는다. | M |
-| FR-RET-4 | 주입 텍스트는 결과마다 `ts`, `prompt_id`, `embed_text`(최대 길이 설정, 기본 800자)를 담고, 전체 길이를 설정값(기본 4,000자) 이하로 제한해야 한다. 각 결과는 `<memory ts="…" prompt="…">` … `</memory>` 블록으로 감싸고, 블록 안의 `&`, `<`, `>`, `"`는 이스케이프한다. 머리말에 블록 내용은 과거 기록이며 지시가 아님을 밝힌다. 끝에 `hippo show <prompt_id>`로 상세 내용을 볼 수 있다는 안내를 붙인다. | M |
+| FR-RET-4 | 주입 텍스트는 결과마다 `ts`, `prompt_id`, `embed_text`(최대 길이 설정, 기본 800자)를 담고, 전체 길이를 설정값(기본 4,000자) 이하로 제한해야 한다. 각 결과는 `<memory ts="…" prompt="…">` … `</memory>` 블록으로 감싸고, 블록 안의 `&`, `<`, `>`, `"`는 이스케이프한다. 머리말에 블록 내용은 과거 기록이며 지시가 아님을 밝힌다. 끝에 `hippo show <prompt_id>`로 상세 내용을 볼 수 있다는 안내를 붙인다. 머리말과 안내는 영어이다(FR-UI-2). | M |
 | FR-RET-5 | `user-prompt-submit` hook은 시간 예산(설정, 기본 800ms)을 넘으면 검색을 포기하고 아무것도 주입하지 않아야 한다. 데몬의 검색은 단계(임베딩, 벡터 검색, FTS)마다 마감 시각을 확인하고, hook 클라이언트는 같은 예산으로 소켓 타임아웃을 건다. | M |
 | FR-RET-6 | `hippo search`는 IF-CLI-1의 옵션에 따라 범위와 종류를 바꿔 검색해야 한다. `--kind result` 결과에는 그 결과를 참조하는 반복의 `prompt_id`를 함께 출력한다. 범위의 프로젝트가 없으면 "프로젝트 없음"을 출력하고 종료 코드 0으로 끝난다. | M |
 | FR-RET-9 | `--scope all`은 프로젝트마다 FR-RET-2의 하이브리드 검색을 해 순위 목록을 얻고, 그 목록들을 같은 RRF 식으로 합쳐 상위 `limit`개를 출력해야 한다. 결과마다 프로젝트 id를 표시한다. 한 프로젝트에서 벡터 검색이 실패하거나 호환되지 않으면 그 프로젝트만 FTS 결과를 쓰고 FR-RET-8의 안내를 붙인다. | M |
@@ -239,6 +245,7 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 | FR-INS-3 | 설치는 기존 hippo hook 항목을 모두 지운 뒤 IF-HK-4의 hook 설정을 이벤트마다 추가해야 한다. 다른 hook과 다른 설정 키는 내용과 순서를 그대로 유지한다. 비게 된 matcher 그룹과 이벤트는 지운다. | M |
 | FR-INS-4 | 제거는 hippo hook 항목만 지워야 한다. 비게 된 matcher 그룹, 이벤트, `hooks` 키는 지운다. | M |
 | FR-INS-5 | 결과가 기존 내용과 같으면 파일을 쓰지 않고 "변경 없음"을 출력한다. 다르면 변경 내용(diff)을 출력하고, 기존 파일이 있으면 `<파일>.hippo-backup-<유닉스 시각>`(이미 있으면 `-<번호>`를 붙임)으로 백업한 뒤 임시 파일에 쓰고 이름을 바꿔 원자적으로 교체한다. 기존 파일 권한을 유지한다. 임시 파일은 같은 디렉터리에 무작위 이름으로 배타적으로 만들고, 백업은 링크를 따르지 않는 배타적 생성(권한 0600)으로 만든다. 설정 파일이나 바로 위 디렉터리가 심볼릭 링크이면 수정하지 않고 오류로 끝낸다. `--dry-run`이면 diff만 출력하고 아무것도 쓰지 않는다. | M |
+| FR-INS-7 | 설치는 hook 범위에 맞는 Claude 메모리 파일에 안내 블록을 넣어야 한다. `--scope user`는 `$HOME/.claude/CLAUDE.md`, `--scope project`는 `<프로젝트>/CLAUDE.local.md`이다. 블록은 `<!-- hippo:begin -->` 줄과 `<!-- hippo:end -->` 줄로 감싼다(Claude Code는 블록 HTML 주석을 컨텍스트에 넣기 전에 지운다). 블록이 이미 있으면 그 블록만 새 내용으로 바꾸고, 없으면 파일 끝에 빈 줄 하나를 두고 덧붙인다. 블록 밖의 내용은 그대로 둔다. 제거는 블록만 지우고, 그 결과 파일이 공백뿐이면 파일을 지운다. 시작 표식만 있고 끝 표식이 없으면 수정하지 않고 오류로 끝낸다. 쓰기, 백업, 변경 없음, diff, `--dry-run`, 심볼릭 링크 거부는 FR-INS-5와 같다. `--scope project`이고 프로젝트가 git 작업 트리 안인데 `CLAUDE.local.md`가 git에서 무시되지 않으면(`git check-ignore`) 커밋될 수 있다는 경고를 출력한다. `.gitignore`는 바꾸지 않는다. | M |
 | FR-INS-6 | 기존 파일이 JSON으로 해석되지 않거나, 최상위가 객체가 아니거나, `hooks`가 객체가 아니면 수정하지 않고 오류로 끝낸다. 파일이 없으면 새로 만든다(디렉터리 포함). | M |
 
 #### 3.2.9 임베딩 서버 자동 시작 (EMB)
@@ -276,7 +283,7 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 | ID | 요구사항 | 우선순위 |
 |----|----------|----------|
 | FR-SWP-1 | 임베더는 `Embedder` 트레이트로 추상화해야 한다. 트레이트는 최소한 `model_id()`, `dimension()`, `max_input_tokens()`, `embed(texts) -> vectors`를 제공한다. 임베더를 사용하는 코드는 구체 백엔드 타입에 의존하지 않아야 한다. | M |
-| FR-SWP-2 | 벡터 저장소는 `VectorStore` 트레이트로 추상화해야 한다. 트레이트는 최소한 `info`, `upsert`, `delete`, `search(vector, filter, limit)`, `count`, `ensure_index`, `scan`(모든 벡터 레코드를 차례로 읽음. FR-PRJ-9의 복사에 쓴다)을 제공한다. 필터는 백엔드 중립 타입(`kind`, `cwd`, `session_id` 제외, `embed_model`)으로 표현한다. 벡터 레코드 id는 `<kind>:<ref_id>#<chunk_index>`이다. 결과 벡터에는 `cwd`와 `session_id`를 넣지 않는다. 검색 점수는 코사인 유사도이며 클수록 가깝다. 저장소는 처음 저장한 벡터의 `embed_model`과 차원을 `info`로 돌려주고, 차원이 다른 벡터의 저장은 오류로 거부해야 한다. | M |
+| FR-SWP-2 | 벡터 저장소는 `VectorStore` 트레이트로 추상화해야 한다. 트레이트는 최소한 `info`, `upsert`, `delete`, `search(vector, filter, limit)`, `count`, `ensure_index`, `scan`(모든 벡터 레코드를 차례로 읽음. FR-PRJ-9의 복사에 쓴다)을 제공한다. 필터는 백엔드 중립 타입(`kind`, `session_id` 제외, `embed_model`)으로 표현한다. 경로 범위는 프로젝트 저장소 단위로 나누므로 필터에 두지 않는다. 벡터 레코드 id는 `<kind>:<ref_id>#<chunk_index>`이다. 결과 벡터에는 `cwd`와 `session_id`를 넣지 않는다. 검색 점수는 코사인 유사도이며 클수록 가깝다. 저장소는 처음 저장한 벡터의 `embed_model`과 차원을 `info`로 돌려주고, 차원이 다른 벡터의 저장은 오류로 거부해야 한다. | M |
 | FR-SWP-3 | 사용할 임베더 백엔드, 모델, 차원과 벡터 저장소 백엔드는 `config.toml`로 선택해야 한다. 백엔드를 추가할 때 수집, 해석, 검색 로직을 수정하지 않아야 한다. | M |
 | FR-SWP-4 | 원본 저장소는 벡터 없이도 반복, 결과, 임베딩 대상 텍스트를 모두 보관해야 한다. 벡터 저장소의 내용은 원본 저장소에서 다시 만들 수 있어야 한다. | M |
 | FR-SWP-5 | `hippo reindex`는 데몬에 재색인을 요청하고, 데몬은 범위(IF-CLI-7)의 프로젝트마다 차례로, 현재 설정의 임베더와 벡터 저장소 백엔드로 그 프로젝트의 원본 저장소 전체를 새 세대 디렉터리(`projects/<id>/vectors/<이름>/<세대>/`)에 다시 색인해야 한다. 재색인은 백그라운드로 실행하며 그동안 기존 저장소로 검색할 수 있어야 한다(호환되지 않으면 FTS 전용). 재색인 중에는 임베딩 작업 스레드를 멈춰, 그 사이 들어온 작업이 전환 후 새 저장소에 반영되게 한다. 프로젝트마다 완료하면 그 프로젝트의 `vectors/<이름>/ACTIVE` 포인터를 원자적으로 바꿔 전환하고 호환성을 다시 판정한다. 한 프로젝트가 실패하면 그 프로젝트를 실패로 기록하고 다음 프로젝트를 계속한다. 이미 재색인 중이면 오류를 돌려준다. 교체 절차: 설정 변경 → 데몬 재시작 → `hippo reindex`. | M |
@@ -293,7 +300,7 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 | FR-DMN-2 | 원본 저장소와 벡터 저장소 쓰기는 데몬만 수행해야 한다. | M |
 | FR-DMN-3 | 데몬은 세션 단위 처리 요청을 직렬로 처리해 같은 세션을 동시에 처리하지 않아야 한다. | M |
 | FR-DMN-4 | 데몬은 처리 오류를 `~/.hippo/logs/`에 기록하고 계속 동작해야 한다. | M |
-| FR-DMN-5 | 데몬은 시작할 때 데이터 루트와 하위 디렉터리를 권한 0700으로 만들거나 맞추고, 잠금을 얻은 뒤 남아 있는 소켓 파일을 지우고 새로 만들어야 한다. 소켓 파일 권한은 0600이다. | M |
+| FR-DMN-5 | 데몬은 시작할 때 데이터 루트와 하위 디렉터리를 권한 0700으로 만들거나 맞추고, 잠금 파일(`hippo.lock`)의 권한을 0600으로 맞추고, 잠금을 얻은 뒤 남아 있는 소켓 파일을 지우고 새로 만들어야 한다. 소켓 파일 권한은 0600이다. | M |
 | FR-DMN-7 | hook 클라이언트와 CLI는 데몬에 연결할 수 없으면, 설정 `[daemon] autostart`(기본 true)가 켜져 있을 때 같은 실행 파일로 `daemon` 명령을 분리된 프로세스(별도 프로세스 그룹)로 띄워야 한다. 데몬의 stderr는 `logs/daemon.err`에 덧붙인다. 띄운 뒤에는 소켓에 연결될 때까지 기다린다(수집과 CLI는 최대 5초, 자동 주입은 남은 시간 예산까지). 여러 클라이언트가 동시에 띄워도 FR-DMN-1에 따라 하나만 남는다. | M |
 | FR-DMN-8 | 데몬은 마지막 요청을 받은 뒤 `[daemon] idle_timeout_secs`(기본 1800, 0이면 종료하지 않음) 동안 요청이 없으면 스스로 종료해야 한다. 재색인 중에는 종료하지 않는다. 종료할 때 소켓 파일을 지운다. 남은 임베딩 작업은 원본 저장소에 남아 다음 실행 때 처리된다. | M |
 | FR-DMN-6 | 수집, 가져오기 준비(FR-PRJ-7), 세션 가져오기(FR-IMP-3)는 전용 쓰기 스레드 하나가 처리해야 한다. 쓰기 스레드는 FR-IMP-6의 우선순위를 따르고, 같은 우선순위 안에서는 요청 순서대로 처리한다. 임베딩 작업은 별도 스레드 하나가 처리한다. 데몬은 메모리에 (프로젝트 id, 작업) 큐를 두 단계(일반, `bulk`)로 두고, 커밋될 때 등록된 작업을 `bulk` 값에 맞는 단계의 끝에 넣는다. 데몬이 시작할 때 모든 프로젝트의 `embed_jobs`를 `enqueued_at` 순으로 읽어 `bulk` 값에 맞는 단계에 넣는다. 임베딩 스레드는 일반 단계가 비어 있을 때만 `bulk` 단계에서 꺼내며, 한 단계의 앞에서부터 같은 프로젝트의 작업을 `job_batch`개까지 묶어 처리한다. 실패하면 작업을 큐에 남기고 일정 시간 뒤 재시도한다. 벡터 저장소가 호환되지 않는 프로젝트(FR-SWP-6)의 작업은 큐에서 빼고 원본 저장소에만 남긴다. 그 프로젝트의 재색인이 끝나면 남은 작업을 다시 큐에 넣는다. | M |
@@ -340,6 +347,8 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 | FR-DMN-*, QA-1 | 테스트 | 중복 실행 거부, 강제 종료 후 재시작 시 누락과 중복 없음 확인. `max_open_projects`를 넘을 때 닫힘, 여러 프로젝트 작업의 단일 FIFO 처리 순서 확인 |
 | FR-PRJ-* | 테스트 | 임시 디렉터리에 git 저장소를 만들어(`git init`, 커밋, `git worktree add`, `mv`, 두 번째 clone) worktree 통합, 판정 규칙 (a)~(d), 세션 중 `cd`해도 고정값 유지, 조회 전용 판정이 목록 DB를 바꾸지 않음 확인. 가져오기 준비의 네 경우(FR-PRJ-7), 벡터 복사와 재임베딩 분기, 중간 실패 후 재실행 멱등성 확인 |
 | FR-IMP-* | 테스트 | 임시 transcripts 디렉터리로 후보 선택(하위 경로, worktree, 없어진 경로, 프로젝트 id, `subagents/` 제외, 정렬), 세션 상태별 처리 (a)~(c), 끝 반복의 완료·보류 판정, 다른 프로젝트 세션 건너뜀, fork 복사본 건너뜀, 재실행 시 "변경 없음", `bulk` 작업 등록과 임베딩 큐 우선순위, 쓰기 작업 우선순위 확인 |
+| FR-INS-*, IF-SKL-1 | 테스트 | 임시 HOME과 프로젝트에서 hook 병합·제거, 안내 블록 추가·교체·제거(블록 밖 내용 유지, 공백만 남으면 파일 삭제), 끝 표식 없는 블록 거부, 심볼릭 링크 거부, `--dry-run`, 무시되지 않는 `CLAUDE.local.md` 경고 확인 |
+| FR-UI-* | 테스트 | 기본(en)과 `ko` 설정에서 CLI·데몬 출력 언어 확인, 설정 파일 변경이 데몬 재시작 없이 다음 요청에 반영됨 확인, 주입 블록·안내 블록·`embed_text`가 언어 설정과 관계없이 영어임 확인 |
 | PR-1~4 | 시연 | 벤치마크 스크립트로 측정 |
 | QA-3 | 검사 | 코드 리뷰와 실행 중 네트워크 연결 목록 확인(`lsof -i`) |
 | 부록 B 항목 | 시연 | 대화형 세션에서 확인 |

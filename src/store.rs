@@ -141,7 +141,6 @@ pub struct MergeReport {
 
 #[derive(Debug, Clone, Default)]
 pub struct FtsFilter {
-    pub cwd: Option<String>,
     pub exclude_session: Option<String>,
 }
 
@@ -444,8 +443,8 @@ impl RecordStore {
             "SELECT i.id, bm25(iterations_fts) FROM iterations_fts
              JOIN iterations i ON i.rowid = iterations_fts.rowid
              WHERE iterations_fts MATCH ?1
-               AND (?2 IS NULL OR i.cwd = ?2) AND (?3 IS NULL OR i.session_id <> ?3)
-             ORDER BY bm25(iterations_fts) LIMIT ?4",
+               AND (?2 IS NULL OR i.session_id <> ?2)
+             ORDER BY bm25(iterations_fts) LIMIT ?3",
             query,
             filter,
             limit,
@@ -462,10 +461,10 @@ impl RecordStore {
             "SELECT r.id, bm25(results_fts) FROM results_fts
              JOIN results r ON r.rowid = results_fts.rowid
              WHERE results_fts MATCH ?1
-               AND ((?2 IS NULL AND ?3 IS NULL) OR EXISTS (
+               AND (?2 IS NULL OR EXISTS (
                    SELECT 1 FROM iteration_results ir JOIN iterations i ON i.id = ir.iteration_id
-                   WHERE ir.result_id = r.id AND (?2 IS NULL OR i.cwd = ?2) AND (?3 IS NULL OR i.session_id <> ?3)))
-             ORDER BY bm25(results_fts) LIMIT ?4",
+                   WHERE ir.result_id = r.id AND i.session_id <> ?2))
+             ORDER BY bm25(results_fts) LIMIT ?3",
             query,
             filter,
             limit,
@@ -474,15 +473,15 @@ impl RecordStore {
 
     /// 결과를 참조하는 반복 중 필터를 만족하는 것이 있는지. 필터가 비어 있으면 항상 참. (FR-RET-2)
     pub fn result_in_scope(&self, result_id: &str, filter: &FtsFilter) -> Result<bool> {
-        if filter.cwd.is_none() && filter.exclude_session.is_none() {
+        let Some(exclude) = &filter.exclude_session else {
             return Ok(true);
-        }
+        };
         Ok(self
             .conn
             .query_row(
                 "SELECT EXISTS (SELECT 1 FROM iteration_results ir JOIN iterations i ON i.id = ir.iteration_id
-                 WHERE ir.result_id = ?1 AND (?2 IS NULL OR i.cwd = ?2) AND (?3 IS NULL OR i.session_id <> ?3))",
-                params![result_id, filter.cwd, filter.exclude_session],
+                 WHERE ir.result_id = ?1 AND i.session_id <> ?2)",
+                params![result_id, exclude],
                 |r| r.get(0),
             )?)
     }
@@ -531,7 +530,7 @@ impl RecordStore {
         };
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map(
-            params![fts_query, filter.cwd, filter.exclude_session, limit as i64],
+            params![fts_query, filter.exclude_session, limit as i64],
             |r| {
                 Ok(FtsHit {
                     id: r.get(0)?,

@@ -16,6 +16,7 @@ use crate::config::{Config, Paths};
 use crate::embedder::Embedder;
 use crate::fsutil::{ensure_private_dir, open_private_append, set_private_file};
 use crate::generations::{activate, active_dir, cleanup_inactive, new_generation};
+use crate::i18n::Lang;
 use crate::import::candidates;
 use crate::indexer::{ChunkConfig, Compatibility, compatibility, process_jobs, reindex};
 use crate::ingest::{
@@ -24,8 +25,8 @@ use crate::ingest::{
 };
 use crate::project::{Location, locate, normalize};
 use crate::protocol::{
-    COMPAT_MISMATCH, ImportSessionReport, MISSING_LOCATION, ProjectStatus, REINDEX_RUNNING,
-    Request, Response, Scope, StatusInfo,
+    COMPAT_MISMATCH, ImportSessionReport, ProjectStatus, REINDEX_RUNNING, Request, Response, Scope,
+    StatusInfo, missing_location,
 };
 use crate::queue::{EmbedQueue, Lane, LaneQueue};
 use crate::redact::Redactor;
@@ -37,6 +38,7 @@ use crate::search::{
 };
 use crate::spool;
 use crate::store::{EmbedJob, RecordStore};
+use crate::tr;
 use crate::vector::VectorStore;
 
 #[derive(Debug, thiserror::Error)]
@@ -60,7 +62,17 @@ const REINDEX_PAGE: usize = 256;
 const LOG_FILE: &str = "hippo.log";
 const REINDEX_IDLE: &str = "idle";
 const REINDEX_DONE: &str = "done";
-const NO_PROJECT: &str = "프로젝트 없음\n";
+fn no_project(lang: Lang) -> String {
+    tr!(lang, "No project\n", "프로젝트 없음\n")
+}
+
+fn reindex_busy(lang: Lang) -> String {
+    tr!(
+        lang,
+        "Cannot import while reindexing",
+        "재색인 중에는 가져올 수 없습니다"
+    )
+}
 
 type Reply = Sender<Response>;
 
@@ -303,6 +315,15 @@ impl Shared {
         Ok(())
     }
 
+    /// 사람이 읽는 출력의 언어. 요청마다 설정 파일에서 다시 읽는다. (FR-UI-1)
+    fn lang(&self) -> Lang {
+        let path = self.paths.config();
+        if !path.exists() {
+            return self.config.ui.language;
+        }
+        Config::load(&path).map_or(self.config.ui.language, |c| c.ui.language)
+    }
+
     fn chunking(&self) -> ChunkConfig {
         ChunkConfig {
             max_tokens: self.config.chunking.max_tokens,
@@ -386,6 +407,7 @@ pub fn start(
         .truncate(false)
         .write(true)
         .open(paths.lock())?;
+    set_private_file(&paths.lock())?;
     match lock_file.try_lock() {
         Ok(()) => {}
         Err(fs::TryLockError::WouldBlock) => return Err(DaemonError::AlreadyRunning),
@@ -608,8 +630,9 @@ fn import_origin(shared: &Shared, from: &str) -> Result<(PathBuf, String), Strin
 /// 원본·대상 프로젝트를 정해 위치를 바꾸거나 병합한다. 후보 세션은 연결 스레드가 찾는다. (FR-PRJ-7)
 fn import_prepare(shared: &Shared, from: &str, to: &str) -> Result<Response, String> {
     if shared.reindexing.load(Ordering::SeqCst) {
-        return Err("재색인 중에는 가져올 수 없습니다".into());
+        return Err(reindex_busy(shared.lang()));
     }
+    let lang = shared.lang();
     let to_loc = shared.locate(to);
     let found = lock(&shared.registry)?
         .find_source(from)
@@ -632,16 +655,23 @@ fn import_prepare(shared: &Shared, from: &str, to: &str) -> Result<Response, Str
             let id = lock(&shared.registry)?
                 .resolve(&to_loc, now_secs())
                 .map_err(|e| e.to_string())?;
-            let text = format!("프로젝트 {id}을(를) {}에 만들었습니다.\n", to_loc.path);
+            let path = &to_loc.path;
+            let text = tr!(
+                lang,
+                "Created project {id} at {path}.\n",
+                "프로젝트 {id}을(를) {path}에 만들었습니다.\n"
+            );
             (id, text)
         }
         (Some(source), None) => {
             lock(&shared.registry)?
                 .relocate(&source, &to_loc)
                 .map_err(|e| e.to_string())?;
-            let text = format!(
-                "프로젝트 {source}의 위치를 {}(으)로 바꿨습니다.\n",
-                to_loc.path
+            let path = &to_loc.path;
+            let text = tr!(
+                lang,
+                "Moved project {source} to {path}.\n",
+                "프로젝트 {source}의 위치를 {path}(으)로 바꿨습니다.\n"
             );
             (source, text)
         }
@@ -649,7 +679,7 @@ fn import_prepare(shared: &Shared, from: &str, to: &str) -> Result<Response, Str
             let text = merge(shared, &source, &target)?;
             (target, text)
         }
-        (_, Some(target)) => (target, "변경 없음\n".to_string()),
+        (_, Some(target)) => (target, tr!(lang, "No change\n", "변경 없음\n")),
     };
     Ok(Response::ImportPlan {
         project_id,
@@ -698,7 +728,7 @@ fn import_one(
     transcript_path: &Path,
 ) -> Result<Response, String> {
     if shared.reindexing.load(Ordering::SeqCst) {
-        return Err("재색인 중에는 가져올 수 없습니다".into());
+        return Err(reindex_busy(shared.lang()));
     }
     let bound = {
         let mut registry = lock(&shared.registry)?;
@@ -707,7 +737,11 @@ fn import_one(
             .map_err(|e| e.to_string())?
             .is_none()
         {
-            return Err(format!("프로젝트가 없습니다: {project_id}"));
+            return Err(tr!(
+                shared.lang(),
+                "Project not found: {project_id}",
+                "프로젝트가 없습니다: {project_id}"
+            ));
         }
         let bound = registry
             .session_project(session_id)
@@ -743,6 +777,7 @@ fn import_one(
 
 /// 원본의 기록을 대상으로 병합하고 원본을 지운다. (FR-PRJ-9)
 fn merge(shared: &Shared, source: &str, target: &str) -> Result<String, String> {
+    let lang = shared.lang();
     let _embedding = lock(&shared.embed_lock)?;
     let src = shared.project(source)?;
     let dst = shared.project(target)?;
@@ -769,13 +804,25 @@ fn merge(shared: &Shared, source: &str, target: &str) -> Result<String, String> 
     fs::remove_dir_all(shared.paths.project_dir(source)).map_err(|e| e.to_string())?;
     shared.enqueue_pending(target, &records);
     let vectors = if copy {
-        format!("벡터 {copied}개를 복사했습니다.")
+        tr!(
+            lang,
+            "Copied {copied} vectors.",
+            "벡터 {copied}개를 복사했습니다."
+        )
     } else {
-        format!("모델이 달라 임베딩 작업 {}개를 등록했습니다.", report.jobs)
+        let jobs = report.jobs;
+        tr!(
+            lang,
+            "The embedding model differs; queued {jobs} embedding jobs.",
+            "모델이 달라 임베딩 작업 {jobs}개를 등록했습니다."
+        )
     };
-    Ok(format!(
+    Ok(tr!(
+        lang,
+        "Merged project {source} into {target}: {} iterations, {} results. {vectors}\n",
         "프로젝트 {source}의 기록을 {target}(으)로 가져왔습니다. 반복 {}개, 결과 {}개. {vectors}\n",
-        report.iterations, report.results
+        report.iterations,
+        report.results
     ))
 }
 
@@ -874,7 +921,7 @@ fn start_reindex(shared: &Arc<Shared>, scope: &Scope, cwd: &str) -> Response {
     let targets = match shared.scope_projects(scope, cwd) {
         Ok(t) if t.is_empty() => {
             return Response::Error {
-                message: NO_PROJECT.trim_end().into(),
+                message: no_project(shared.lang()).trim_end().into(),
             };
         }
         Ok(t) => t,
@@ -1100,14 +1147,13 @@ fn search_scope(
     let req = SearchRequest {
         query,
         kind,
-        cwd: None,
         exclude_session: None,
         limit,
     };
     let ids = shared.scope_projects(scope, cwd)?;
     if *scope != Scope::All {
         let Some(id) = ids.first() else {
-            return Ok(NO_PROJECT.to_string());
+            return Ok(no_project(shared.lang()));
         };
         let handle = shared.project(id)?;
         let records = shared.records(id)?;
@@ -1138,7 +1184,7 @@ fn search_scope(
             "project {id}: vector search failed, falling back to keyword search: {reason}"
         ));
     }
-    render_project_hits(&projects, &result).map_err(|e| e.to_string())
+    render_project_hits(&projects, &result, shared.lang()).map_err(|e| e.to_string())
 }
 
 /// 임베딩이나 벡터 검색이 실패하면 FTS 결과만으로 응답하고 첫 줄에 안내한다. (FR-RET-8)
@@ -1149,14 +1195,17 @@ fn search_with_fallback(
     req: &SearchRequest,
 ) -> Result<String, String> {
     match search(records, backends, req, None) {
-        Ok(hits) => render_hits(records, &hits).map_err(|e| e.to_string()),
+        Ok(hits) => render_hits(records, &hits, shared.lang()).map_err(|e| e.to_string()),
         Err(e @ (SearchError::Embed(_) | SearchError::Vector(_))) => {
             shared.log(&format!(
                 "vector search failed, falling back to keyword search: {e}"
             ));
             let hits = search(records, None, req, None).map_err(|e| e.to_string())?;
-            let body = render_hits(records, &hits).map_err(|e| e.to_string())?;
-            Ok(format!(
+            let lang = shared.lang();
+            let body = render_hits(records, &hits, lang).map_err(|e| e.to_string())?;
+            Ok(tr!(
+                lang,
+                "(vector search unavailable, showing keyword results only: {e})\n{body}",
                 "(벡터 검색을 쓰지 못해 키워드 검색 결과만 표시합니다: {e})\n{body}"
             ))
         }
@@ -1191,10 +1240,11 @@ fn show(
             .map_err(|e| e.to_string())?
             .is_empty();
         if found {
-            return render_turn(&records, prompt_id, with_results).map_err(|e| e.to_string());
+            return render_turn(&records, prompt_id, with_results, shared.lang())
+                .map_err(|e| e.to_string());
         }
     }
-    Ok(missing_turn(prompt_id))
+    Ok(missing_turn(prompt_id, shared.lang()))
 }
 
 fn status(shared: &Shared) -> Result<StatusInfo, String> {
@@ -1240,8 +1290,9 @@ fn project_list(shared: &Shared) -> Result<String, String> {
     let rows = lock(&shared.registry)?
         .projects()
         .map_err(|e| e.to_string())?;
+    let lang = shared.lang();
     if rows.is_empty() {
-        return Ok(NO_PROJECT.to_string());
+        return Ok(no_project(lang));
     }
     let mut out = String::new();
     for row in rows {
@@ -1251,9 +1302,9 @@ fn project_list(shared: &Shared) -> Result<String, String> {
             .map_err(|e| e.to_string())?
             .iterations;
         let missing = if Path::new(&row.location).exists() {
-            ""
+            String::new()
         } else {
-            MISSING_LOCATION
+            missing_location(lang)
         };
         out.push_str(&format!(
             "{}  {}  {}{missing}  iterations={iterations}  last_active={}\n",

@@ -18,7 +18,7 @@ pub fn build_embed_text(it: &Iteration, max_tool_input_chars: usize) -> String {
     let inputs = it
         .inputs
         .iter()
-        .map(|input| format!("[입력] {}", input_text(input)));
+        .map(|input| format!("[input] {}", input_text(input)));
     let tools = it.tool_calls.iter().map(|call| {
         let json = call.input.to_string();
         let shown = if json.chars().count() > max_tool_input_chars {
@@ -28,9 +28,9 @@ pub fn build_embed_text(it: &Iteration, max_tool_input_chars: usize) -> String {
         } else {
             json
         };
-        format!("[툴] {}({shown})", call.name)
+        format!("[tool] {}({shown})", call.name)
     });
-    let response = (!it.texts.is_empty()).then(|| format!("[응답] {}", it.texts.join("\n")));
+    let response = (!it.texts.is_empty()).then(|| format!("[response] {}", it.texts.join("\n")));
     inputs
         .chain(tools)
         .chain(response)

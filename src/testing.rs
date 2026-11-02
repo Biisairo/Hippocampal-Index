@@ -132,7 +132,6 @@ impl VectorStore for MemoryVectorStore {
             .records
             .values()
             .filter(|r| filter.kind.is_none_or(|k| r.kind == k))
-            .filter(|r| filter.cwd.is_none() || r.cwd == filter.cwd)
             .filter(|r| filter.exclude_session.is_none() || r.session_id != filter.exclude_session)
             .filter(|r| {
                 filter

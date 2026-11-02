@@ -89,22 +89,15 @@ pub fn vector_store_contract(make: &dyn Fn() -> Box<dyn VectorStore>) {
 
     // 필터
     let q = [1.0, 0.0, 0.0];
-    let f = |kind, cwd: Option<&str>, ex: Option<&str>, model: Option<&str>| VectorFilter {
+    let f = |kind, ex: Option<&str>, model: Option<&str>| VectorFilter {
         kind,
-        cwd: cwd.map(str::to_string),
         exclude_session: ex.map(str::to_string),
         embed_model: model.map(str::to_string),
     };
-    let mut got = ids(&s
-        .search(&q, &f(Some(Result), None, None, None), 10)
-        .unwrap());
+    let mut got = ids(&s.search(&q, &f(Some(Result), None, None), 10).unwrap());
     got.sort();
     assert_eq!(got, ["r#0", "r#1"]);
-    assert_eq!(
-        ids(&s.search(&q, &f(None, Some("/q"), None, None), 10).unwrap()),
-        ["b#0"]
-    );
-    let mut got = ids(&s.search(&q, &f(None, None, Some("s1"), None), 10).unwrap());
+    let mut got = ids(&s.search(&q, &f(None, Some("s1"), None), 10).unwrap());
     got.sort();
     assert_eq!(
         got,
@@ -112,7 +105,7 @@ pub fn vector_store_contract(make: &dyn Fn() -> Box<dyn VectorStore>) {
         "세션 없는 결과 벡터는 제외 대상이 아님"
     );
     assert!(
-        s.search(&q, &f(None, None, None, Some("other")), 10)
+        s.search(&q, &f(None, None, Some("other")), 10)
             .unwrap()
             .is_empty()
     );
@@ -130,7 +123,7 @@ pub fn vector_store_contract(make: &dyn Fn() -> Box<dyn VectorStore>) {
     assert_eq!(s.count().unwrap(), 4);
     assert_eq!(
         ids(&s
-            .search(&[0.0, 0.0, 1.0], &f(Some(Iteration), None, None, None), 1)
+            .search(&[0.0, 0.0, 1.0], &f(Some(Iteration), None, None), 1)
             .unwrap()),
         ["a#0"]
     );

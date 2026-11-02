@@ -75,11 +75,12 @@ fn filter_values_with_quotes_are_escaped() {
         Some("s'1"),
     )])
     .unwrap();
-    let f = VectorFilter {
-        cwd: Some(cwd.into()),
-        ..Default::default()
-    };
-    assert_eq!(s.search(&[1.0, 0.0], &f, 5).unwrap().len(), 1);
+    assert_eq!(
+        s.search(&[1.0, 0.0], &VectorFilter::default(), 5)
+            .unwrap()
+            .len(),
+        1
+    );
     let ex = VectorFilter {
         exclude_session: Some("s'1".into()),
         ..Default::default()

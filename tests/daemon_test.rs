@@ -11,6 +11,7 @@ use hippo::client::{Launcher, ensure_daemon, launch_disabled, request, run_hook}
 use hippo::config::{Config, Paths};
 use hippo::daemon::{DaemonError, DaemonHandle, start};
 use hippo::embedder::Embedder;
+use hippo::i18n::Lang;
 use hippo::import::Candidate;
 use hippo::ingest::{HookEvent, ImportOutcome, IngestRequest};
 use hippo::protocol::{ImportSessionReport, Request, Response, Scope, StatusInfo};
@@ -303,12 +304,19 @@ fn data_root_and_socket_are_owner_only() {
     let e = env();
     fs::create_dir_all(&e.paths.root).unwrap();
     fs::set_permissions(&e.paths.root, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(e.paths.lock(), "").unwrap();
+    fs::set_permissions(e.paths.lock(), fs::Permissions::from_mode(0o644)).unwrap();
     let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
     let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&e.paths.root), 0o700);
     assert_eq!(mode(&e.paths.spool()), 0o700);
     assert_eq!(mode(&e.paths.logs()), 0o700);
     assert_eq!(mode(&e.paths.socket()), 0o600);
+    assert_eq!(
+        mode(&e.paths.lock()),
+        0o600,
+        "이전 실행이 남긴 0644 잠금 파일도 맞춤"
+    );
     handle.shutdown();
 }
 
@@ -338,7 +346,11 @@ fn incompatible_vector_store_falls_back_to_fts() {
         "임베딩 작업은 처리하지 않고 남김"
     );
     assert_eq!(st.projects[0].vectors, 1);
-    assert!(st.render().contains("hippo reindex"), "{}", st.render());
+    assert!(
+        st.render(Lang::En).contains("hippo reindex"),
+        "{}",
+        st.render(Lang::En)
+    );
 
     let search = search_req("두 파일은 병렬로", Scope::All, "/");
     let out = text(request(&e.paths.socket(), &search, TIMEOUT).unwrap());
@@ -739,7 +751,7 @@ fn search_falls_back_to_fts_when_embedding_fails() {
     let out = text(request(&e.paths.socket(), &search, TIMEOUT).unwrap());
     let first = out.lines().next().unwrap();
     assert!(
-        first.contains("키워드 검색") && first.contains("ollama down"),
+        first.contains("keyword results") && first.contains("ollama down"),
         "{out}"
     );
     assert!(
@@ -859,7 +871,7 @@ fn sessions_in_different_projects_are_stored_and_searched_separately() {
     assert_eq!(st.projects.len(), 2);
     assert_eq!(project_at(&st, &a).iterations, 2);
     assert_eq!(project_at(&st, &b).iterations, 2);
-    let rendered = st.render();
+    let rendered = st.render(Lang::En);
     assert!(rendered.contains(&project_at(&st, &a).id), "{rendered}");
 
     let q = "두 파일은 병렬로";
@@ -907,7 +919,7 @@ fn sessions_in_different_projects_are_stored_and_searched_separately() {
         )
         .unwrap(),
     );
-    assert!(none.contains("프로젝트 없음"), "{none}");
+    assert!(none.contains("No project"), "{none}");
 
     let embed_text = RecordStore::open(&e.paths.project_records(&project_at(&st, &a).id))
         .unwrap()
@@ -994,7 +1006,7 @@ fn project_list(paths: &Paths) -> String {
 fn project_list_shows_id_location_and_counts() {
     let e = env();
     let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
-    assert!(project_list(&e.paths).contains("프로젝트 없음"));
+    assert!(project_list(&e.paths).contains("No project"));
     let a = mkdir(&e, "a");
     let t = transcript_at(e._dir.path(), "sa", &a, None);
     ingest_session(&e.paths, "sa", &t);
@@ -1004,9 +1016,9 @@ fn project_list_shows_id_location_and_counts() {
         list.contains(&id) && list.contains(&s(&a)) && list.contains("iterations=2"),
         "{list}"
     );
-    assert!(!list.contains("위치 없음"), "{list}");
+    assert!(!list.contains("location missing"), "{list}");
     fs::remove_dir(&a).unwrap();
-    assert!(project_list(&e.paths).contains("위치 없음"));
+    assert!(project_list(&e.paths).contains("location missing"));
     handle.shutdown();
 }
 
@@ -1103,7 +1115,7 @@ fn import_moves_source_location_when_target_has_no_project() {
     fs::rename(&a, &b).unwrap();
     let b = fs::canonicalize(&b).unwrap();
     let (summary, reports) = run_import(&e.paths, &s(&a), &b);
-    assert!(summary.contains("위치"), "{summary}");
+    assert!(summary.contains("Moved project"), "{summary}");
     assert_eq!(
         outcomes(&reports),
         vec![("sa", ImportOutcome::Unchanged, 0)]
@@ -1128,7 +1140,7 @@ fn import_merges_source_project_copying_vectors() {
     let source = project_at(&st, &a).id.clone();
     let target = project_at(&st, &b).id.clone();
     let (summary, reports) = run_import(&e.paths, &source, &b);
-    assert!(summary.contains("복사"), "{summary}");
+    assert!(summary.contains("Copied"), "{summary}");
     assert!(reports.is_empty());
     let st = status(&e.paths);
     assert_eq!(st.projects.len(), 1);
@@ -1167,7 +1179,7 @@ fn import_merge_reembeds_when_source_vectors_are_incompatible() {
     wait_until(|| project_at(&status(&e.paths), &b).embed_jobs == 0);
     assert_eq!(project_at(&status(&e.paths), &a).compatibility, "mismatch");
     let (summary, _) = run_import(&e.paths, &s(&a), &b);
-    assert!(summary.contains("임베딩 작업"), "{summary}");
+    assert!(summary.contains("embedding jobs"), "{summary}");
     wait_until(|| totals(&status(&e.paths)).1 == 0);
     let st = status(&e.paths);
     assert_eq!(st.projects.len(), 1);
@@ -1187,7 +1199,7 @@ fn import_into_same_project_or_from_unknown_path_changes_nothing() {
     );
     let id = only_project(&e.paths);
     let (project, summary, sessions) = prepare(&e.paths, &s(&a), &a);
-    assert!(summary.contains("변경 없음"), "{summary}");
+    assert!(summary.contains("No change"), "{summary}");
     assert_eq!((project.as_str(), sessions.len()), (id.as_str(), 0));
     let (project, _, sessions) = prepare(&e.paths, "/no/such/source", &a);
     assert_eq!((project.as_str(), sessions.len()), (id.as_str(), 0));
@@ -1319,7 +1331,7 @@ fn show_looks_in_current_project_first_then_others() {
         show(&e.paths, &p, None, &s(&b)).contains("[1]"),
         "다른 프로젝트에서도 찾음"
     );
-    assert!(show(&e.paths, &p, Some(Scope::Project), &s(&b)).contains("기록 없음"));
+    assert!(show(&e.paths, &p, Some(Scope::Project), &s(&b)).contains("no records"));
     assert!(show(&e.paths, &p, Some(Scope::Path(s(&a))), "/").contains("[1]"));
     handle.shutdown();
 }
@@ -1571,5 +1583,20 @@ fn startup_queue_embeds_bulk_jobs_after_normal_jobs() {
     let seen = seen.lock().unwrap().clone();
     let pos = |m: &str| seen.iter().position(|t| t.contains(m)).unwrap();
     assert!(pos("MARKER_LIVE") < pos("MARKER_BULK"), "{seen:?}");
+    handle.shutdown();
+}
+
+#[test]
+fn daemon_text_follows_language_setting_without_restart() {
+    let e = env();
+    let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
+    assert!(project_list(&e.paths).contains("No project"), "기본은 영어");
+    fs::write(e.paths.config(), "[ui]\nlanguage = \"ko\"\n").unwrap();
+    assert!(
+        project_list(&e.paths).contains("프로젝트 없음"),
+        "다음 요청부터 반영"
+    );
+    fs::write(e.paths.config(), "[ui]\nlanguage = \"en\"\n").unwrap();
+    assert!(project_list(&e.paths).contains("No project"));
     handle.shutdown();
 }

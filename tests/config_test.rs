@@ -141,3 +141,17 @@ fn project_and_daemon_defaults() {
         (2, 50)
     );
 }
+
+#[test]
+fn ui_language_defaults_to_english_and_accepts_korean() {
+    use hippo::i18n::Lang;
+    assert_eq!(Config::default().ui.language, Lang::En);
+    assert_eq!(
+        Config::parse("[ui]\nlanguage = \"ko\"\n")
+            .unwrap()
+            .ui
+            .language,
+        Lang::Ko
+    );
+    assert!(Config::parse("[ui]\nlanguage = \"fr\"\n").is_err());
+}

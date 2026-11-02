@@ -235,8 +235,9 @@ launchd는 데몬이 비정상 종료했을 때만 다시 띄우고, 유휴 종�
 - 다시 실행해도 결과가 같으면 아무것도 바꾸지 않습니다("변경 없음").
 - 심볼릭 링크를 거쳐서는 쓰지 않고, JSON이 깨진 설정 파일은 건드리지 않습니다.
 - 파일은 2칸 들여쓰기 JSON으로 다시 쓰입니다. 키 순서와 값은 유지되지만, 원래 형식은 달라질 수 있습니다. 원본은 백업에 남습니다.
+- Claude가 `hippo search`와 `hippo show`를 쓸 수 있다는 영어 안내 블록을 메모리 파일에 넣습니다. `--scope user`는 `~/.claude/CLAUDE.md`, `--scope project`는 `<프로젝트>/CLAUDE.local.md`(공식 문서가 권장하는 개인용 파일)입니다. 블록은 `<!-- hippo:begin -->`과 `<!-- hippo:end -->` 사이에 있고, 이 표식은 Claude Code가 컨텍스트에 넣기 전에 지우므로 토큰을 쓰지 않습니다. 블록 밖의 내용은 그대로 둡니다. `CLAUDE.local.md`가 git에서 무시되지 않으면 경고만 출력하고, `.gitignore`는 바꾸지 않습니다.
 
-hook 블록만 출력해 직접 넣을 수도 있습니다: `hippo hooks-config`.
+hook 블록만 출력해 직접 넣을 수도 있습니다: `hippo hooks-config`. `uninstall`은 hook 항목과 안내 블록만 지웁니다. 안내 블록만 있던 메모리 파일은 지웁니다.
 
 hook을 등록한 뒤에는 Claude Code 세션을 새로 시작하십시오.
 
@@ -269,7 +270,7 @@ hippo search "배포" --scope ~/work/my-app --limit 5      # 그 경로가 속�
 | `--kind` | `iteration`, `result`, `both` | `iteration` |
 | `--limit` | 숫자 | `10` |
 
-검색 결과에는 RRF 점수, 벡터 유사도(`sim=-`이면 키워드로만 찾은 결과), `prompt_id`, 미리보기가 나옵니다. 결과(도구 출력)를 찾은 경우에는 그 결과를 만든 프롬프트 목록도 함께 나옵니다. `--scope all`은 프로젝트마다 검색한 뒤 RRF로 합치고, 결과마다 `project=<id>`를 붙입니다. 현재 디렉터리가 어느 프로젝트에도 속하지 않으면 "프로젝트 없음"이 나옵니다.
+검색 결과에는 RRF 점수, 벡터 유사도(`sim=-`이면 키워드로만 찾은 결과), `prompt_id`, 미리보기가 나옵니다. 결과(도구 출력)를 찾은 경우에는 그 결과를 만든 프롬프트 목록도 함께 나옵니다. `--scope all`은 프로젝트마다 검색한 뒤 RRF로 합치고, 결과마다 `project=<id>`를 붙입니다. 현재 디렉터리가 어느 프로젝트에도 속하지 않으면 "No project"(한국어 설정이면 "프로젝트 없음")가 나옵니다. 이 문서의 출력 예는 `[ui] language = "ko"` 기준입니다.
 
 ### 4.2 한 턴 전체 보기
 
@@ -318,7 +319,7 @@ hippo import --from <프로젝트 id> --to ~/work/app
 - **분기한 세션의 복사본**: 같은 `message.id`의 반복이 다른 세션으로 이미 있으면 건너뜁니다.
 - **다른 프로젝트에 고정된 세션**: 건너뛰고 "다른 프로젝트"로 알려 줍니다.
 
-진행률은 세션마다 한 줄씩 출력합니다.
+진행률은 세션마다 한 줄씩 출력합니다. 아래는 `[ui] language = "ko"`일 때의 예입니다(기본은 영어).
 
 ```
 후보 세션 120개
@@ -332,17 +333,13 @@ hippo import --from <프로젝트 id> --to ~/work/app
 
 ### 4.5 Claude가 기억을 쓰게 하기
 
-자동 주입은 가장 잘 맞는 몇 개만 전달합니다. 더 찾아봐야 할 때는 Claude가 CLI를 직접 호출할 수 있습니다. `CLAUDE.md`에 다음과 같은 줄을 넣어 두면 됩니다.
-
-```
-과거 세션을 찾아봐야 하면 Bash로 `hippo search "<질의>"` 또는 `hippo show <prompt_id>`를 실행한다.
-```
+자동 주입은 가장 잘 맞는 몇 개만 전달합니다. 더 찾아봐야 할 때는 Claude가 CLI를 직접 호출할 수 있습니다. 그 방법을 알려 주는 안내 블록은 `hippo install`이 메모리 파일에 넣습니다([3.5](#35-hook-등록) 참고). 따로 적을 필요는 없습니다.
 
 ---
 
 ## 5. 설정
 
-파일: `~/.hippo/config.toml`. 모든 키는 생략할 수 있습니다. 알 수 없는 키는 오류로 처리하므로 오타를 바로 알 수 있습니다. 설정을 바꾼 뒤에는 데몬을 다시 시작하십시오.
+파일: `~/.hippo/config.toml`. 모든 키는 생략할 수 있습니다. 알 수 없는 키는 오류로 처리하므로 오타를 바로 알 수 있습니다. 설정을 바꾼 뒤에는 데몬을 다시 시작하십시오. `[ui] language`만은 다음 명령부터 바로 적용됩니다.
 
 ```toml
 [embedder]
@@ -387,6 +384,9 @@ git_timeout_ms = 1000              # git 실행 시간 제한. 넘으면 git이 
 
 [import]
 transcripts_dir = "/Users/me/.claude/projects"   # 과거 transcript를 찾는 디렉터리. 기본값은 $HOME/.claude/projects (`~`는 펼치지 않음)
+
+[ui]
+language = "en"                    # CLI 출력 언어: en(기본) 또는 ko. Claude에게 주는 텍스트와 --help는 항상 영어
 
 [[redact.patterns]]                # 추가 비밀값 패턴 (정규식)
 kind = "internal"
@@ -452,7 +452,7 @@ pattern = 'HCI-\d{6}'
 |------|-----------|
 | `hippo: daemon not reachable` | 데몬을 띄우지 못했습니다. `~/.hippo/logs/daemon.err`를 확인하십시오(예: 설정 오류). `autostart = false`이면 직접 띄워야 합니다 |
 | `embed_jobs`가 줄지 않음 | 모델을 받았는지(`ollama list`), `hippo`가 Ollama를 띄울 수 있었는지(`~/.hippo/logs/ollama.log`, `hippo.log`) 확인합니다. 작업은 5초마다 다시 시도합니다 |
-| 검색 결과에 "벡터 검색을 쓰지 못해 키워드 검색 결과만 표시합니다"가 나옴 | 임베딩에 실패했습니다(Ollama를 띄우지 못했거나 모델이 없음). 복구될 때까지 키워드 검색 결과만 나옵니다 |
+| 검색 결과에 "vector search unavailable, showing keyword results only"(한국어 설정이면 "벡터 검색을 쓰지 못해 키워드 검색 결과만 표시합니다")가 나옴 | 임베딩에 실패했습니다(Ollama를 띄우지 못했거나 모델이 없음). 복구될 때까지 키워드 검색 결과만 나옵니다 |
 | `compatibility: mismatch` | 모델이나 차원이 바뀌었습니다. `hippo reindex` 실행 |
 | 자동 주입이 되지 않음 | `[inject] threshold`를 낮춥니다. 주입은 같은 프로젝트의 다른 세션만 대상입니다 |
 | `lance-*`나 `protoc`에서 빌드 실패 | `brew reinstall protobuf` 후 `protoc --version` 확인 |
@@ -474,7 +474,7 @@ pattern = 'HCI-\d{6}'
 | `transcript.rs` | transcript JSONL을 반복으로 해석, 안전 offset |
 | `bg.rs` | 백그라운드 시작 감지, `<task-notification>` 해석, 서브에이전트 보고 추출 |
 | `redact.rs` | 비밀값 마스킹 |
-| `embed_text.rs` | 임베딩할 텍스트(`[입력]`/`[툴]`/`[응답]` 줄) 생성, 청크 분할 |
+| `embed_text.rs` | 임베딩할 텍스트(`[input]`/`[tool]`/`[response]` 줄) 생성, 청크 분할 |
 | `store.rs` | SQLite 원본 저장소, 중복 제거, FTS5, 프로젝트 병합 |
 | `project.rs` | 경로 정규화, git 정보, 프로젝트 위치 |
 | `registry.rs` | 목록 DB: 프로젝트 판정, 세션 고정, 위치 변경, 흡수 |

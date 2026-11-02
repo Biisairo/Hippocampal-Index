@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::i18n::Lang;
 use crate::redact::ExtraPattern;
 
 #[derive(Debug, thiserror::Error)]
@@ -88,6 +89,13 @@ pub struct ProjectSection {
     pub git_timeout_ms: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiSection {
+    /// 사람이 읽는 출력의 언어. (FR-UI-1)
+    pub language: Lang,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ImportSection {
@@ -121,6 +129,7 @@ pub struct Config {
     pub daemon: DaemonSection,
     pub project: ProjectSection,
     pub import: ImportSection,
+    pub ui: UiSection,
 }
 
 impl Config {
