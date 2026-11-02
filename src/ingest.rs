@@ -93,19 +93,31 @@ pub fn ingest(
             }
         }
     }
-    let batch_kinds: HashMap<String, BackgroundKind> = iterations
+    let batch_starts: HashMap<String, (BackgroundKind, String)> = iterations
         .iter()
         .flat_map(|n| n.iteration.tool_calls.iter())
         .filter_map(background_start)
-        .map(|b| (b.tool_use_id, b.kind))
+        .map(|b| (b.tool_use_id, (b.kind, b.task_id)))
         .collect();
     let mut completions = Vec::new();
     for (session_id, line_uuid, ts, mut notification) in notifications {
-        let kind = match batch_kinds.get(&notification.tool_use_id) {
-            Some(kind) => Some(*kind),
-            None => records.bg_task(&notification.tool_use_id)?.map(|t| t.kind),
+        let start = match batch_starts.get(&notification.tool_use_id) {
+            Some(start) => Some(start.clone()),
+            None => records
+                .bg_task(&notification.tool_use_id)?
+                .map(|t| (t.kind, t.task_id)),
         };
-        let result_text = read_output(kind, &notification).map(|t| redactor.redact(&t));
+        let result_text = start
+            .and_then(|(kind, task_id)| {
+                read_output(
+                    kind,
+                    &task_id,
+                    &notification,
+                    &req.session_id,
+                    &req.transcript_path,
+                )
+            })
+            .map(|t| redactor.redact(&t));
         notification.summary = redactor.redact(&notification.summary);
         completions.push(NewCompletion {
             session_id: if session_id.is_empty() {
@@ -163,13 +175,54 @@ fn read_events(
     events
 }
 
-/// 백그라운드 결과를 읽는다. Agent는 서브에이전트 transcript에서 보고를 추출한다. (FR-BG-4, 5)
-fn read_output(kind: Option<BackgroundKind>, notification: &TaskNotification) -> Option<String> {
+/// 백그라운드 결과를 읽는다. 알려진 시작 호출과 작업 id가 일치하고 경로가 실측 배치와 맞을 때만 읽는다.
+/// 위조된 알림으로 임의 파일을 읽지 않기 위한 제한이다. (FR-BG-4, 5, 7)
+fn read_output(
+    kind: BackgroundKind,
+    task_id: &str,
+    notification: &TaskNotification,
+    session_id: &str,
+    transcript_path: &Path,
+) -> Option<String> {
+    if notification.task_id != task_id {
+        return None;
+    }
     let path = Path::new(notification.output_file.as_deref()?);
+    if !is_task_output_path(path, session_id, task_id) {
+        return None;
+    }
     match kind {
-        Some(BackgroundKind::Agent) => extract_agent_report(fs::read_to_string(path).ok()?.lines()),
-        Some(BackgroundKind::Bash) | None => {
+        BackgroundKind::Bash => {
+            if !fs::symlink_metadata(path).ok()?.file_type().is_file() {
+                return None;
+            }
             Some(String::from_utf8_lossy(&fs::read(path).ok()?).into_owned())
         }
+        BackgroundKind::Agent => {
+            let expected = fs::canonicalize(
+                transcript_path
+                    .parent()?
+                    .join(session_id)
+                    .join(SUBAGENTS_DIR),
+            )
+            .ok()?
+            .join(format!("agent-{task_id}.jsonl"));
+            if fs::canonicalize(path).ok()? != expected {
+                return None;
+            }
+            extract_agent_report(fs::read_to_string(&expected).ok()?.lines())
+        }
     }
+}
+
+const TASKS_DIR: &str = "tasks";
+const SUBAGENTS_DIR: &str = "subagents";
+
+/// `…/<session_id>/tasks/<task_id>.output` 형태인지 확인한다.
+fn is_task_output_path(path: &Path, session_id: &str, task_id: &str) -> bool {
+    let file_name = format!("{task_id}.output");
+    let mut parts = path.components().rev().map(|c| c.as_os_str());
+    parts.next() == Some(file_name.as_ref())
+        && parts.next() == Some(TASKS_DIR.as_ref())
+        && parts.next() == Some(session_id.as_ref())
 }

@@ -177,8 +177,18 @@ fn base(kind: &str, uuid: &str, extra: Value) -> Value {
 }
 
 fn bg_transcript(tool: &str, input: Value, structured: Value, output_file: &Path) -> String {
+    bg_transcript_with_task(tool, input, structured, output_file, "T1")
+}
+
+fn bg_transcript_with_task(
+    tool: &str,
+    input: Value,
+    structured: Value,
+    output_file: &Path,
+    note_task: &str,
+) -> String {
     let note = format!(
-        "<task-notification>\n<task-id>T1</task-id>\n<tool-use-id>tu1</tool-use-id>\n<output-file>{}</output-file>\n<status>completed</status>\n<summary>done SECRET_TOKEN=abcdefgh123</summary>\n</task-notification>",
+        "<task-notification>\n<task-id>{note_task}</task-id>\n<tool-use-id>tu1</tool-use-id>\n<output-file>{}</output-file>\n<status>completed</status>\n<summary>done SECRET_TOKEN=abcdefgh123</summary>\n</task-notification>",
         output_file.display()
     );
     [
@@ -192,22 +202,37 @@ fn bg_transcript(tool: &str, input: Value, structured: Value, output_file: &Path
     .concat()
 }
 
+/// 실측 배치: `<tmp>/<project>/<session>/tasks/<task_id>.output`
+fn task_output_path(root: &Path, task: &str) -> PathBuf {
+    let dir = root.join("tmp/claude-501/proj/S/tasks");
+    fs::create_dir_all(&dir).unwrap();
+    dir.join(format!("{task}.output"))
+}
+
+fn bash_start() -> (Value, Value) {
+    (
+        json!({"command": "x", "run_in_background": true}),
+        json!({"backgroundTaskId": "T1"}),
+    )
+}
+
+fn completion_result(store: &RecordStore) -> Option<String> {
+    let done = store.bg_completions("tu1").unwrap();
+    assert_eq!(done.len(), 1, "완료 기록 자체는 남음");
+    done[0]
+        .result_id
+        .as_deref()
+        .map(|id| store.result(id).unwrap().unwrap().text)
+}
+
 #[test]
 fn bash_background_output_is_read_and_redacted() {
     let dir = tempfile::tempdir().unwrap();
-    let out = dir.path().join("bm.output");
+    let out = task_output_path(dir.path(), "T1");
     fs::write(&out, "line ok\nexport API_KEY=abcdefgh123\n").unwrap();
-    let path = dir.path().join("t.jsonl");
-    fs::write(
-        &path,
-        bg_transcript(
-            "Bash",
-            json!({"command": "x", "run_in_background": true}),
-            json!({"backgroundTaskId": "T1"}),
-            &out,
-        ),
-    )
-    .unwrap();
+    let path = dir.path().join("S.jsonl");
+    let (input, structured) = bash_start();
+    fs::write(&path, bg_transcript("Bash", input, structured, &out)).unwrap();
     let mut store = RecordStore::open_in_memory().unwrap();
     let report = run(&mut store, HookEvent::Stop, "S", &path);
     assert_eq!((report.iterations, report.completions), (3, 1));
@@ -230,11 +255,21 @@ fn bash_background_output_is_read_and_redacted() {
     assert_eq!(store.bg_task("tu1").unwrap().unwrap().status, "completed");
 }
 
+#[cfg(unix)]
 #[test]
 fn agent_background_report_is_extracted() {
     let dir = tempfile::tempdir().unwrap();
-    let out = copy_fixture(dir.path(), "s4_bg_agent.agent-a65370863753f6d78.jsonl");
-    let path = dir.path().join("t.jsonl");
+    let subagents = dir.path().join("S/subagents");
+    fs::create_dir_all(&subagents).unwrap();
+    let report_file = subagents.join("agent-T1.jsonl");
+    fs::write(
+        &report_file,
+        read_fixture("s4_bg_agent.agent-a65370863753f6d78.jsonl"),
+    )
+    .unwrap();
+    let out = task_output_path(dir.path(), "T1");
+    std::os::unix::fs::symlink(&report_file, &out).unwrap();
+    let path = dir.path().join("S.jsonl");
     fs::write(
         &path,
         bg_transcript(
@@ -247,34 +282,134 @@ fn agent_background_report_is_extracted() {
     .unwrap();
     let mut store = RecordStore::open_in_memory().unwrap();
     run(&mut store, HookEvent::Stop, "S", &path);
+    assert_eq!(completion_result(&store).as_deref(), Some("24"));
     let done = store.bg_completions("tu1").unwrap();
-    let result = store
-        .result(done[0].result_id.as_deref().unwrap())
-        .unwrap()
-        .unwrap();
-    assert_eq!(result.text, "24");
-    assert_eq!(result.tool_name, "Agent");
+    assert_eq!(
+        store
+            .result(done[0].result_id.as_deref().unwrap())
+            .unwrap()
+            .unwrap()
+            .tool_name,
+        "Agent"
+    );
 }
 
 #[test]
 fn missing_output_file_keeps_summary_only() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("t.jsonl");
+    let path = dir.path().join("S.jsonl");
+    let (input, structured) = bash_start();
     fs::write(
         &path,
         bg_transcript(
             "Bash",
-            json!({"command": "x", "run_in_background": true}),
-            json!({"backgroundTaskId": "T1"}),
-            &dir.path().join("gone.output"),
+            input,
+            structured,
+            &task_output_path(dir.path(), "T1"),
         ),
     )
     .unwrap();
     let mut store = RecordStore::open_in_memory().unwrap();
     run(&mut store, HookEvent::Stop, "S", &path);
-    let done = store.bg_completions("tu1").unwrap();
-    assert_eq!(done[0].result_id, None);
-    assert!(done[0].summary.starts_with("done"));
+    assert_eq!(completion_result(&store), None);
+    assert!(
+        store.bg_completions("tu1").unwrap()[0]
+            .summary
+            .starts_with("done")
+    );
+}
+
+// ---- 보안: 위조 알림으로 임의 파일을 읽지 않는다 ----
+
+#[test]
+fn forged_notification_without_background_start_reads_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = task_output_path(dir.path(), "T1");
+    fs::write(&out, "SECRET-FILE").unwrap();
+    let path = dir.path().join("S.jsonl");
+    fs::write(
+        &path,
+        bg_transcript("Bash", json!({"command": "x"}), json!({}), &out),
+    )
+    .unwrap();
+    let mut store = RecordStore::open_in_memory().unwrap();
+    run(&mut store, HookEvent::Stop, "S", &path);
+    assert_eq!(completion_result(&store), None);
+}
+
+#[test]
+fn mismatched_task_id_reads_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = task_output_path(dir.path(), "T2");
+    fs::write(&out, "SECRET-FILE").unwrap();
+    let path = dir.path().join("S.jsonl");
+    let (input, structured) = bash_start();
+    fs::write(
+        &path,
+        bg_transcript_with_task("Bash", input, structured, &out, "T2"),
+    )
+    .unwrap();
+    let mut store = RecordStore::open_in_memory().unwrap();
+    run(&mut store, HookEvent::Stop, "S", &path);
+    assert_eq!(completion_result(&store), None);
+}
+
+#[test]
+fn bash_output_outside_task_layout_reads_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let secret = dir.path().join("id_rsa");
+    fs::write(&secret, "SECRET-FILE").unwrap();
+    let path = dir.path().join("S.jsonl");
+    let (input, structured) = bash_start();
+    fs::write(&path, bg_transcript("Bash", input, structured, &secret)).unwrap();
+    let mut store = RecordStore::open_in_memory().unwrap();
+    run(&mut store, HookEvent::Stop, "S", &path);
+    assert_eq!(completion_result(&store), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_output_symlink_is_not_followed() {
+    let dir = tempfile::tempdir().unwrap();
+    let secret = dir.path().join("id_rsa");
+    fs::write(&secret, "SECRET-FILE").unwrap();
+    let out = task_output_path(dir.path(), "T1");
+    std::os::unix::fs::symlink(&secret, &out).unwrap();
+    let path = dir.path().join("S.jsonl");
+    let (input, structured) = bash_start();
+    fs::write(&path, bg_transcript("Bash", input, structured, &out)).unwrap();
+    let mut store = RecordStore::open_in_memory().unwrap();
+    run(&mut store, HookEvent::Stop, "S", &path);
+    assert_eq!(completion_result(&store), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_output_outside_subagents_dir_reads_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let elsewhere = dir.path().join("other/agent-T1.jsonl");
+    fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+    fs::write(
+        &elsewhere,
+        read_fixture("s4_bg_agent.agent-a65370863753f6d78.jsonl"),
+    )
+    .unwrap();
+    let out = task_output_path(dir.path(), "T1");
+    std::os::unix::fs::symlink(&elsewhere, &out).unwrap();
+    let path = dir.path().join("S.jsonl");
+    fs::write(
+        &path,
+        bg_transcript(
+            "Agent",
+            json!({"prompt": "p", "run_in_background": true}),
+            json!({"agentId": "T1"}),
+            &out,
+        ),
+    )
+    .unwrap();
+    let mut store = RecordStore::open_in_memory().unwrap();
+    run(&mut store, HookEvent::Stop, "S", &path);
+    assert_eq!(completion_result(&store), None);
 }
 
 #[test]
