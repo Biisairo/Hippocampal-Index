@@ -431,3 +431,38 @@ fn appended_lines_after_partial_write() {
     run(&mut store, HookEvent::Stop, "S", &path);
     assert_eq!(store.counts().unwrap().iterations, 3);
 }
+
+#[cfg(unix)]
+#[test]
+fn bash_output_through_symlinked_directory_reads_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("secrets");
+    fs::create_dir_all(&real).unwrap();
+    fs::write(real.join("T1.output"), "SECRET-FILE").unwrap();
+    let session_dir = dir.path().join("tmp/S");
+    fs::create_dir_all(&session_dir).unwrap();
+    std::os::unix::fs::symlink(&real, session_dir.join("tasks")).unwrap();
+    let out = session_dir.join("tasks/T1.output");
+    let path = dir.path().join("S.jsonl");
+    let (input, structured) = bash_start();
+    fs::write(&path, bg_transcript("Bash", input, structured, &out)).unwrap();
+    let mut store = RecordStore::open_in_memory().unwrap();
+    run(&mut store, HookEvent::Stop, "S", &path);
+    assert_eq!(completion_result(&store), None);
+}
+
+#[test]
+fn bash_output_with_parent_or_relative_components_reads_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = task_output_path(dir.path(), "T1");
+    fs::write(&out, "SECRET-FILE").unwrap();
+    let dotted = out.parent().unwrap().join("../tasks/T1.output");
+    for candidate in [dotted, PathBuf::from("S/tasks/T1.output")] {
+        let path = dir.path().join("S.jsonl");
+        let (input, structured) = bash_start();
+        fs::write(&path, bg_transcript("Bash", input, structured, &candidate)).unwrap();
+        let mut store = RecordStore::open_in_memory().unwrap();
+        run(&mut store, HookEvent::Stop, "S", &path);
+        assert_eq!(completion_result(&store), None, "{}", candidate.display());
+    }
+}

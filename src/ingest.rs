@@ -193,10 +193,11 @@ fn read_output(
     }
     match kind {
         BackgroundKind::Bash => {
-            if !fs::symlink_metadata(path).ok()?.file_type().is_file() {
+            let canonical = fs::canonicalize(path).ok()?;
+            if !is_task_output_path(&canonical, session_id, task_id) {
                 return None;
             }
-            Some(String::from_utf8_lossy(&fs::read(path).ok()?).into_owned())
+            read_regular_file_nofollow(&canonical)
         }
         BackgroundKind::Agent => {
             let expected = fs::canonicalize(
@@ -218,8 +219,34 @@ fn read_output(
 const TASKS_DIR: &str = "tasks";
 const SUBAGENTS_DIR: &str = "subagents";
 
-/// `…/<session_id>/tasks/<task_id>.output` 형태인지 확인한다.
+/// 링크를 따르지 않고 연 뒤, 열린 핸들로 일반 파일인지 확인하고 읽는다. 검사와 읽기 사이의 경쟁을 없앤다.
+fn read_regular_file_nofollow(path: &Path) -> Option<String> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// 절대 경로이고, `.`/`..` 없이 `…/<session_id>/tasks/<task_id>.output` 형태인지 확인한다.
 fn is_task_output_path(path: &Path, session_id: &str, task_id: &str) -> bool {
+    use std::path::Component;
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return false;
+    }
     let file_name = format!("{task_id}.output");
     let mut parts = path.components().rev().map(|c| c.as_os_str());
     parts.next() == Some(file_name.as_ref())
