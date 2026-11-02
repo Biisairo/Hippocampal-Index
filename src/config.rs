@@ -164,19 +164,27 @@ impl Paths {
 const DATA_DIR: &str = ".session-memory";
 const LOCAL_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1"];
 
-/// `http(s)://<host>[:port][/...]`의 host가 로컬 루프백인지 확인한다. (C-4)
-fn is_local_url(url: &str) -> bool {
-    let Some(rest) = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-    else {
+/// URL을 파서로 해석해 host가 로컬 루프백인지 확인한다. userinfo, 쿼리, 프래그먼트가 있으면 거부한다. (C-4)
+pub fn is_local_url(url: &str) -> bool {
+    if url.contains('#') {
+        return false;
+    }
+    let Ok(uri) = url.parse::<ureq::http::Uri>() else {
         return false;
     };
-    let authority = rest.split('/').next().unwrap_or_default();
-    let host = match authority.strip_prefix('[') {
-        Some(v6) => v6.split(']').next().unwrap_or_default(),
-        None => authority.split(':').next().unwrap_or_default(),
+    if !matches!(uri.scheme_str(), Some("http" | "https")) || uri.query().is_some() {
+        return false;
+    }
+    let Some(authority) = uri.authority() else {
+        return false;
     };
+    if authority.as_str().contains('@') {
+        return false;
+    }
+    let host = authority
+        .host()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
     LOCAL_HOSTS.contains(&host)
 }
 

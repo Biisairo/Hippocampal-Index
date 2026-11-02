@@ -55,7 +55,7 @@ fn config(url: &str, dimension: usize) -> EmbedderConfig {
 #[test]
 fn sends_expected_request_and_parses_embeddings() {
     let (url, rx) = fake_server(200, json!({"embeddings": [[0.6, 0.8], [1.0, 0.0]]}));
-    let e = OllamaEmbedder::new(&config(&url, 2));
+    let e = OllamaEmbedder::try_new(&config(&url, 2)).unwrap();
     let out = e.embed(&["가".into(), "나".into()]).unwrap();
     assert_eq!(out, vec![vec![0.6, 0.8], vec![1.0, 0.0]]);
     let (line, body) = rx.recv().unwrap();
@@ -70,7 +70,7 @@ fn sends_expected_request_and_parses_embeddings() {
 
 #[test]
 fn empty_input_sends_no_request() {
-    let e = OllamaEmbedder::new(&config("http://127.0.0.1:9", 2));
+    let e = OllamaEmbedder::try_new(&config("http://127.0.0.1:9", 2)).unwrap();
     assert!(e.embed(&[]).unwrap().is_empty());
 }
 
@@ -79,7 +79,8 @@ fn unreachable_server_is_unavailable() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     drop(listener);
-    let err = OllamaEmbedder::new(&config(&url, 2))
+    let err = OllamaEmbedder::try_new(&config(&url, 2))
+        .unwrap()
         .embed(&["x".into()])
         .unwrap_err();
     assert!(matches!(err, EmbedError::Unavailable(_)), "{err:?}");
@@ -88,7 +89,8 @@ fn unreachable_server_is_unavailable() {
 #[test]
 fn error_status_is_invalid_response_with_message() {
     let (url, _rx) = fake_server(404, json!({"error": "model not found"}));
-    let err = OllamaEmbedder::new(&config(&url, 2))
+    let err = OllamaEmbedder::try_new(&config(&url, 2))
+        .unwrap()
         .embed(&["x".into()])
         .unwrap_err();
     match err {
@@ -101,17 +103,23 @@ fn error_status_is_invalid_response_with_message() {
 fn wrong_count_or_dimension_is_rejected() {
     let (url, _rx) = fake_server(200, json!({"embeddings": [[0.6, 0.8]]}));
     assert!(matches!(
-        OllamaEmbedder::new(&config(&url, 2)).embed(&["a".into(), "b".into()]),
+        OllamaEmbedder::try_new(&config(&url, 2))
+            .unwrap()
+            .embed(&["a".into(), "b".into()]),
         Err(EmbedError::InvalidResponse(_))
     ));
     let (url, _rx) = fake_server(200, json!({"embeddings": [[0.6, 0.8, 0.0]]}));
     assert!(matches!(
-        OllamaEmbedder::new(&config(&url, 2)).embed(&["a".into()]),
+        OllamaEmbedder::try_new(&config(&url, 2))
+            .unwrap()
+            .embed(&["a".into()]),
         Err(EmbedError::InvalidResponse(_))
     ));
     let (url, _rx) = fake_server(200, json!({"nope": 1}));
     assert!(matches!(
-        OllamaEmbedder::new(&config(&url, 2)).embed(&["a".into()]),
+        OllamaEmbedder::try_new(&config(&url, 2))
+            .unwrap()
+            .embed(&["a".into()]),
         Err(EmbedError::InvalidResponse(_))
     ));
 }
@@ -121,7 +129,7 @@ fn wrong_count_or_dimension_is_rejected() {
 #[test]
 #[ignore = "로컬 Ollama와 qwen3-embedding:0.6b 필요"]
 fn live_ollama_satisfies_contract_and_ranks_korean() {
-    let e = OllamaEmbedder::new(&EmbedderConfig::default());
+    let e = OllamaEmbedder::try_new(&EmbedderConfig::default()).unwrap();
     embedder_contract(&e);
     let v = e
         .embed(&[
@@ -131,4 +139,48 @@ fn live_ollama_satisfies_contract_and_ranks_korean() {
         ])
         .unwrap();
     assert!(cosine(&v[0], &v[1]) > cosine(&v[0], &v[2]));
+}
+
+// ---- 보안: 외부 전송 금지 (C-4) ----
+
+#[test]
+fn constructor_rejects_non_local_url() {
+    for url in [
+        "http://127.0.0.1:11434@evil.com",
+        "https://api.example.com",
+        "http://localhost:1/?x=1",
+    ] {
+        assert!(OllamaEmbedder::try_new(&config(url, 2)).is_err(), "{url}");
+    }
+    assert!(OllamaEmbedder::try_new(&config("http://[::1]:11434", 2)).is_ok());
+}
+
+#[test]
+fn redirects_are_not_followed() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (tx, rx) = mpsc::channel::<()>();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf);
+        let _ = write!(
+            stream,
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/api/embed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        listener.set_nonblocking(true).unwrap();
+        thread::sleep(std::time::Duration::from_millis(300));
+        if listener.accept().is_ok() {
+            tx.send(()).unwrap();
+        }
+    });
+    let err = OllamaEmbedder::try_new(&config(&url, 2))
+        .unwrap()
+        .embed(&["x".into()]);
+    assert!(err.is_err());
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_millis(600))
+            .is_err(),
+        "두 번째 요청 없음"
+    );
 }

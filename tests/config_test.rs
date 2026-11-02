@@ -65,6 +65,12 @@ fn rejects_non_local_embedder_url() {
         "https://api.example.com",
         "http://10.0.0.5:11434",
         "http://localhost.evil.com:11434",
+        "http://127.0.0.1:11434@evil.com",
+        "http://user@localhost:11434",
+        "http://localhost:11434/?next=http://evil.com",
+        "http://localhost:11434/#frag",
+        "ftp://localhost:11434",
+        "localhost:11434",
     ] {
         let text = format!("[embedder]\nurl = \"{url}\"\n");
         assert!(

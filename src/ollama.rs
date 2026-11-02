@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::config::EmbedderConfig;
+use crate::config::{EmbedderConfig, is_local_url};
 use crate::embedder::{EmbedError, Embedder};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -20,20 +20,28 @@ pub struct OllamaEmbedder {
 }
 
 impl OllamaEmbedder {
-    pub fn new(config: &EmbedderConfig) -> Self {
+    /// URL이 localhost가 아니면 거부한다. 설정 파싱을 거치지 않는 경로도 막기 위해 여기서 다시 검사한다. (C-4)
+    pub fn try_new(config: &EmbedderConfig) -> Result<Self, EmbedError> {
+        if !is_local_url(&config.url) {
+            return Err(EmbedError::Config(format!(
+                "embedder url must point to localhost: {}",
+                config.url
+            )));
+        }
         let agent = ureq::Agent::config_builder()
             .timeout_global(Some(REQUEST_TIMEOUT))
             .http_status_as_error(false)
+            .max_redirects(0)
             .build()
             .into();
-        Self {
+        Ok(Self {
             endpoint: format!("{}{EMBED_PATH}", config.url.trim_end_matches('/')),
             model: config.model.clone(),
             dimension: config.dimension,
             max_input_tokens: config.max_input_tokens,
             keep_alive: config.keep_alive.clone(),
             agent,
-        }
+        })
     }
 }
 

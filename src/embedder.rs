@@ -6,6 +6,8 @@ pub enum EmbedError {
     Unavailable(String),
     #[error("invalid embedding response: {0}")]
     InvalidResponse(String),
+    #[error("invalid embedder config: {0}")]
+    Config(String),
 }
 
 pub trait Embedder: Send + Sync {
