@@ -103,14 +103,20 @@ pub struct BgCompletion {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum JobKind {
+pub enum RecordKind {
     Iteration,
     Result,
 }
 
+impl RecordKind {
+    pub fn as_str(self) -> &'static str {
+        job_kind_str(self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct EmbedJob {
-    pub kind: JobKind,
+    pub kind: RecordKind,
     pub ref_id: String,
 }
 
@@ -389,6 +395,24 @@ impl RecordStore {
         )
     }
 
+    /// `rowid > after`인 반복 id를 rowid 순으로 최대 `limit`개 돌려준다. (재색인용)
+    pub fn iteration_page(&self, after: i64, limit: usize) -> Result<Vec<(i64, String)>> {
+        self.page("iterations", after, limit)
+    }
+
+    /// `rowid > after`인 결과 id를 rowid 순으로 최대 `limit`개 돌려준다. (재색인용)
+    pub fn result_page(&self, after: i64, limit: usize) -> Result<Vec<(i64, String)>> {
+        self.page("results", after, limit)
+    }
+
+    fn page(&self, table: &str, after: i64, limit: usize) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT rowid, id FROM {table} WHERE rowid > ?1 ORDER BY rowid LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![after, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn counts(&self) -> Result<Counts> {
         let count = |table: &str| -> Result<u64> {
             let n: i64 =
@@ -587,7 +611,7 @@ fn insert_iteration(tx: &Transaction, new: &NewIteration) -> Result<()> {
         "INSERT INTO iterations_fts (rowid, embed_text) VALUES (last_insert_rowid(), ?1)",
         [&new.embed_text],
     )?;
-    enqueue(tx, JobKind::Iteration, &id)?;
+    enqueue(tx, RecordKind::Iteration, &id)?;
     for call in &it.tool_calls {
         if let Some(result) = &call.result
             && let Some(result_id) = insert_result(tx, &call.name, &result.text, &it.ts)?
@@ -682,12 +706,12 @@ fn insert_result(
             "INSERT INTO results_fts (rowid, text) VALUES (last_insert_rowid(), ?1)",
             [text],
         )?;
-        enqueue(tx, JobKind::Result, &id)?;
+        enqueue(tx, RecordKind::Result, &id)?;
     }
     Ok(Some(id))
 }
 
-fn enqueue(tx: &Transaction, kind: JobKind, ref_id: &str) -> Result<()> {
+fn enqueue(tx: &Transaction, kind: RecordKind, ref_id: &str) -> Result<()> {
     tx.execute(
         "INSERT OR IGNORE INTO embed_jobs (kind, ref_id) VALUES (?1, ?2)",
         params![job_kind_str(kind), ref_id],
@@ -720,17 +744,17 @@ fn kind_from_str(s: &str) -> Option<BackgroundKind> {
     }
 }
 
-fn job_kind_str(kind: JobKind) -> &'static str {
+fn job_kind_str(kind: RecordKind) -> &'static str {
     match kind {
-        JobKind::Iteration => "iteration",
-        JobKind::Result => "result",
+        RecordKind::Iteration => "iteration",
+        RecordKind::Result => "result",
     }
 }
 
-fn job_kind_from_str(s: &str) -> Option<JobKind> {
+fn job_kind_from_str(s: &str) -> Option<RecordKind> {
     match s {
-        "iteration" => Some(JobKind::Iteration),
-        "result" => Some(JobKind::Result),
+        "iteration" => Some(RecordKind::Iteration),
+        "result" => Some(RecordKind::Result),
         _ => None,
     }
 }

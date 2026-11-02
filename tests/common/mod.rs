@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod contract;
+
 use std::fs;
 use std::path::PathBuf;
 

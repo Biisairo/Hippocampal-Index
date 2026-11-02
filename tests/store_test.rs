@@ -5,7 +5,9 @@ use rusqlite::Connection;
 use serde_json::json;
 use smem::bg::{BackgroundKind, TaskNotification};
 use smem::embed_text::build_embed_text;
-use smem::store::{Batch, EmbedJob, FtsFilter, JobKind, NewCompletion, NewIteration, RecordStore};
+use smem::store::{
+    Batch, EmbedJob, FtsFilter, NewCompletion, NewIteration, RecordKind, RecordStore,
+};
 use smem::transcript::{ExtractorState, Iteration, IterationInput, ToolCall, ToolResultData};
 
 fn batch_from_fixture(name: &str) -> Batch {
@@ -328,11 +330,11 @@ fn embed_jobs_are_listed_and_completed() {
     assert_eq!(
         jobs[0],
         EmbedJob {
-            kind: JobKind::Iteration,
+            kind: RecordKind::Iteration,
             ref_id: "s:m1".into()
         }
     );
-    assert_eq!(jobs[1].kind, JobKind::Result);
+    assert_eq!(jobs[1].kind, RecordKind::Result);
     assert_eq!(store.embed_jobs(1).unwrap().len(), 1);
     store.complete_embed_jobs(&jobs[..1]).unwrap();
     assert_eq!(store.embed_jobs(10).unwrap(), jobs[1..].to_vec());
