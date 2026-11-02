@@ -150,3 +150,19 @@ fn redacts_all_iteration_text_fields() {
     assert!(!dumped.contains("abcdefgh123"), "{dumped}");
     assert_eq!(dumped.matches("[REDACTED:env]").count(), 7);
 }
+
+#[test]
+fn masks_truncated_pem_without_end_marker() {
+    let text = "a\n-----BEGIN PRIVATE KEY-----\nMIIEow\nxyz";
+    assert_eq!(r().redact(text), "a\n[REDACTED:private_key]");
+}
+
+#[test]
+fn extra_kind_is_not_treated_as_replacement_template() {
+    let red = Redactor::new(&[ExtraPattern {
+        kind: "$1${0}".into(),
+        pattern: r"(HCI)-\d{6}".into(),
+    }])
+    .unwrap();
+    assert_eq!(red.redact("id HCI-123456"), "id [REDACTED:$1${0}]");
+}

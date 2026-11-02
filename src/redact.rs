@@ -1,6 +1,6 @@
 //! 저장 전 비밀값 마스킹. (FR-STO-6, QA-4)
 
-use regex::Regex;
+use regex::{Captures, Regex};
 use serde_json::Value;
 
 use crate::transcript::{Iteration, IterationInput};
@@ -32,7 +32,7 @@ struct Rule {
 const BUILTIN: &[(&str, &str, bool)] = &[
     (
         "private_key",
-        r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+        r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----(?:.*?-----END [A-Z ]*PRIVATE KEY-----|.*\z)",
         false,
     ),
     ("api_key", r"\bsk-[A-Za-z0-9_-]{20,}", false),
@@ -79,11 +79,16 @@ impl Redactor {
 
     pub fn redact(&self, text: &str) -> String {
         self.rules.iter().fold(text.to_string(), |acc, rule| {
-            let replacement = match rule.replace {
-                Replace::Whole => format!("[REDACTED:{}]", rule.kind),
-                Replace::ValueOnly => format!("${{1}}${{2}}[REDACTED:{}]", rule.kind),
-            };
-            rule.re.replace_all(&acc, replacement.as_str()).into_owned()
+            let mask = format!("[REDACTED:{}]", rule.kind);
+            rule.re
+                .replace_all(&acc, |caps: &Captures| match rule.replace {
+                    Replace::Whole => mask.clone(),
+                    Replace::ValueOnly => {
+                        let group = |i| caps.get(i).map_or("", |m| m.as_str());
+                        format!("{}{}{mask}", group(1), group(2))
+                    }
+                })
+                .into_owned()
         })
     }
 
