@@ -219,7 +219,8 @@ fn user_answer_follows_its_tool_line() {
     );
     assert_eq!(
         build_embed_text(&long, 10, &answer_tools()),
-        "[tool] AskUserQuestion({})\n[answer] 0123456789…"
+        "[tool] AskUserQuestion({})\n[answer] 0123456789abc",
+        "답은 결과 끝에 있으므로 자르지 않음"
     );
     let unanswered = iteration(vec![], vec![call("AskUserQuestion", json!({}))], vec![]);
     assert_eq!(

@@ -69,7 +69,7 @@ pub fn build_embed_text(
                 .result
                 .as_ref()
                 .filter(|_| answer_tools.contains(&call.name))
-                .map(|r| format!("[answer] {}", truncate(&r.text, max_tool_input_chars)));
+                .map(|r| format!("[answer] {}", r.text));
             std::iter::once(line).chain(answer)
         });
     let response = (!it.texts.is_empty()).then(|| format!("[response] {}", it.texts.join("\n")));

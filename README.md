@@ -365,7 +365,7 @@ max_tokens = 8000                  # chunk limit = min(model limit, this) × cha
 chars_per_token = 1.0
 
 [embed_text]
-max_tool_input_chars = 500         # tool-input JSON and [answer] are cut here in the embedded text only
+max_tool_input_chars = 500         # tool-input JSON is cut here in the embedded text only ([answer] is not cut)
 answer_tools = ["AskUserQuestion", "ExitPlanMode"]   # tools whose result (your answer) is added as [answer]
 
 [inject]

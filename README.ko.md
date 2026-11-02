@@ -365,7 +365,7 @@ max_tokens = 8000                  # 청크 한도 = min(모델 한도, 이 값)
 chars_per_token = 1.0
 
 [embed_text]
-max_tool_input_chars = 500         # 임베딩 텍스트에서만 도구 입력 JSON과 [answer]를 이 길이로 자름
+max_tool_input_chars = 500         # 임베딩 텍스트에서만 도구 입력 JSON을 이 길이로 자름 ([answer]는 자르지 않음)
 answer_tools = ["AskUserQuestion", "ExitPlanMode"]   # 결과(사용자의 답)를 [answer]로 넣는 도구
 
 [inject]
