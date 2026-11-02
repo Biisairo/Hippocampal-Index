@@ -1,4 +1,4 @@
-# 소프트웨어 요구사항 명세서 (SRS) — session-memory
+# 소프트웨어 요구사항 명세서 (SRS) — hippo
 
 | 항목 | 값 |
 |------|----|
@@ -13,10 +13,10 @@
 ## 1. 서론
 
 ### 1.1 목적
-이 문서는 Claude Code 세션의 대화를 agentic loop 반복 단위로 로컬 벡터 DB에 저장하고, 이후 대화에서 그 기록을 검색해 답변에 활용하는 개인 기억 시스템 `session-memory`의 요구사항을 정의한다. 구현, 테스트, 인수 판단은 이 문서를 단일 기준으로 삼는다.
+이 문서는 Claude Code 세션의 대화를 agentic loop 반복 단위로 로컬 벡터 DB에 저장하고, 이후 대화에서 그 기록을 검색해 답변에 활용하는 개인 기억 시스템 `hippo`의 요구사항을 정의한다. 구현, 테스트, 인수 판단은 이 문서를 단일 기준으로 삼는다.
 
 ### 1.2 범위
-`session-memory`는 단일 Rust 바이너리 `smem`으로 제공되며 다음을 수행한다.
+`hippo`는 단일 Rust 바이너리 `hippo`로 제공되며 다음을 수행한다.
 - Claude Code hook으로 메인 agentic loop의 반복을 수집한다.
 - 상주 데몬이 transcript를 해석해 반복과 도구 결과를 원본 저장소(SQLite)에 저장하고, 로컬 임베딩 모델로 벡터화해 벡터 저장소(기본 LanceDB)에 색인한다.
 - 임베딩 모델과 벡터 저장소는 설정만 바꿔 교체할 수 있다. 벡터 저장소는 원본 저장소에서 언제든 다시 만들 수 있는 파생 인덱스이다.
@@ -61,11 +61,11 @@
 ### 2.1 제품 관점
 
 ```
-Claude Code ──hook(stdin JSON)──▶ smem hook <event> ──Unix socket──▶ smem daemon
+Claude Code ──hook(stdin JSON)──▶ hippo hook <event> ──Unix socket──▶ hippo daemon
                                         │ (데몬 응답 없음)                   │
                                         └──────▶ 스풀 파일 ◀──── 시작 시 소진 ┤
                                                                            ├─▶ transcript JSONL 읽기
-Claude (Bash) ──▶ smem search ... ──Unix socket──────────────────────────▶ ├─▶ 원본 저장소 SQLite (기준 데이터, FTS)
+Claude (Bash) ──▶ hippo search ... ──Unix socket──────────────────────────▶ ├─▶ 원본 저장소 SQLite (기준 데이터, FTS)
                                                                            ├─▶ Embedder 트레이트 ──▶ [기본] Ollama (localhost)
                                                                            └─▶ VectorStore 트레이트 ──▶ [기본] LanceDB
 ```
@@ -86,7 +86,7 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 - C-4 데이터를 로컬 장비 밖으로 전송하지 않는다. 네트워크 통신은 `localhost`의 Ollama로 한정한다. 임베더 URL은 URL 파서로 해석하며, 스킴이 `http`/`https`가 아니거나, host가 `localhost`, `127.0.0.1`, `::1`이 아니거나, userinfo(`@`)·쿼리·프래그먼트가 있으면 거부한다. 이 검사는 설정을 읽을 때와 임베더를 만들 때 모두 수행한다. HTTP 리다이렉트는 따르지 않는다.
 - C-5 MCP 서버를 사용하지 않는다. (사내 규정상 새 MCP 서버는 정보보호팀 승인 대상)
 - C-6 1차 대상 플랫폼은 macOS(darwin)이다.
-- C-7 Claude Code 설정 파일은 사용자가 `smem install`/`smem uninstall`을 실행할 때만 수정한다. 그 밖의 명령과 데몬은 설정 파일을 수정하지 않는다.
+- C-7 Claude Code 설정 파일은 사용자가 `hippo install`/`hippo uninstall`을 실행할 때만 수정한다. 그 밖의 명령과 데몬은 설정 파일을 수정하지 않는다.
 
 ### 2.5 가정과 의존성
 - A-1 Claude Code의 hook 입력 스키마와 transcript JSONL 형식은 부록 A의 실측 결과(Claude Code 2.1.316)와 같다. 버전이 바뀌면 재검증한다.
@@ -113,32 +113,32 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 #### 3.1.1 Hook 인터페이스
 | ID | 요구사항 | 우선순위 |
 |----|----------|----------|
-| IF-HK-1 | `smem hook <event>`는 stdin으로 hook 입력 JSON 1개를 받아야 한다. `<event>`는 `post-tool-batch`, `stop`, `stop-failure`, `session-end`, `user-prompt-submit` 중 하나이다. | M |
+| IF-HK-1 | `hippo hook <event>`는 stdin으로 hook 입력 JSON 1개를 받아야 한다. `<event>`는 `post-tool-batch`, `stop`, `stop-failure`, `session-end`, `user-prompt-submit` 중 하나이다. | M |
 | IF-HK-2 | `user-prompt-submit`을 뺀 모든 hook은 항상 종료 코드 0으로 끝나야 하며 stdout에 아무것도 출력하지 않아야 한다. | M |
 | IF-HK-3 | `user-prompt-submit`은 주입할 기억이 있으면 `hookSpecificOutput.additionalContext`를 담은 JSON 1개를 stdout에 출력하고, 없으면 아무것도 출력하지 않아야 한다. 어떤 경우에도 프롬프트를 차단하지 않아야 한다(종료 코드 0). | M |
-| IF-HK-4 | `smem hooks-config`는 Claude Code `settings.json`에 넣을 hook 설정 JSON을 stdout에 출력해야 한다. 수집 hook(`PostToolBatch`, `Stop`, `StopFailure`, `SessionEnd`)은 `async: true`로 설정한다. `UserPromptSubmit`은 동기로 두고 `timeout`(초)을 시간 예산보다 크게 설정한다. 명령 경로는 실행 중인 `smem`의 절대 경로를 쓴다. | M |
+| IF-HK-4 | `hippo hooks-config`는 Claude Code `settings.json`에 넣을 hook 설정 JSON을 stdout에 출력해야 한다. 수집 hook(`PostToolBatch`, `Stop`, `StopFailure`, `SessionEnd`)은 `async: true`로 설정한다. `UserPromptSubmit`은 동기로 두고 `timeout`(초)을 시간 예산보다 크게 설정한다. 명령 경로는 실행 중인 `hippo`의 절대 경로를 쓴다. | M |
 | IF-HK-5 | 수집 hook 클라이언트는 데몬에 요청을 보내고 처리 완료 응답을 기다린다(기본 10초). 연결할 수 없으면 FR-CAP-5에 따라 스풀에 기록한다. 응답 대기 중 시간이 지나면 그대로 종료한다. | M |
 
 #### 3.1.2 CLI 인터페이스
 | ID | 요구사항 | 우선순위 |
 |----|----------|----------|
-| IF-CLI-1 | `smem search <query> [--scope cwd\|all\|<path>] [--kind iteration\|result\|both] [--limit N]`는 검색 결과를 사람이 읽을 수 있는 텍스트로 출력해야 한다. 기본값은 `--scope cwd --kind iteration --limit 10`이다. `search`, `show`, `status`는 데몬에 요청하며, 데몬이 응답하지 않으면 오류 메시지를 stderr에 출력하고 종료 코드 1로 끝난다. | M |
-| IF-CLI-2 | `smem show <prompt_id>`는 해당 턴의 반복을 순서대로 복원해 출력해야 한다. `--with-results` 옵션을 주면 연결된 결과 원문도 출력한다. | M |
-| IF-CLI-3 | `smem daemon`은 데몬을 포그라운드로 실행해야 한다. | M |
-| IF-CLI-4 | `smem launchd-plist`는 데몬 자동 실행용 launchd plist를 stdout에 출력해야 한다. | S |
-| IF-CLI-6 | `smem install --scope user\|project [--project <경로>] [--dry-run]`는 hook 설정을 Claude Code 설정 파일에 병합해야 한다. `smem uninstall`은 같은 옵션으로 smem hook만 제거해야 한다. | M |
-| IF-CLI-5 | `smem status`는 데몬 상태, 스풀 대기 건수, 임베딩 대기 건수, 테이블별 행 수를 출력해야 한다. | S |
+| IF-CLI-1 | `hippo search <query> [--scope cwd\|all\|<path>] [--kind iteration\|result\|both] [--limit N]`는 검색 결과를 사람이 읽을 수 있는 텍스트로 출력해야 한다. 기본값은 `--scope cwd --kind iteration --limit 10`이다. `search`, `show`, `status`는 데몬에 요청하며, 데몬이 응답하지 않으면 오류 메시지를 stderr에 출력하고 종료 코드 1로 끝난다. | M |
+| IF-CLI-2 | `hippo show <prompt_id>`는 해당 턴의 반복을 순서대로 복원해 출력해야 한다. `--with-results` 옵션을 주면 연결된 결과 원문도 출력한다. | M |
+| IF-CLI-3 | `hippo daemon`은 데몬을 포그라운드로 실행해야 한다. | M |
+| IF-CLI-4 | `hippo launchd-plist`는 데몬 자동 실행용 launchd plist를 stdout에 출력해야 한다. | S |
+| IF-CLI-6 | `hippo install --scope user\|project [--project <경로>] [--dry-run]`는 hook 설정을 Claude Code 설정 파일에 병합해야 한다. `hippo uninstall`은 같은 옵션으로 hippo hook만 제거해야 한다. | M |
+| IF-CLI-5 | `hippo status`는 데몬 상태, 스풀 대기 건수, 임베딩 대기 건수, 테이블별 행 수를 출력해야 한다. | S |
 
 #### 3.1.3 데몬 소켓 인터페이스
 | ID | 요구사항 | 우선순위 |
 |----|----------|----------|
-| IF-SK-1 | 데몬은 `~/.session-memory/smem.sock` Unix socket으로 줄 단위 JSON 요청과 응답을 주고받아야 한다. | M |
+| IF-SK-1 | 데몬은 `~/.hippo/hippo.sock` Unix socket으로 줄 단위 JSON 요청과 응답을 주고받아야 한다. | M |
 | IF-SK-2 | 요청 종류는 `ingest`(hook 이벤트 전달), `inject`(자동 주입 텍스트 생성), `search`, `show`, `status`, `reindex`이다. 연결 하나에 요청 하나, 응답 하나를 주고받는다. | M |
 
 #### 3.1.4 Skill
 | ID | 요구사항 | 우선순위 |
 |----|----------|----------|
-| IF-SKL-1 | Claude가 과거 기억이 필요할 때 `smem search`와 `smem show`를 Bash로 호출하는 방법을 안내하는 skill 문서(`SKILL.md`)를 제공해야 한다. | M |
+| IF-SKL-1 | Claude가 과거 기억이 필요할 때 `hippo search`와 `hippo show`를 Bash로 호출하는 방법을 안내하는 skill 문서(`SKILL.md`)를 제공해야 한다. | M |
 
 ### 3.2 기능 요구사항
 
@@ -198,19 +198,19 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 | FR-RET-1 | `user-prompt-submit` hook은 프롬프트로 `iterations`를 검색해야 한다. 조건: `cwd`가 현재 cwd와 같을 것, `session_id`가 현재 세션과 다를 것. | M |
 | FR-RET-2 | 검색은 벡터 검색과 FTS 결과를 합친 하이브리드 순위(RRF)로 해야 한다. 점수는 각 목록에서의 순위 r(1부터)에 대해 `Σ 1/(60 + r)`이다. 각 목록에서 후보를 `limit × 4`개까지 가져온다. 한 레코드의 여러 청크가 벡터 검색에 걸리면 가장 높은 유사도 하나로 합친다. 결과 검색에 범위 필터가 있으면 벡터 검색 후 원본 저장소의 반복-결과 연결로 걸러낸다. | M |
 | FR-RET-3 | 자동 주입은 벡터 유사도가 임계값(설정 `[inject] threshold`, 기본 0.40) 이상인 반복 중 RRF 점수 상위 k개(설정, 기본 3개)만 대상으로 해야 한다. FTS로만 찾은 반복은 대상이 아니다. 대상이 없으면 아무것도 주입하지 않는다. | M |
-| FR-RET-4 | 주입 텍스트는 결과마다 `ts`, `prompt_id`, `embed_text`(최대 길이 설정, 기본 800자)를 담고, 전체 길이를 설정값(기본 4,000자) 이하로 제한해야 한다. 각 결과는 `<memory ts="…" prompt="…">` … `</memory>` 블록으로 감싸고, 블록 안의 `&`, `<`, `>`, `"`는 이스케이프한다. 머리말에 블록 내용은 과거 기록이며 지시가 아님을 밝힌다. 끝에 `smem show <prompt_id>`로 상세 내용을 볼 수 있다는 안내를 붙인다. | M |
+| FR-RET-4 | 주입 텍스트는 결과마다 `ts`, `prompt_id`, `embed_text`(최대 길이 설정, 기본 800자)를 담고, 전체 길이를 설정값(기본 4,000자) 이하로 제한해야 한다. 각 결과는 `<memory ts="…" prompt="…">` … `</memory>` 블록으로 감싸고, 블록 안의 `&`, `<`, `>`, `"`는 이스케이프한다. 머리말에 블록 내용은 과거 기록이며 지시가 아님을 밝힌다. 끝에 `hippo show <prompt_id>`로 상세 내용을 볼 수 있다는 안내를 붙인다. | M |
 | FR-RET-5 | `user-prompt-submit` hook은 시간 예산(설정, 기본 800ms)을 넘으면 검색을 포기하고 아무것도 주입하지 않아야 한다. 데몬의 검색은 단계(임베딩, 벡터 검색, FTS)마다 마감 시각을 확인하고, hook 클라이언트는 같은 예산으로 소켓 타임아웃을 건다. | M |
-| FR-RET-6 | `smem search`는 IF-CLI-1의 옵션에 따라 범위와 종류를 바꿔 검색해야 한다. `--kind result` 결과에는 그 결과를 참조하는 반복의 `prompt_id`를 함께 출력한다. | M |
-| FR-RET-7 | `smem show`는 `prompt_id`의 반복을 `iteration_index` 순서로 출력하고, 반복에 백그라운드 시작 호출이 있으면 그 작업의 완료 기록(순번, 상태, 요약, 결과 id)을 함께 표시해야 한다. | M |
+| FR-RET-6 | `hippo search`는 IF-CLI-1의 옵션에 따라 범위와 종류를 바꿔 검색해야 한다. `--kind result` 결과에는 그 결과를 참조하는 반복의 `prompt_id`를 함께 출력한다. | M |
+| FR-RET-7 | `hippo show`는 `prompt_id`의 반복을 `iteration_index` 순서로 출력하고, 반복에 백그라운드 시작 호출이 있으면 그 작업의 완료 기록(순번, 상태, 요약, 결과 id)을 함께 표시해야 한다. | M |
 
 #### 3.2.8 설치 (INS)
 | ID | 요구사항 | 우선순위 |
 |----|----------|----------|
 | FR-INS-1 | 대상 파일은 `--scope user`면 `$HOME/.claude/settings.json`, `--scope project`면 `<프로젝트>/.claude/settings.local.json`이다. 프로젝트 경로는 `--project`로 주며, 없으면 현재 디렉터리를 쓴다. | M |
-| FR-INS-2 | smem hook 항목은 `command`가 `smem hook <post-tool-batch\|stop\|stop-failure\|session-end\|user-prompt-submit>`로 끝나고, 실행 파일 이름이 `smem`인 항목으로 식별한다. 설정 파일에 별도 표식 키를 넣지 않는다. | M |
-| FR-INS-3 | 설치는 기존 smem hook 항목을 모두 지운 뒤 IF-HK-4의 hook 설정을 이벤트마다 추가해야 한다. 다른 hook과 다른 설정 키는 내용과 순서를 그대로 유지한다. 비게 된 matcher 그룹과 이벤트는 지운다. | M |
-| FR-INS-4 | 제거는 smem hook 항목만 지워야 한다. 비게 된 matcher 그룹, 이벤트, `hooks` 키는 지운다. | M |
-| FR-INS-5 | 결과가 기존 내용과 같으면 파일을 쓰지 않고 "변경 없음"을 출력한다. 다르면 변경 내용(diff)을 출력하고, 기존 파일이 있으면 `<파일>.smem-backup-<유닉스 시각>`(이미 있으면 `-<번호>`를 붙임)으로 백업한 뒤 임시 파일에 쓰고 이름을 바꿔 원자적으로 교체한다. 기존 파일 권한을 유지한다. 임시 파일은 같은 디렉터리에 무작위 이름으로 배타적으로 만들고, 백업은 링크를 따르지 않는 배타적 생성(권한 0600)으로 만든다. 설정 파일이나 바로 위 디렉터리가 심볼릭 링크이면 수정하지 않고 오류로 끝낸다. `--dry-run`이면 diff만 출력하고 아무것도 쓰지 않는다. | M |
+| FR-INS-2 | hippo hook 항목은 `command`가 `hippo hook <post-tool-batch\|stop\|stop-failure\|session-end\|user-prompt-submit>`로 끝나고, 실행 파일 이름이 `hippo`인 항목으로 식별한다. 설정 파일에 별도 표식 키를 넣지 않는다. | M |
+| FR-INS-3 | 설치는 기존 hippo hook 항목을 모두 지운 뒤 IF-HK-4의 hook 설정을 이벤트마다 추가해야 한다. 다른 hook과 다른 설정 키는 내용과 순서를 그대로 유지한다. 비게 된 matcher 그룹과 이벤트는 지운다. | M |
+| FR-INS-4 | 제거는 hippo hook 항목만 지워야 한다. 비게 된 matcher 그룹, 이벤트, `hooks` 키는 지운다. | M |
+| FR-INS-5 | 결과가 기존 내용과 같으면 파일을 쓰지 않고 "변경 없음"을 출력한다. 다르면 변경 내용(diff)을 출력하고, 기존 파일이 있으면 `<파일>.hippo-backup-<유닉스 시각>`(이미 있으면 `-<번호>`를 붙임)으로 백업한 뒤 임시 파일에 쓰고 이름을 바꿔 원자적으로 교체한다. 기존 파일 권한을 유지한다. 임시 파일은 같은 디렉터리에 무작위 이름으로 배타적으로 만들고, 백업은 링크를 따르지 않는 배타적 생성(권한 0600)으로 만든다. 설정 파일이나 바로 위 디렉터리가 심볼릭 링크이면 수정하지 않고 오류로 끝낸다. `--dry-run`이면 diff만 출력하고 아무것도 쓰지 않는다. | M |
 | FR-INS-6 | 기존 파일이 JSON으로 해석되지 않거나, 최상위가 객체가 아니거나, `hooks`가 객체가 아니면 수정하지 않고 오류로 끝낸다. 파일이 없으면 새로 만든다(디렉터리 포함). | M |
 
 #### 3.2.6 교체 가능성 (SWP)
@@ -220,10 +220,10 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 | FR-SWP-2 | 벡터 저장소는 `VectorStore` 트레이트로 추상화해야 한다. 트레이트는 최소한 `info`, `upsert`, `delete`, `search(vector, filter, limit)`, `count`, `ensure_index`를 제공한다. 필터는 백엔드 중립 타입(`kind`, `cwd`, `session_id` 제외, `embed_model`)으로 표현한다. 벡터 레코드 id는 `<kind>:<ref_id>#<chunk_index>`이다. 결과 벡터에는 `cwd`와 `session_id`를 넣지 않는다. 검색 점수는 코사인 유사도이며 클수록 가깝다. 저장소는 처음 저장한 벡터의 `embed_model`과 차원을 `info`로 돌려주고, 차원이 다른 벡터의 저장은 오류로 거부해야 한다. | M |
 | FR-SWP-3 | 사용할 임베더 백엔드, 모델, 차원과 벡터 저장소 백엔드는 `config.toml`로 선택해야 한다. 백엔드를 추가할 때 수집, 해석, 검색 로직을 수정하지 않아야 한다. | M |
 | FR-SWP-4 | 원본 저장소는 벡터 없이도 반복, 결과, 임베딩 대상 텍스트를 모두 보관해야 한다. 벡터 저장소의 내용은 원본 저장소에서 다시 만들 수 있어야 한다. | M |
-| FR-SWP-5 | `smem reindex`는 데몬에 재색인을 요청하고, 데몬은 현재 설정의 임베더와 벡터 저장소 백엔드로 원본 저장소 전체를 새 세대 디렉터리(`vectors/<이름>/<세대>/`)에 다시 색인해야 한다. 재색인은 백그라운드로 실행하며 그동안 기존 저장소로 검색할 수 있어야 한다(호환되지 않으면 FTS 전용). 재색인 중에는 임베딩 작업 스레드를 멈춰, 그 사이 들어온 작업이 전환 후 새 저장소에 반영되게 한다. 완료하면 `vectors/<이름>/ACTIVE` 포인터를 원자적으로 바꿔 전환하고 호환성을 다시 판정한다. 이미 재색인 중이면 오류를 돌려준다. 교체 절차: 설정 변경 → 데몬 재시작 → `smem reindex`. | M |
+| FR-SWP-5 | `hippo reindex`는 데몬에 재색인을 요청하고, 데몬은 현재 설정의 임베더와 벡터 저장소 백엔드로 원본 저장소 전체를 새 세대 디렉터리(`vectors/<이름>/<세대>/`)에 다시 색인해야 한다. 재색인은 백그라운드로 실행하며 그동안 기존 저장소로 검색할 수 있어야 한다(호환되지 않으면 FTS 전용). 재색인 중에는 임베딩 작업 스레드를 멈춰, 그 사이 들어온 작업이 전환 후 새 저장소에 반영되게 한다. 완료하면 `vectors/<이름>/ACTIVE` 포인터를 원자적으로 바꿔 전환하고 호환성을 다시 판정한다. 이미 재색인 중이면 오류를 돌려준다. 교체 절차: 설정 변경 → 데몬 재시작 → `hippo reindex`. | M |
 | FR-SWP-9 | 데몬은 시작할 때 `ACTIVE`가 가리키지 않는 세대 디렉터리를 지워야 한다. `ACTIVE`가 없으면 첫 세대를 만들어 가리키게 한다. | M |
-| FR-SWP-10 | `smem status`는 재색인 상태(`idle`, `running`, `done`, `failed: <사유>`)를 보여야 한다. 벡터가 0개인데 반복이 있으면 재색인이 필요하다고 안내한다. | M |
-| FR-SWP-6 | 데몬은 시작할 때 활성 벡터 저장소의 `embed_model`, 차원과 설정의 임베더가 다르면 수집은 계속하되, 벡터 검색을 끄고 FTS 검색만 수행하며(이 상태에서는 자동 주입을 하지 않는다) `smem status`와 로그에 재색인 필요를 표시해야 한다. | M |
+| FR-SWP-10 | `hippo status`는 재색인 상태(`idle`, `running`, `done`, `failed: <사유>`)를 보여야 한다. 벡터가 0개인데 반복이 있으면 재색인이 필요하다고 안내한다. | M |
+| FR-SWP-6 | 데몬은 시작할 때 활성 벡터 저장소의 `embed_model`, 차원과 설정의 임베더가 다르면 수집은 계속하되, 벡터 검색을 끄고 FTS 검색만 수행하며(이 상태에서는 자동 주입을 하지 않는다) `hippo status`와 로그에 재색인 필요를 표시해야 한다. | M |
 | FR-SWP-7 | 하이브리드 검색의 FTS 부분은 원본 저장소(SQLite FTS5)에서 수행해 벡터 저장소 백엔드와 무관하게 동작해야 한다. | M |
 | FR-SWP-8 | 테스트용으로 결정론적 `Embedder`와 메모리 기반 `VectorStore` 백엔드를 제공하고, 모든 백엔드에 같은 계약 테스트를 적용해야 한다. | M |
 
@@ -233,7 +233,7 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 | FR-DMN-1 | 데몬은 장비당 1개만 실행되어야 한다. 이미 실행 중이면 두 번째 실행은 오류 메시지를 출력하고 종료한다. | M |
 | FR-DMN-2 | 원본 저장소와 벡터 저장소 쓰기는 데몬만 수행해야 한다. | M |
 | FR-DMN-3 | 데몬은 세션 단위 처리 요청을 직렬로 처리해 같은 세션을 동시에 처리하지 않아야 한다. | M |
-| FR-DMN-4 | 데몬은 처리 오류를 `~/.session-memory/logs/`에 기록하고 계속 동작해야 한다. | M |
+| FR-DMN-4 | 데몬은 처리 오류를 `~/.hippo/logs/`에 기록하고 계속 동작해야 한다. | M |
 | FR-DMN-5 | 데몬은 시작할 때 데이터 루트와 하위 디렉터리를 권한 0700으로 만들거나 맞추고, 잠금을 얻은 뒤 남아 있는 소켓 파일을 지우고 새로 만들어야 한다. 소켓 파일 권한은 0600이다. | M |
 | FR-DMN-6 | 수집은 전용 스레드 하나가 요청 순서대로 처리해야 한다. 임베딩 작업은 별도 스레드가 처리하며, 수집이 끝날 때마다 깨어나고 실패하면 일정 시간 뒤 재시도한다. 벡터 저장소가 호환되지 않으면(FR-SWP-6) 임베딩 작업 스레드는 작업을 처리하지 않는다. | M |
 
@@ -242,13 +242,13 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 |----|----------|
 | PR-1 | 수집 hook 클라이언트는 실행 시작부터 종료까지 p95 50ms 이하여야 한다. |
 | PR-2 | `user-prompt-submit` hook은 시간 예산(FR-RET-5)을 넘지 않아야 한다. 데몬이 준비된 상태에서 p95 300ms 이하를 목표로 한다. |
-| PR-3 | `iterations` 1,000만 행에서 `smem search` 응답은 p95 500ms 이하여야 한다. |
+| PR-3 | `iterations` 1,000만 행에서 `hippo search` 응답은 p95 500ms 이하여야 한다. |
 | PR-4 | 데몬은 하루 3.5만 청크를 하루 안에 임베딩할 수 있어야 한다. |
 
 ### 3.4 논리 데이터 요구사항
 | ID | 요구사항 |
 |----|----------|
-| DR-1 | 데이터 루트는 `~/.session-memory/`이며 하위에 `records.sqlite`(원본 저장소. 세션 해석기 상태, 백그라운드 기록, 임베딩 작업 큐 포함), `vectors/<저장소명>/<세대>/`(벡터 저장소)와 `vectors/<저장소명>/ACTIVE`(사용 중인 세대), `spool/`, `logs/`, `config.toml`을 둔다. |
+| DR-1 | 데이터 루트는 `~/.hippo/`이며 하위에 `records.sqlite`(원본 저장소. 세션 해석기 상태, 백그라운드 기록, 임베딩 작업 큐 포함), `vectors/<저장소명>/<세대>/`(벡터 저장소)와 `vectors/<저장소명>/ACTIVE`(사용 중인 세대), `spool/`, `logs/`, `config.toml`을 둔다. |
 | DR-2 | 데이터 루트의 권한은 `0700`이어야 한다. |
 | DR-3 | 모든 벡터 행은 생성에 쓴 `embed_model`과 차원을 기록해야 한다. |
 
@@ -260,7 +260,7 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 | QA-3 (보안) | 데이터는 로컬 장비 밖으로 전송되지 않아야 한다. (C-4) |
 | QA-4 (보안) | 비밀값 마스킹(FR-STO-6)을 거치지 않은 텍스트는 DB에 기록되지 않아야 한다. |
 | QA-6 (보안) | 주입 텍스트와 CLI 출력에서 `\n`, `\t`를 뺀 제어 문자(C0, DEL, C1)는 `\u{..}` 형태로 이스케이프해야 한다. |
-| QA-5 (무간섭) | `smem`의 어떤 오류도 Claude Code 세션 진행을 막거나 오류 메시지를 띄우지 않아야 한다. |
+| QA-5 (무간섭) | `hippo`의 어떤 오류도 Claude Code 세션 진행을 막거나 오류 메시지를 띄우지 않아야 한다. |
 
 ---
 

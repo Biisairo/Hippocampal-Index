@@ -47,7 +47,7 @@ const EMBED_IDLE: Duration = Duration::from_secs(1);
 const EMBED_RETRY: Duration = Duration::from_secs(5);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const REINDEX_PAGE: usize = 256;
-const LOG_FILE: &str = "smemd.log";
+const LOG_FILE: &str = "hippo.log";
 const REINDEX_IDLE: &str = "idle";
 const REINDEX_DONE: &str = "done";
 

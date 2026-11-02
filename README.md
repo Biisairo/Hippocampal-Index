@@ -1,8 +1,10 @@
-# session-memory (`smem`)
+# hippo
+
+Named after the hippocampus, the part of the brain that turns short-term experience into long-term memory.
 
 [한국어](README.ko.md)
 
-`smem` gives Claude Code a long-term memory of your own sessions. It records every iteration of the agentic loop into a local database. When you send a new prompt, it searches that memory and gives Claude the relevant past context.
+`hippo` gives Claude Code a long-term memory of your own sessions. It records every iteration of the agentic loop into a local database. When you send a new prompt, it searches that memory and gives Claude the relevant past context.
 
 All data stays on your machine. Embeddings come from a local Ollama model, and vectors go into an embedded LanceDB. No conversation content leaves the computer.
 
@@ -36,7 +38,7 @@ Your prompt
   → iteration 3: model text only (the loop ends)
 ```
 
-`smem` stores **one record per iteration**. The record contains:
+`hippo` stores **one record per iteration**. The record contains:
 
 - **Input**: your prompt, a background-task completion notice, or a subagent report, if one arrived before this iteration
 - **Tool calls**: the name and input of each tool call
@@ -51,12 +53,12 @@ Your prompt
 | Last iteration (text only) | `Stop` / `StopFailure` |
 | Leftovers at session end | `SessionEnd` |
 
-These hooks run with `async: true`, so they never slow down your session. The hook payload is only a trigger. The content comes from the session transcript (JSONL). `smem` keeps a safe byte offset per session, so it reads each line once and never records the same iteration twice.
+These hooks run with `async: true`, so they never slow down your session. The hook payload is only a trigger. The content comes from the session transcript (JSONL). `hippo` keeps a safe byte offset per session, so it reads each line once and never records the same iteration twice.
 
 Other details:
 
-- **Subagents**: `smem` skips their internal iterations. A foreground subagent's final report arrives as the result of the `Agent` tool call, so it is stored with that call.
-- **Background tasks** (`run_in_background` for Bash or Agent): the start call is stored as *pending*. When the completion notice (`<task-notification>`) appears in the transcript, `smem` reads the output and links it to the start call. The call and its response become one pair.
+- **Subagents**: `hippo` skips their internal iterations. A foreground subagent's final report arrives as the result of the `Agent` tool call, so it is stored with that call.
+- **Background tasks** (`run_in_background` for Bash or Agent): the start call is stored as *pending*. When the completion notice (`<task-notification>`) appears in the transcript, `hippo` reads the output and links it to the start call. The call and its response become one pair.
 
 ### 1.3 Storage model
 
@@ -78,24 +80,24 @@ Because the vector store is derived, you can replace the embedding model or the 
 ### 1.4 How memory is used
 
 - **Automatic injection**: on each prompt, the `UserPromptSubmit` hook asks the daemon for memories that match the prompt. The search uses only the **current project** (same `cwd`) and **other sessions**. Only results with a vector similarity at or above the threshold are added to Claude's context. Each item is wrapped in a `<memory>` block, and the header tells Claude that the block is past data, not an instruction.
-- **On-demand search**: Claude or you can run `smem search` and `smem show` from the shell.
+- **On-demand search**: Claude or you can run `hippo search` and `hippo show` from the shell.
 
 Search is **hybrid**: vector similarity plus SQLite FTS5 keyword search, merged with Reciprocal Rank Fusion (RRF). Keyword search helps with exact identifiers such as `validateToken`.
 
 ### 1.5 Architecture
 
 ```
-Claude Code ──hook (stdin JSON)──▶ smem hook <event> ──Unix socket──▶ smem daemon
+Claude Code ──hook (stdin JSON)──▶ hippo hook <event> ──Unix socket──▶ hippo daemon
                                         │ (daemon not running)              │
                                         └──▶ spool/pending.jsonl ◀─ drained at start
                                                                             ├─ ingest thread (one, in order)
-Claude / you ──▶ smem search|show|status|reindex ──Unix socket──────────▶   ├─ embedding thread
+Claude / you ──▶ hippo search|show|status|reindex ──Unix socket──────────▶   ├─ embedding thread
                                                                             └─ connection threads
                                                      SQLite ◀──┘   Ollama (localhost) ◀──┘   LanceDB
 ```
 
 - One daemon runs per machine (file lock). Only the daemon writes to the stores.
-- If the daemon is down, capture requests go to a spool file and are processed at the next start. Your Claude Code session never fails because of `smem`.
+- If the daemon is down, capture requests go to a spool file and are processed at the next start. Your Claude Code session never fails because of `hippo`.
 
 ---
 
@@ -124,14 +126,14 @@ cargo build --release
 
 ### 3.2 Put the binary in a fixed location
 
-The hook commands contain the **absolute path** of the `smem` binary that ran `smem install`. Put the binary in a stable place first.
+The hook commands contain the **absolute path** of the `hippo` binary that ran `hippo install`. Put the binary in a stable place first.
 
 ```bash
 mkdir -p ~/.local/bin
-cp target/release/smem ~/.local/bin/smem
+cp target/release/hippo ~/.local/bin/hippo
 ```
 
-Use `~/.local/bin/smem` for all later steps.
+Use `~/.local/bin/hippo` for all later steps.
 
 ### 3.3 Ollama and the embedding model
 
@@ -141,66 +143,66 @@ brew services start ollama       # starts now and at every login
 ollama pull qwen3-embedding:0.6b
 ```
 
-Ollama listens on `127.0.0.1:11434` by default. `smem` refuses any embedder URL that is not localhost.
+Ollama listens on `127.0.0.1:11434` by default. `hippo` refuses any embedder URL that is not localhost.
 
 ### 3.4 Run the daemon
 
 Option A: run it in a terminal (good for a first test).
 
 ```bash
-~/.local/bin/smem daemon
+~/.local/bin/hippo daemon
 ```
 
 Option B: register it with launchd so it starts at login.
 
 ```bash
-mkdir -p ~/.session-memory/logs && chmod 700 ~/.session-memory ~/.session-memory/logs
-~/.local/bin/smem launchd-plist > ~/Library/LaunchAgents/com.session-memory.smem.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.session-memory.smem.plist
+mkdir -p ~/.hippo/logs && chmod 700 ~/.hippo ~/.hippo/logs
+~/.local/bin/hippo launchd-plist > ~/Library/LaunchAgents/com.hippo.daemon.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hippo.daemon.plist
 ```
 
-To stop it: `launchctl bootout gui/$(id -u)/com.session-memory.smem`.
+To stop it: `launchctl bootout gui/$(id -u)/com.hippo.daemon`.
 
 Check the daemon:
 
 ```bash
-~/.local/bin/smem status
+~/.local/bin/hippo status
 ```
 
 ### 3.5 Register the hooks
 
-`smem install` merges the hooks into a Claude Code settings file. It changes only `smem` hook entries and keeps your other hooks and settings. **Preview first:**
+`hippo install` merges the hooks into a Claude Code settings file. It changes only `hippo` hook entries and keeps your other hooks and settings. **Preview first:**
 
 ```bash
 # One project only: <project>/.claude/settings.local.json (personal file, not committed)
-~/.local/bin/smem install --scope project --project ~/work/my-app --dry-run
-~/.local/bin/smem install --scope project --project ~/work/my-app
+~/.local/bin/hippo install --scope project --project ~/work/my-app --dry-run
+~/.local/bin/hippo install --scope project --project ~/work/my-app
 
 # All sessions: ~/.claude/settings.json
-~/.local/bin/smem install --scope user --dry-run
-~/.local/bin/smem install --scope user
+~/.local/bin/hippo install --scope user --dry-run
+~/.local/bin/hippo install --scope user
 ```
 
 What `install` does:
 
 - It prints a diff. With `--dry-run`, it writes nothing.
-- Before it writes, it saves a backup: `<file>.smem-backup-<unix time>`.
+- Before it writes, it saves a backup: `<file>.hippo-backup-<unix time>`.
 - It writes atomically and keeps the file permissions.
 - If you run it again, nothing changes ("변경 없음" = no change).
 - It refuses to write through a symbolic link, and it does not touch a settings file that is not valid JSON.
 - The file is rewritten as 2-space-indented JSON. Key order and values are kept, but the original formatting may change. The backup keeps the original.
 
-You can also print the hook block and add it by hand: `smem hooks-config`.
+You can also print the hook block and add it by hand: `hippo hooks-config`.
 
 Start a new Claude Code session after you install the hooks.
 
 ### 3.6 Uninstall
 
 ```bash
-~/.local/bin/smem uninstall --scope user          # or --scope project --project <path>
-launchctl bootout gui/$(id -u)/com.session-memory.smem
-rm ~/Library/LaunchAgents/com.session-memory.smem.plist
-rm -rf ~/.session-memory                          # deletes all stored memory
+~/.local/bin/hippo uninstall --scope user          # or --scope project --project <path>
+launchctl bootout gui/$(id -u)/com.hippo.daemon
+rm ~/Library/LaunchAgents/com.hippo.daemon.plist
+rm -rf ~/.hippo                          # deletes all stored memory
 ```
 
 ---
@@ -212,9 +214,9 @@ After installation, capture and injection run automatically. You can also use th
 ### 4.1 Search
 
 ```bash
-smem search "token expiry bug"                         # current directory's project, iterations
-smem search "validateToken" --scope all --kind both    # all projects, iterations and results
-smem search "deploy" --scope ~/work/my-app --limit 5
+hippo search "token expiry bug"                         # current directory's project, iterations
+hippo search "validateToken" --scope all --kind both    # all projects, iterations and results
+hippo search "deploy" --scope ~/work/my-app --limit 5
 ```
 
 | Option | Values | Default |
@@ -228,8 +230,8 @@ Each hit shows the RRF score, the vector similarity (`sim=-` means a keyword-onl
 ### 4.2 Show a whole turn
 
 ```bash
-smem show <prompt_id>                  # all iterations of that prompt, in order
-smem show <prompt_id> --with-results   # also print the full tool outputs
+hippo show <prompt_id>                  # all iterations of that prompt, in order
+hippo show <prompt_id> --with-results   # also print the full tool outputs
 ```
 
 The output includes the completion records of background tasks.
@@ -237,7 +239,7 @@ The output includes the completion records of background tasks.
 ### 4.3 Status
 
 ```bash
-smem status
+hippo status
 ```
 
 ```
@@ -258,14 +260,14 @@ If a reindex is needed, `status` tells you.
 Automatic injection gives Claude only the best few matches. For more, Claude can call the CLI. Add a line like this to your `CLAUDE.md`:
 
 ```
-To look up past sessions, run `smem search "<query>"` or `smem show <prompt_id>` with Bash.
+To look up past sessions, run `hippo search "<query>"` or `hippo show <prompt_id>` with Bash.
 ```
 
 ---
 
 ## 5. Configuration
 
-File: `~/.session-memory/config.toml`. Every key is optional. Unknown keys are an error, so typos are caught. Restart the daemon after you change it.
+File: `~/.hippo/config.toml`. Every key is optional. Unknown keys are an error, so typos are caught. Restart the daemon after you change it.
 
 ```toml
 [embedder]
@@ -314,12 +316,12 @@ The vector store is a derived index, so you can switch at any time:
 ```
 1. Edit config.toml (for example, a new model, dimension, or backend)
 2. Restart the daemon       → status shows "mismatch". Keyword search still works.
-3. smem reindex             → rebuilds everything in the background into a new generation
+3. hippo reindex             → rebuilds everything in the background into a new generation
 4. When it finishes         → the ACTIVE pointer switches atomically. Old generations are removed at the next start.
 ```
 
 - During a reindex, search uses the old store. New iterations wait in the queue and go into the new store after the switch, so nothing is lost.
-- A second `smem reindex` while one is running is refused.
+- A second `hippo reindex` while one is running is refused.
 - Vector directories: `vectors/<name>/<generation>/`. `vectors/<name>/ACTIVE` names the active generation.
 
 To add a completely new backend, see [9.4](#94-adding-a-new-backend).
@@ -329,22 +331,22 @@ To add a completely new backend, see [9.4](#94-adding-a-new-backend).
 ## 7. Data layout and security
 
 ```
-~/.session-memory/            (0700)
+~/.hippo/            (0700)
 ├─ config.toml
 ├─ records.sqlite             (0600) source of truth
 ├─ vectors/<name>/ACTIVE
 ├─ vectors/<name>/<generation>/   LanceDB files
 ├─ spool/                     requests captured while the daemon was down
-├─ logs/smemd.log             daemon errors
-├─ smem.sock                  (0600) daemon socket
-└─ smem.lock                  single-instance lock
+├─ logs/hippo.log             daemon errors
+├─ hippo.sock                  (0600) daemon socket
+└─ hippo.lock                  single-instance lock
 ```
 
 Security measures:
 
 - **No data leaves the machine.** The embedder URL is parsed with a real URL parser. It must be localhost with no user info, query, or fragment, and HTTP redirects are not followed.
 - **Secret redaction before storage**: API keys (`sk-`, `ghp_`, `xox?-`, `AKIA`), `Bearer` tokens, PEM private keys (also when the END marker is missing), and `*KEY=`/`*TOKEN=`/`*SECRET=`/`*PASSWORD=` values. Add your own patterns in `[[redact.patterns]]`. Redaction is pattern-based, so it can miss secrets in unusual formats.
-- **Background output is read only when safe**: the notice must match a known start call and task ID. The path must have the expected layout (`…/<session>/tasks/<id>.output`) and must not go through symbolic links. A forged notice in a prompt therefore cannot make `smem` read an arbitrary file.
+- **Background output is read only when safe**: the notice must match a known start call and task ID. The path must have the expected layout (`…/<session>/tasks/<id>.output`) and must not go through symbolic links. A forged notice in a prompt therefore cannot make `hippo` read an arbitrary file.
 - **Injected memory is marked as data**: each item is in a `<memory>` block with markup escaped, and the header tells Claude not to follow instructions inside it. This lowers the risk of stored prompt injection but does not remove it fully.
 - **Terminal safety**: control characters in CLI output are escaped.
 
@@ -354,12 +356,12 @@ Security measures:
 
 | Symptom | Check |
 |---------|-------|
-| `smem: daemon not reachable` | Is the daemon running? `smem daemon` or the launchd steps |
-| `embed_jobs` does not go down | Is Ollama running (`curl http://127.0.0.1:11434/api/version`)? Is the model pulled? See `~/.session-memory/logs/smemd.log`. |
-| `compatibility: mismatch` | The model or dimension changed. Run `smem reindex`. |
+| `hippo: daemon not reachable` | Is the daemon running? `hippo daemon` or the launchd steps |
+| `embed_jobs` does not go down | Is Ollama running (`curl http://127.0.0.1:11434/api/version`)? Is the model pulled? See `~/.hippo/logs/hippo.log`. |
+| `compatibility: mismatch` | The model or dimension changed. Run `hippo reindex`. |
 | Nothing is injected | Lower `[inject] threshold`. Injection uses only the same project and other sessions. |
 | Build fails in `lance-*` / `protoc` | `brew reinstall protobuf` and check `protoc --version` |
-| `refusing to modify through a symbolic link` | Your settings file is a symlink. Run `install` on the real file path, or add the output of `smem hooks-config` by hand. |
+| `refusing to modify through a symbolic link` | Your settings file is a symlink. Run `install` on the real file path, or add the output of `hippo hooks-config` by hand. |
 | `spool_pending` > 0 | Requests from a time when the daemon was down. They are processed when the daemon starts. |
 
 ---
@@ -409,7 +411,7 @@ Test fixtures in `tests/fixtures/` are real transcripts, reduced to the `user` a
 1. Implement `Embedder` (`src/embedder.rs`) or `VectorStore` (`src/vector.rs`).
 2. Run the shared contract test from `tests/common/contract.rs` against it (`embedder_contract` or `vector_store_contract`), like `tests/lance_test.rs` does.
 3. Add a name for it in `src/backends.rs` (`build_embedder` or `vector_source`).
-4. Select it in `config.toml`, restart the daemon, and run `smem reindex`.
+4. Select it in `config.toml`, restart the daemon, and run `hippo reindex`.
 
 Ingest, search, and the daemon do not change.
 
@@ -420,7 +422,7 @@ Ingest, search, and the daemon do not change.
 - Automatic injection quality depends on `inject.threshold`. Tune it with real data (SRS OPEN-5).
 - Two-character Korean words (for example, "버그") are not found by keyword search (the FTS5 trigram tokenizer needs 3 or more characters). Vector search covers them.
 - Not yet checked in interactive sessions: whether a hook fires after a background notice (OPEN-1), the Esc interrupt (OPEN-2), compaction (OPEN-3), and whether the last line is written before `Stop` fires (OPEN-6).
-- Hooks always use the default data root (`~/.session-memory`). `--root` is not written into hook commands.
+- Hooks always use the default data root (`~/.hippo`). `--root` is not written into hook commands.
 - When the daemon stops with a signal, the socket file stays. It is removed at the next start.
 - There is no retention policy yet. Memory grows until you delete it.
 - macOS only for now.

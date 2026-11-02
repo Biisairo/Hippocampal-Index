@@ -2,16 +2,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use hippo::backends::{BackendError, build_embedder, vector_source};
+use hippo::client::{HookAction, inject_output, parse_hook, run_hook};
+use hippo::config::{Config, Paths};
+use hippo::generations::active_dir;
+use hippo::ingest::{HookEvent, IngestRequest};
+use hippo::protocol::{Request, Response, StatusInfo};
+use hippo::search::{SearchKind, SearchRequest};
+use hippo::setup::{hooks_config, launchd_plist};
+use hippo::spool;
 use serde_json::{Value, json};
-use smem::backends::{BackendError, build_embedder, vector_source};
-use smem::client::{HookAction, inject_output, parse_hook, run_hook};
-use smem::config::{Config, Paths};
-use smem::generations::active_dir;
-use smem::ingest::{HookEvent, IngestRequest};
-use smem::protocol::{Request, Response, StatusInfo};
-use smem::search::{SearchKind, SearchRequest};
-use smem::setup::{hooks_config, launchd_plist};
-use smem::spool;
 
 fn probe(path: &str) -> String {
     fs::read_to_string(
@@ -269,7 +269,7 @@ fn hook_without_daemon_spools_ingest_and_skips_inject() {
 
 #[test]
 fn hooks_config_registers_all_events() {
-    let exe = Path::new("/opt/bin/smem");
+    let exe = Path::new("/opt/bin/hippo");
     let cfg = hooks_config(exe, 5);
     let hooks = &cfg["hooks"];
     for (event, arg) in [
@@ -280,20 +280,23 @@ fn hooks_config_registers_all_events() {
     ] {
         let h = &hooks[event][0]["hooks"][0];
         assert_eq!(h["type"], "command");
-        assert_eq!(h["command"], format!("/opt/bin/smem hook {arg}"));
+        assert_eq!(h["command"], format!("/opt/bin/hippo hook {arg}"));
         assert_eq!(h["async"], true, "{event}");
     }
     let ups = &hooks["UserPromptSubmit"][0]["hooks"][0];
-    assert_eq!(ups["command"], "/opt/bin/smem hook user-prompt-submit");
+    assert_eq!(ups["command"], "/opt/bin/hippo hook user-prompt-submit");
     assert!(ups.get("async").is_none_or(|v| v == false));
     assert_eq!(ups["timeout"], 5);
 }
 
 #[test]
 fn launchd_plist_runs_daemon() {
-    let plist = launchd_plist(Path::new("/opt/bin/smem"), &Paths::new(PathBuf::from("/r")));
+    let plist = launchd_plist(
+        Path::new("/opt/bin/hippo"),
+        &Paths::new(PathBuf::from("/r")),
+    );
     assert!(plist.starts_with("<?xml"));
-    assert!(plist.contains("<string>/opt/bin/smem</string>"));
+    assert!(plist.contains("<string>/opt/bin/hippo</string>"));
     assert!(plist.contains("<string>daemon</string>"));
     assert!(plist.contains("/r/logs/"));
     assert!(plist.contains("<key>KeepAlive</key>"));
@@ -356,27 +359,27 @@ fn status_info(iterations: u64, vectors: u64, compatibility: &str, reindex: &str
 fn status_render_shows_fields_and_reindex_hints() {
     let ok = status_info(3, 5, "compatible", "idle").render();
     assert!(ok.contains("iterations: 3") && ok.contains("reindex: idle"));
-    assert!(!ok.contains("smem reindex"));
+    assert!(!ok.contains("hippo reindex"));
     assert!(
         status_info(3, 0, "empty", "idle")
             .render()
-            .contains("smem reindex"),
+            .contains("hippo reindex"),
         "벡터 0개 + 반복 있음"
     );
     assert!(
         status_info(3, 5, "mismatch", "idle")
             .render()
-            .contains("smem reindex")
+            .contains("hippo reindex")
     );
     assert!(
         !status_info(3, 5, "mismatch", "running")
             .render()
-            .contains("smem reindex"),
+            .contains("hippo reindex"),
         "진행 중이면 안내 생략"
     );
     assert!(
         !status_info(0, 0, "empty", "idle")
             .render()
-            .contains("smem reindex")
+            .contains("hippo reindex")
     );
 }

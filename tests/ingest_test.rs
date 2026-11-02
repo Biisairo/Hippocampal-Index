@@ -5,10 +5,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use common::*;
+use hippo::ingest::{HookEvent, IngestError, IngestOptions, IngestRequest, ingest};
+use hippo::redact::Redactor;
+use hippo::store::RecordStore;
 use serde_json::{Value, json};
-use smem::ingest::{HookEvent, IngestError, IngestOptions, IngestRequest, ingest};
-use smem::redact::Redactor;
-use smem::store::RecordStore;
 
 const OPTS: IngestOptions = IngestOptions {
     max_tool_input_chars: 500,
@@ -27,7 +27,7 @@ fn run(
     event: HookEvent,
     session: &str,
     path: &Path,
-) -> smem::ingest::IngestReport {
+) -> hippo::ingest::IngestReport {
     ingest(
         store,
         &Redactor::new(&[]).unwrap(),

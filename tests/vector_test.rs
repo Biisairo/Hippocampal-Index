@@ -1,10 +1,10 @@
 mod common;
 
 use common::contract::{embedder_contract, vector_store_contract};
-use smem::embedder::Embedder;
-use smem::store::RecordKind;
-use smem::testing::{HashEmbedder, MemoryVectorStore};
-use smem::vector::{VectorStore, cosine, vector_id};
+use hippo::embedder::Embedder;
+use hippo::store::RecordKind;
+use hippo::testing::{HashEmbedder, MemoryVectorStore};
+use hippo::vector::{VectorStore, cosine, vector_id};
 
 #[test]
 fn memory_store_satisfies_contract() {

@@ -1,9 +1,9 @@
 //! 모든 백엔드에 적용하는 계약 테스트. (FR-SWP-8)
 #![allow(dead_code)]
 
-use smem::embedder::Embedder;
-use smem::store::RecordKind;
-use smem::vector::{VectorError, VectorFilter, VectorRecord, VectorStore};
+use hippo::embedder::Embedder;
+use hippo::store::RecordKind;
+use hippo::vector::{VectorError, VectorFilter, VectorRecord, VectorStore};
 
 pub fn record(
     kind: RecordKind,
@@ -25,7 +25,7 @@ pub fn record(
     }
 }
 
-fn ids(hits: &[smem::vector::VectorHit]) -> Vec<String> {
+fn ids(hits: &[hippo::vector::VectorHit]) -> Vec<String> {
     hits.iter()
         .map(|h| format!("{}#{}", h.ref_id, h.chunk_index))
         .collect()

@@ -6,11 +6,11 @@ use std::sync::mpsc;
 use std::thread;
 
 use common::contract::embedder_contract;
+use hippo::config::EmbedderConfig;
+use hippo::embedder::{EmbedError, Embedder};
+use hippo::ollama::OllamaEmbedder;
+use hippo::vector::cosine;
 use serde_json::{Value, json};
-use smem::config::EmbedderConfig;
-use smem::embedder::{EmbedError, Embedder};
-use smem::ollama::OllamaEmbedder;
-use smem::vector::cosine;
 
 /// 요청 한 건을 받아 본문을 돌려주고, 정해진 상태 코드와 본문으로 응답하는 가짜 서버.
 fn fake_server(status: u16, body: Value) -> (String, mpsc::Receiver<(String, Value)>) {

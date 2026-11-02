@@ -4,23 +4,23 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use smem::backends::{build_embedder, vector_source};
-use smem::client::{request, run_hook};
-use smem::config::{Config, Paths};
-use smem::daemon;
-use smem::install::{Action, Scope, apply, target_file};
-use smem::protocol::{Request, Response};
-use smem::search::{SearchKind, SearchRequest};
-use smem::setup::{hooks_config, launchd_plist};
+use hippo::backends::{build_embedder, vector_source};
+use hippo::client::{request, run_hook};
+use hippo::config::{Config, Paths};
+use hippo::daemon;
+use hippo::install::{Action, Scope, apply, target_file};
+use hippo::protocol::{Request, Response};
+use hippo::search::{SearchKind, SearchRequest};
+use hippo::setup::{hooks_config, launchd_plist};
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// UserPromptSubmit hook timeout(초)은 시간 예산보다 이만큼 여유를 둔다.
 const INJECT_TIMEOUT_MARGIN_SECS: u64 = 2;
 
 #[derive(Parser)]
-#[command(name = "smem", about = "Claude Code 세션 기억 저장소")]
+#[command(name = "hippo", about = "Claude Code 세션 기억 저장소")]
 struct Cli {
-    /// 데이터 루트 (기본: ~/.session-memory)
+    /// 데이터 루트 (기본: ~/.hippo)
     #[arg(long, global = true)]
     root: Option<PathBuf>,
     #[command(subcommand)]
@@ -60,7 +60,7 @@ enum Command {
     LaunchdPlist,
     /// Claude Code 설정 파일에 hook을 병합한다.
     Install(InstallArgs),
-    /// Claude Code 설정 파일에서 smem hook을 제거한다.
+    /// Claude Code 설정 파일에서 hippo hook을 제거한다.
     Uninstall(InstallArgs),
 }
 
@@ -175,7 +175,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// 실행 중인 smem 경로로 hook 설정을 만든다. UserPromptSubmit timeout은 시간 예산보다 여유를 둔다.
+/// 실행 중인 hippo 경로로 hook 설정을 만든다. UserPromptSubmit timeout은 시간 예산보다 여유를 둔다.
 fn hook_settings(paths: &Paths) -> Result<serde_json::Value, String> {
     let budget_ms = Config::load(&paths.config())
         .map_err(|e| e.to_string())?
@@ -228,7 +228,7 @@ fn query_daemon(paths: &Paths, req: &Request) -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Response::Done) => {
-            println!("재색인을 시작했습니다. 진행 상태는 `smem status`로 확인할 수 있습니다.");
+            println!("재색인을 시작했습니다. 진행 상태는 `hippo status`로 확인할 수 있습니다.");
             ExitCode::SUCCESS
         }
         Ok(Response::Error { message }) => fail(&message),
@@ -260,6 +260,6 @@ fn run_daemon(paths: Paths) -> ExitCode {
 }
 
 fn fail(message: &str) -> ExitCode {
-    eprintln!("smem: {message}");
+    eprintln!("hippo: {message}");
     ExitCode::from(1)
 }

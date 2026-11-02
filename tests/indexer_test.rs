@@ -2,14 +2,14 @@ mod common;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use hippo::embed_text::build_embed_text;
+use hippo::embedder::{EmbedError, Embedder};
+use hippo::indexer::{ChunkConfig, Compatibility, compatibility, process_embed_jobs, reindex};
+use hippo::store::{Batch, NewIteration, RecordKind, RecordStore};
+use hippo::testing::{HashEmbedder, MemoryVectorStore};
+use hippo::transcript::{ExtractorState, Iteration, IterationInput, ToolCall, ToolResultData};
+use hippo::vector::{VectorFilter, VectorRecord, VectorStore};
 use serde_json::json;
-use smem::embed_text::build_embed_text;
-use smem::embedder::{EmbedError, Embedder};
-use smem::indexer::{ChunkConfig, Compatibility, compatibility, process_embed_jobs, reindex};
-use smem::store::{Batch, NewIteration, RecordKind, RecordStore};
-use smem::testing::{HashEmbedder, MemoryVectorStore};
-use smem::transcript::{ExtractorState, Iteration, IterationInput, ToolCall, ToolResultData};
-use smem::vector::{VectorFilter, VectorRecord, VectorStore};
 
 const CHUNKING: ChunkConfig = ChunkConfig {
     max_tokens: 8_000,

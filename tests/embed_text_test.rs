@@ -1,9 +1,9 @@
 use std::num::NonZeroUsize;
 
+use hippo::bg::TaskNotification;
+use hippo::embed_text::{build_embed_text, chunk, chunk_limit};
+use hippo::transcript::{Iteration, IterationInput, ToolCall};
 use serde_json::json;
-use smem::bg::TaskNotification;
-use smem::embed_text::{build_embed_text, chunk, chunk_limit};
-use smem::transcript::{Iteration, IterationInput, ToolCall};
 
 fn iteration(inputs: Vec<IterationInput>, calls: Vec<ToolCall>, texts: Vec<&str>) -> Iteration {
     Iteration {

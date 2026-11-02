@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-const BIN: &str = env!("CARGO_BIN_EXE_smem");
+const BIN: &str = env!("CARGO_BIN_EXE_hippo");
 
-fn smem(root: &Path, args: &[&str], stdin: &str) -> Output {
+fn hippo(root: &Path, args: &[&str], stdin: &str) -> Output {
     let mut child = Command::new(BIN)
         .arg("--root")
         .arg(root)
@@ -51,7 +51,7 @@ fn spawn_daemon(root: &Path) -> Daemon {
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !root.join("smem.sock").exists() {
+    while !root.join("hippo.sock").exists() {
         assert!(Instant::now() < deadline, "daemon did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -62,7 +62,7 @@ fn spawn_daemon(root: &Path) -> Daemon {
 #[test]
 fn hooks_config_prints_settings_json() {
     let dir = tempfile::tempdir_in("/tmp").unwrap();
-    let out = smem(dir.path(), &["hooks-config"], "");
+    let out = hippo(dir.path(), &["hooks-config"], "");
     assert!(out.status.success());
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     let cmd = v["hooks"]["Stop"][0]["hooks"][0]["command"]
@@ -80,7 +80,7 @@ fn hooks_config_prints_settings_json() {
 #[test]
 fn launchd_plist_prints_xml() {
     let dir = tempfile::tempdir_in("/tmp").unwrap();
-    let out = smem(dir.path(), &["launchd-plist"], "");
+    let out = hippo(dir.path(), &["launchd-plist"], "");
     assert!(out.status.success());
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.contains("<string>daemon</string>"));
@@ -94,11 +94,11 @@ fn launchd_plist_prints_xml() {
 fn hook_never_fails_and_spools_without_daemon() {
     let dir = tempfile::tempdir_in("/tmp").unwrap();
     let input = r#"{"session_id":"s","transcript_path":"/t/s.jsonl","cwd":"/w"}"#;
-    let out = smem(dir.path(), &["hook", "stop"], input);
+    let out = hippo(dir.path(), &["hook", "stop"], input);
     assert!(out.status.success());
     assert!(out.stdout.is_empty());
     assert!(dir.path().join("spool/pending.jsonl").exists());
-    let bad = smem(dir.path(), &["hook", "user-prompt-submit"], "garbage");
+    let bad = hippo(dir.path(), &["hook", "user-prompt-submit"], "garbage");
     assert!(bad.status.success());
     assert!(bad.stdout.is_empty());
 }
@@ -107,7 +107,7 @@ fn hook_never_fails_and_spools_without_daemon() {
 fn query_commands_fail_without_daemon() {
     let dir = tempfile::tempdir_in("/tmp").unwrap();
     for args in [&["search", "q"][..], &["show", "p"], &["status"]] {
-        let out = smem(dir.path(), args, "");
+        let out = hippo(dir.path(), args, "");
         assert_eq!(out.status.code(), Some(1), "{args:?}");
         assert!(!out.stderr.is_empty());
     }
@@ -118,7 +118,7 @@ fn daemon_serves_status_search_show() {
     let dir = tempfile::tempdir_in("/tmp").unwrap();
     let root = dir.path().join("root");
     let _daemon = spawn_daemon(&root);
-    let status = smem(&root, &["status"], "");
+    let status = hippo(&root, &["status"], "");
     assert!(
         status.status.success(),
         "{}",
@@ -128,7 +128,7 @@ fn daemon_serves_status_search_show() {
     assert!(text.contains("iterations: 0"), "{text}");
     assert!(text.contains("test-hash-64"));
 
-    let search = smem(
+    let search = hippo(
         &root,
         &[
             "search",
@@ -147,7 +147,7 @@ fn daemon_serves_status_search_show() {
         String::from_utf8(search.stdout).unwrap().trim(),
         "결과 없음"
     );
-    let show = smem(&root, &["show", "nope", "--with-results"], "");
+    let show = hippo(&root, &["show", "nope", "--with-results"], "");
     assert!(show.status.success());
     assert!(
         String::from_utf8(show.stdout)
@@ -184,7 +184,7 @@ fn install_and_uninstall_project_scope() {
     let p = project.to_string_lossy().to_string();
     let target = project.join(".claude/settings.local.json");
 
-    let dry = smem(
+    let dry = hippo(
         dir.path(),
         &[
             "install",
@@ -201,7 +201,7 @@ fn install_and_uninstall_project_scope() {
     assert!(String::from_utf8_lossy(&dry.stdout).contains("hook stop"));
 
     assert!(
-        smem(
+        hippo(
             dir.path(),
             &["install", "--scope", "project", "--project", &p],
             ""
@@ -214,10 +214,10 @@ fn install_and_uninstall_project_scope() {
         v["hooks"]["Stop"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap()
-            .ends_with("smem hook stop")
+            .ends_with("hippo hook stop")
     );
 
-    let again = smem(
+    let again = hippo(
         dir.path(),
         &["install", "--scope", "project", "--project", &p],
         "",
@@ -225,7 +225,7 @@ fn install_and_uninstall_project_scope() {
     assert!(String::from_utf8_lossy(&again.stdout).contains("변경 없음"));
 
     assert!(
-        smem(
+        hippo(
             dir.path(),
             &["uninstall", "--scope", "project", "--project", &p],
             ""
@@ -265,7 +265,7 @@ fn install_refuses_invalid_settings() {
     let project = dir.path().join("proj/.claude");
     fs::create_dir_all(&project).unwrap();
     fs::write(project.join("settings.local.json"), "{ broken").unwrap();
-    let out = smem(
+    let out = hippo(
         dir.path(),
         &[
             "install",

@@ -1,6 +1,6 @@
 use std::fs;
 
-use smem::generations::{activate, active_dir, cleanup_inactive, new_generation};
+use hippo::generations::{activate, active_dir, cleanup_inactive, new_generation};
 
 #[test]
 fn first_call_creates_and_points_to_initial_generation() {

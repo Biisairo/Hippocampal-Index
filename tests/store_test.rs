@@ -1,14 +1,14 @@
 mod common;
 
 use common::*;
-use rusqlite::Connection;
-use serde_json::json;
-use smem::bg::{BackgroundKind, TaskNotification};
-use smem::embed_text::build_embed_text;
-use smem::store::{
+use hippo::bg::{BackgroundKind, TaskNotification};
+use hippo::embed_text::build_embed_text;
+use hippo::store::{
     Batch, EmbedJob, FtsFilter, NewCompletion, NewIteration, RecordKind, RecordStore,
 };
-use smem::transcript::{ExtractorState, Iteration, IterationInput, ToolCall, ToolResultData};
+use hippo::transcript::{ExtractorState, Iteration, IterationInput, ToolCall, ToolResultData};
+use rusqlite::Connection;
+use serde_json::json;
 
 fn batch_from_fixture(name: &str) -> Batch {
     let (mut ex, events) = run_fixture(name);
@@ -382,7 +382,7 @@ fn fts_store() -> RecordStore {
     store
 }
 
-fn ids(hits: Vec<smem::store::FtsHit>) -> Vec<String> {
+fn ids(hits: Vec<hippo::store::FtsHit>) -> Vec<String> {
     let mut v: Vec<String> = hits.into_iter().map(|h| h.id).collect();
     v.sort();
     v

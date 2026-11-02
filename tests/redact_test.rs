@@ -1,7 +1,7 @@
+use hippo::bg::TaskNotification;
+use hippo::redact::{ExtraPattern, Redactor};
+use hippo::transcript::{Iteration, IterationInput, ToolCall, ToolResultData};
 use serde_json::json;
-use smem::bg::TaskNotification;
-use smem::redact::{ExtraPattern, Redactor};
-use smem::transcript::{Iteration, IterationInput, ToolCall, ToolResultData};
 
 fn r() -> Redactor {
     Redactor::new(&[]).unwrap()

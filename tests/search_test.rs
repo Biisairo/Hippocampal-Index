@@ -3,17 +3,17 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::*;
-use serde_json::json;
-use smem::bg::TaskNotification;
-use smem::embed_text::build_embed_text;
-use smem::indexer::{ChunkConfig, process_embed_jobs};
-use smem::search::{
+use hippo::bg::TaskNotification;
+use hippo::embed_text::build_embed_text;
+use hippo::indexer::{ChunkConfig, process_embed_jobs};
+use hippo::search::{
     InjectConfig, SearchError, SearchKind, SearchRequest, VectorBackends, build_injection, fuse,
     render_hits, render_turn, search,
 };
-use smem::store::{Batch, FtsFilter, NewCompletion, NewIteration, RecordKind, RecordStore};
-use smem::testing::{HashEmbedder, MemoryVectorStore};
-use smem::transcript::{ExtractorState, Iteration, IterationInput, ToolCall, ToolResultData};
+use hippo::store::{Batch, FtsFilter, NewCompletion, NewIteration, RecordKind, RecordStore};
+use hippo::testing::{HashEmbedder, MemoryVectorStore};
+use hippo::transcript::{ExtractorState, Iteration, IterationInput, ToolCall, ToolResultData};
+use serde_json::json;
 
 const CHUNKING: ChunkConfig = ChunkConfig {
     max_tokens: 8_000,
@@ -132,7 +132,7 @@ fn req(
     }
 }
 
-fn hit_ids(hits: &[smem::search::SearchHit]) -> Vec<String> {
+fn hit_ids(hits: &[hippo::search::SearchHit]) -> Vec<String> {
     hits.iter().map(|h| h.id.clone()).collect()
 }
 
@@ -345,7 +345,7 @@ fn injection_includes_only_relevant_items_from_this_project_and_other_sessions()
     .unwrap()
     .unwrap();
     assert!(text.contains("p-m1"));
-    assert!(text.contains("smem show"));
+    assert!(text.contains("hippo show"));
     assert!(!text.contains("p-m3"), "다른 프로젝트");
     assert!(!text.contains("p-m4"), "현재 세션");
     assert!(!text.contains("p-m2"), "임계값 미만");

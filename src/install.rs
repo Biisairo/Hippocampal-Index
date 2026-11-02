@@ -1,4 +1,4 @@
-//! Claude Code 설정 파일에 smem hook을 병합하거나 제거한다. (SRS 3.2.8)
+//! Claude Code 설정 파일에 hippo hook을 병합하거나 제거한다. (SRS 3.2.8)
 
 use std::fs;
 use std::io::Write;
@@ -52,11 +52,11 @@ const HOOK_EVENTS: &[&str] = &[
     "session-end",
     "user-prompt-submit",
 ];
-const EXE_NAME: &str = "smem";
+const EXE_NAME: &str = "hippo";
 const CLAUDE_DIR: &str = ".claude";
 const USER_SETTINGS: &str = "settings.json";
 const PROJECT_SETTINGS: &str = "settings.local.json";
-const BACKUP_SUFFIX: &str = "smem-backup";
+const BACKUP_SUFFIX: &str = "hippo-backup";
 const MAX_BACKUP_ATTEMPTS: u32 = 100;
 #[cfg(unix)]
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -71,8 +71,8 @@ pub fn target_file(scope: &Scope) -> Result<PathBuf, InstallError> {
     })
 }
 
-/// `<경로>/smem hook <이벤트>` 형태인지 확인한다. (FR-INS-2)
-pub fn is_smem_command(command: &str) -> bool {
+/// `<경로>/hippo hook <이벤트>` 형태인지 확인한다. (FR-INS-2)
+pub fn is_hippo_command(command: &str) -> bool {
     let command = command.trim();
     HOOK_EVENTS.iter().any(|event| {
         command
@@ -86,7 +86,7 @@ pub fn is_smem_command(command: &str) -> bool {
 
 pub fn merge_install(settings: &mut Value, hooks: &Value) -> Result<(), InstallError> {
     let mut next = settings.clone();
-    remove_smem_hooks(&mut next)?;
+    remove_hippo_hooks(&mut next)?;
     let ours = hooks
         .get("hooks")
         .and_then(Value::as_object)
@@ -116,13 +116,13 @@ pub fn merge_install(settings: &mut Value, hooks: &Value) -> Result<(), InstallE
 
 pub fn merge_uninstall(settings: &mut Value) -> Result<(), InstallError> {
     let mut next = settings.clone();
-    remove_smem_hooks(&mut next)?;
+    remove_hippo_hooks(&mut next)?;
     *settings = next;
     Ok(())
 }
 
-/// smem hook만 지우고, 그 때문에 비게 된 그룹, 이벤트, `hooks` 키를 지운다. (FR-INS-3, 4)
-fn remove_smem_hooks(settings: &mut Value) -> Result<(), InstallError> {
+/// hippo hook만 지우고, 그 때문에 비게 된 그룹, 이벤트, `hooks` 키를 지운다. (FR-INS-3, 4)
+fn remove_hippo_hooks(settings: &mut Value) -> Result<(), InstallError> {
     let root = settings
         .as_object_mut()
         .ok_or_else(|| InstallError::Shape("settings root is not an object".into()))?;
@@ -148,7 +148,7 @@ fn remove_smem_hooks(settings: &mut Value) -> Result<(), InstallError> {
             inner.retain(|h| {
                 !h.get("command")
                     .and_then(Value::as_str)
-                    .is_some_and(is_smem_command)
+                    .is_some_and(is_hippo_command)
             });
             if inner.len() == count {
                 return true;
@@ -256,7 +256,7 @@ fn reject_symlinks(path: &Path) -> Result<(), InstallError> {
     Ok(())
 }
 
-/// `<파일>.smem-backup-<초>[-n]`에 배타적으로 쓴다. 이름이 이미 있으면 번호를 붙여 다시 시도한다.
+/// `<파일>.hippo-backup-<초>[-n]`에 배타적으로 쓴다. 이름이 이미 있으면 번호를 붙여 다시 시도한다.
 fn write_backup(path: &Path, secs: u64, content: &[u8]) -> Result<PathBuf, InstallError> {
     for n in 0..MAX_BACKUP_ATTEMPTS {
         let suffix = if n == 0 {

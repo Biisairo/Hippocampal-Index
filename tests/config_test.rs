@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use smem::config::{Config, ConfigError, Paths};
+use hippo::config::{Config, ConfigError, Paths};
 
 #[test]
 fn defaults_match_srs() {
@@ -106,7 +106,7 @@ fn paths_layout() {
     assert_eq!(p.spool(), PathBuf::from("/r/spool"));
     assert_eq!(p.logs(), PathBuf::from("/r/logs"));
     assert_eq!(p.config(), PathBuf::from("/r/config.toml"));
-    assert_eq!(p.socket(), PathBuf::from("/r/smem.sock"));
-    assert_eq!(p.lock(), PathBuf::from("/r/smem.lock"));
-    assert!(Paths::default_root().unwrap().ends_with(".session-memory"));
+    assert_eq!(p.socket(), PathBuf::from("/r/hippo.sock"));
+    assert_eq!(p.lock(), PathBuf::from("/r/hippo.lock"));
+    assert!(Paths::default_root().unwrap().ends_with(".hippo"));
 }

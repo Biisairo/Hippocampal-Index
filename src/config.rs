@@ -132,7 +132,7 @@ impl Paths {
         Self { root }
     }
 
-    /// `$HOME/.session-memory`
+    /// `$HOME/.hippo`
     pub fn default_root() -> Result<PathBuf, ConfigError> {
         let home = std::env::var_os("HOME").ok_or(ConfigError::NoHome)?;
         Ok(PathBuf::from(home).join(DATA_DIR))
@@ -154,14 +154,14 @@ impl Paths {
         self.root.join("config.toml")
     }
     pub fn socket(&self) -> PathBuf {
-        self.root.join("smem.sock")
+        self.root.join("hippo.sock")
     }
     pub fn lock(&self) -> PathBuf {
-        self.root.join("smem.lock")
+        self.root.join("hippo.lock")
     }
 }
 
-const DATA_DIR: &str = ".session-memory";
+const DATA_DIR: &str = ".hippo";
 const LOCAL_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1"];
 
 /// URL을 파서로 해석해 host가 로컬 루프백인지 확인한다. userinfo, 쿼리, 프래그먼트가 있으면 거부한다. (C-4)

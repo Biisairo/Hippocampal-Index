@@ -1,12 +1,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde_json::{Value, json};
-use smem::install::{
-    Action, InstallError, Scope, apply, is_smem_command, merge_install, merge_uninstall,
+use hippo::install::{
+    Action, InstallError, Scope, apply, is_hippo_command, merge_install, merge_uninstall,
     target_file,
 };
-use smem::setup::hooks_config;
+use hippo::setup::hooks_config;
+use serde_json::{Value, json};
 
 fn ours(exe: &str) -> Value {
     hooks_config(Path::new(exe), 3)
@@ -34,22 +34,22 @@ fn target_files() {
 // ---- FR-INS-2 ----
 
 #[test]
-fn recognizes_only_smem_hook_commands() {
+fn recognizes_only_hippo_hook_commands() {
     for c in [
-        "/opt/bin/smem hook stop",
-        "smem hook user-prompt-submit",
-        "/x/target/release/smem hook post-tool-batch",
+        "/opt/bin/hippo hook stop",
+        "hippo hook user-prompt-submit",
+        "/x/target/release/hippo hook post-tool-batch",
     ] {
-        assert!(is_smem_command(c), "{c}");
+        assert!(is_hippo_command(c), "{c}");
     }
     for c in [
         "afplay done.wav",
-        "/opt/bin/notsmem hook stop",
-        "smem hook unknown",
-        "/opt/bin/smem search q",
-        "echo smem hook stop; rm -rf /",
+        "/opt/bin/nothippo hook stop",
+        "hippo hook unknown",
+        "/opt/bin/hippo search q",
+        "echo hippo hook stop; rm -rf /",
     ] {
-        assert!(!is_smem_command(c), "{c}");
+        assert!(!is_hippo_command(c), "{c}");
     }
 }
 
@@ -58,19 +58,19 @@ fn recognizes_only_smem_hook_commands() {
 #[test]
 fn install_into_empty_settings() {
     let mut s = json!({});
-    merge_install(&mut s, &ours("/a/smem")).unwrap();
-    assert_eq!(s, ours("/a/smem"));
+    merge_install(&mut s, &ours("/a/hippo")).unwrap();
+    assert_eq!(s, ours("/a/hippo"));
 }
 
 #[test]
 fn install_preserves_other_hooks_keys_and_order() {
     let mut s = json!({"model": "opus", "hooks": {"Stop": [other_stop_hook()], "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "guard"}]}]}, "env": {"A": "1"}});
-    merge_install(&mut s, &ours("/a/smem")).unwrap();
+    merge_install(&mut s, &ours("/a/hippo")).unwrap();
     let keys: Vec<&String> = s.as_object().unwrap().keys().collect();
     assert_eq!(keys, ["model", "hooks", "env"], "최상위 키 순서 유지");
     let stop = s["hooks"]["Stop"].as_array().unwrap();
     assert_eq!(stop[0], other_stop_hook(), "다른 hook 유지");
-    assert_eq!(stop[1]["hooks"][0]["command"], "/a/smem hook stop");
+    assert_eq!(stop[1]["hooks"][0]["command"], "/a/hippo hook stop");
     assert_eq!(s["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "guard");
     assert!(s["hooks"]["UserPromptSubmit"].is_array());
 }
@@ -78,19 +78,19 @@ fn install_preserves_other_hooks_keys_and_order() {
 #[test]
 fn reinstall_is_idempotent_and_replaces_old_path() {
     let mut s = json!({"hooks": {"Stop": [other_stop_hook()]}});
-    merge_install(&mut s, &ours("/a/smem")).unwrap();
+    merge_install(&mut s, &ours("/a/hippo")).unwrap();
     let once = s.clone();
-    merge_install(&mut s, &ours("/a/smem")).unwrap();
+    merge_install(&mut s, &ours("/a/hippo")).unwrap();
     assert_eq!(s, once);
-    merge_install(&mut s, &ours("/b/smem")).unwrap();
+    merge_install(&mut s, &ours("/b/hippo")).unwrap();
     let text = s.to_string();
-    assert!(!text.contains("/a/smem") && text.contains("/b/smem"));
+    assert!(!text.contains("/a/hippo") && text.contains("/b/hippo"));
     assert_eq!(s["hooks"]["Stop"].as_array().unwrap().len(), 2);
 }
 
 #[test]
-fn smem_hook_inside_shared_group_is_removed_but_group_kept() {
-    let mut s = json!({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "afplay x"}, {"type": "command", "command": "/old/smem hook stop"}]}]}});
+fn hippo_hook_inside_shared_group_is_removed_but_group_kept() {
+    let mut s = json!({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "afplay x"}, {"type": "command", "command": "/old/hippo hook stop"}]}]}});
     merge_uninstall(&mut s).unwrap();
     assert_eq!(
         s,
@@ -101,9 +101,9 @@ fn smem_hook_inside_shared_group_is_removed_but_group_kept() {
 // ---- FR-INS-4 ----
 
 #[test]
-fn uninstall_removes_only_smem_entries_and_empty_containers() {
+fn uninstall_removes_only_hippo_entries_and_empty_containers() {
     let mut s = json!({"model": "opus", "hooks": {"Stop": [other_stop_hook()]}});
-    merge_install(&mut s, &ours("/a/smem")).unwrap();
+    merge_install(&mut s, &ours("/a/hippo")).unwrap();
     merge_uninstall(&mut s).unwrap();
     assert_eq!(
         s,
@@ -111,7 +111,7 @@ fn uninstall_removes_only_smem_entries_and_empty_containers() {
     );
 
     let mut only = json!({"model": "opus"});
-    merge_install(&mut only, &ours("/a/smem")).unwrap();
+    merge_install(&mut only, &ours("/a/hippo")).unwrap();
     merge_uninstall(&mut only).unwrap();
     assert_eq!(only, json!({"model": "opus"}), "비게 된 hooks 키 제거");
 }
@@ -128,7 +128,7 @@ fn rejects_unexpected_shapes() {
         let mut s = bad.clone();
         assert!(
             matches!(
-                merge_install(&mut s, &ours("/a/smem")),
+                merge_install(&mut s, &ours("/a/hippo")),
                 Err(InstallError::Shape(_))
             ),
             "{bad}"
@@ -143,10 +143,10 @@ fn rejects_unexpected_shapes() {
 fn creates_missing_file_and_directory() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("p/.claude/settings.local.json");
-    let out = apply(&path, &Action::Install(ours("/a/smem")), false).unwrap();
+    let out = apply(&path, &Action::Install(ours("/a/hippo")), false).unwrap();
     assert!(out.changed && out.backup.is_none());
     let written: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(written, ours("/a/smem"));
+    assert_eq!(written, ours("/a/hippo"));
     assert!(fs::read_to_string(&path).unwrap().ends_with('\n'));
 }
 
@@ -156,9 +156,9 @@ fn backs_up_writes_and_reports_diff() {
     let path = dir.path().join("settings.json");
     let original = "{\n  \"model\": \"opus\"\n}\n";
     fs::write(&path, original).unwrap();
-    let out = apply(&path, &Action::Install(ours("/a/smem")), false).unwrap();
+    let out = apply(&path, &Action::Install(ours("/a/hippo")), false).unwrap();
     assert!(out.changed);
-    assert!(out.diff.contains("+") && out.diff.contains("/a/smem hook stop"));
+    assert!(out.diff.contains("+") && out.diff.contains("/a/hippo hook stop"));
     let backup = out.backup.unwrap();
     assert_eq!(fs::read_to_string(&backup).unwrap(), original);
     assert!(
@@ -166,9 +166,9 @@ fn backs_up_writes_and_reports_diff() {
             .file_name()
             .unwrap()
             .to_string_lossy()
-            .starts_with("settings.json.smem-backup-")
+            .starts_with("settings.json.hippo-backup-")
     );
-    let again = apply(&path, &Action::Install(ours("/a/smem")), false).unwrap();
+    let again = apply(&path, &Action::Install(ours("/a/hippo")), false).unwrap();
     assert!(!again.changed && again.backup.is_none() && again.diff.is_empty());
 }
 
@@ -177,7 +177,7 @@ fn dry_run_writes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("settings.json");
     fs::write(&path, "{}\n").unwrap();
-    let out = apply(&path, &Action::Install(ours("/a/smem")), true).unwrap();
+    let out = apply(&path, &Action::Install(ours("/a/hippo")), true).unwrap();
     assert!(out.changed && out.backup.is_none());
     assert!(!out.diff.is_empty());
     assert_eq!(fs::read_to_string(&path).unwrap(), "{}\n");
@@ -188,7 +188,7 @@ fn dry_run_writes_nothing() {
     );
     let missing = apply(
         &dir.path().join("none.json"),
-        &Action::Install(ours("/a/smem")),
+        &Action::Install(ours("/a/hippo")),
         true,
     )
     .unwrap();
@@ -202,7 +202,7 @@ fn invalid_json_is_left_untouched() {
     let path = dir.path().join("settings.json");
     fs::write(&path, "{ invalid").unwrap();
     assert!(matches!(
-        apply(&path, &Action::Install(ours("/a/smem")), false),
+        apply(&path, &Action::Install(ours("/a/hippo")), false),
         Err(InstallError::Parse { .. })
     ));
     assert_eq!(fs::read_to_string(&path).unwrap(), "{ invalid");
@@ -213,7 +213,7 @@ fn uninstall_file_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("settings.json");
     fs::write(&path, "{\"model\": \"opus\"}").unwrap();
-    apply(&path, &Action::Install(ours("/a/smem")), false).unwrap();
+    apply(&path, &Action::Install(ours("/a/hippo")), false).unwrap();
     let out = apply(&path, &Action::Uninstall, false).unwrap();
     assert!(out.changed);
     let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
@@ -235,7 +235,7 @@ fn preserves_file_permissions() {
     let path = dir.path().join("settings.json");
     fs::write(&path, "{}").unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-    apply(&path, &Action::Install(ours("/a/smem")), false).unwrap();
+    apply(&path, &Action::Install(ours("/a/hippo")), false).unwrap();
     assert_eq!(
         fs::metadata(&path).unwrap().permissions().mode() & 0o777,
         0o600
@@ -252,11 +252,11 @@ fn planted_temp_symlink_is_not_followed() {
     fs::write(&victim, "keep").unwrap();
     let path = dir.path().join("settings.json");
     fs::write(&path, "{}").unwrap();
-    std::os::unix::fs::symlink(&victim, dir.path().join("settings.json.smem-tmp")).unwrap();
-    apply(&path, &Action::Install(ours("/a/smem")), false).unwrap();
+    std::os::unix::fs::symlink(&victim, dir.path().join("settings.json.hippo-tmp")).unwrap();
+    apply(&path, &Action::Install(ours("/a/hippo")), false).unwrap();
     assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
     let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(v, ours("/a/smem"));
+    assert_eq!(v, ours("/a/hippo"));
 }
 
 #[cfg(unix)]
@@ -268,7 +268,7 @@ fn symlinked_settings_file_or_directory_is_refused() {
     let link = dir.path().join("settings.json");
     std::os::unix::fs::symlink(&real, &link).unwrap();
     assert!(matches!(
-        apply(&link, &Action::Install(ours("/a/smem")), false),
+        apply(&link, &Action::Install(ours("/a/hippo")), false),
         Err(InstallError::Symlink(_))
     ));
     assert_eq!(fs::read_to_string(&real).unwrap(), "{}");
@@ -280,7 +280,7 @@ fn symlinked_settings_file_or_directory_is_refused() {
     std::os::unix::fs::symlink(&real_dir, project.join(".claude")).unwrap();
     let target = project.join(".claude/settings.local.json");
     assert!(matches!(
-        apply(&target, &Action::Install(ours("/a/smem")), false),
+        apply(&target, &Action::Install(ours("/a/hippo")), false),
         Err(InstallError::Symlink(_))
     ));
     assert!(!real_dir.join("settings.local.json").exists());
@@ -294,7 +294,7 @@ fn backup_and_result_are_owner_only_when_new() {
     let path = dir.path().join("settings.json");
     fs::write(&path, "{}").unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-    let out = apply(&path, &Action::Install(ours("/a/smem")), false).unwrap();
+    let out = apply(&path, &Action::Install(ours("/a/hippo")), false).unwrap();
     let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&path), 0o644, "기존 권한 유지");
     assert_eq!(mode(&out.backup.unwrap()), 0o600);

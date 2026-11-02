@@ -12,7 +12,7 @@ const CAPTURE_HOOKS: &[(&str, &str)] = &[
     ("StopFailure", "stop-failure"),
     ("SessionEnd", "session-end"),
 ];
-const LAUNCHD_LABEL: &str = "com.session-memory.smem";
+const LAUNCHD_LABEL: &str = "com.hippo.daemon";
 
 pub fn hooks_config(exe: &Path, inject_timeout_secs: u64) -> Value {
     let exe = exe.display();

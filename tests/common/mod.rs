@@ -5,8 +5,8 @@ pub mod contract;
 use std::fs;
 use std::path::PathBuf;
 
+use hippo::transcript::{Event, Extractor, ExtractorState, Iteration};
 use serde_json::{Value, json};
-use smem::transcript::{Event, Extractor, ExtractorState, Iteration};
 
 pub fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

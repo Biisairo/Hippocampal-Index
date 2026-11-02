@@ -3,8 +3,8 @@ mod common;
 use std::collections::BTreeSet;
 
 use common::*;
+use hippo::transcript::{Event, Extractor, ExtractorState, IterationInput};
 use serde_json::json;
-use smem::transcript::{Event, Extractor, ExtractorState, IterationInput};
 
 // ---- 실측 fixture 기반 ----
 

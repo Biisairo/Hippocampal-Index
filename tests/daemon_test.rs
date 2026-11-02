@@ -6,19 +6,19 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::*;
+use hippo::backends::{VectorSource, vector_source};
+use hippo::client::{request, run_hook};
+use hippo::config::{Config, Paths};
+use hippo::daemon::{DaemonError, DaemonHandle, start};
+use hippo::embedder::Embedder;
+use hippo::ingest::{HookEvent, IngestRequest};
+use hippo::protocol::{Request, Response, StatusInfo};
+use hippo::search::{SearchKind, SearchRequest};
+use hippo::spool;
+use hippo::store::{RecordKind, RecordStore};
+use hippo::testing::{HashEmbedder, MemoryVectorStore};
+use hippo::vector::{VectorRecord, VectorStore};
 use serde_json::json;
-use smem::backends::{VectorSource, vector_source};
-use smem::client::{request, run_hook};
-use smem::config::{Config, Paths};
-use smem::daemon::{DaemonError, DaemonHandle, start};
-use smem::embedder::Embedder;
-use smem::ingest::{HookEvent, IngestRequest};
-use smem::protocol::{Request, Response, StatusInfo};
-use smem::search::{SearchKind, SearchRequest};
-use smem::spool;
-use smem::store::{RecordKind, RecordStore};
-use smem::testing::{HashEmbedder, MemoryVectorStore};
-use smem::vector::{VectorRecord, VectorStore};
 
 const S2: &str = "afd070e6-4625-4b31-8c43-f1f553949222";
 const S2_CWD: &str = "/Users/user/personal/session_db/probe";
@@ -401,7 +401,7 @@ impl Embedder for SlowEmbedder {
     fn max_input_tokens(&self) -> usize {
         self.0.max_input_tokens()
     }
-    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, smem::embedder::EmbedError> {
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, hippo::embedder::EmbedError> {
         std::thread::sleep(Duration::from_millis(150));
         self.0.embed(texts)
     }

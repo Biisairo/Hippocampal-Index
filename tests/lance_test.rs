@@ -1,9 +1,9 @@
 mod common;
 
 use common::contract::{record, vector_store_contract};
-use smem::lance::LanceVectorStore;
-use smem::store::RecordKind;
-use smem::vector::{VectorError, VectorFilter, VectorStore};
+use hippo::lance::LanceVectorStore;
+use hippo::store::RecordKind;
+use hippo::vector::{VectorError, VectorFilter, VectorStore};
 
 #[test]
 fn lancedb_satisfies_contract() {

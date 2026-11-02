@@ -1,12 +1,12 @@
 mod common;
 
 use common::*;
-use serde_json::json;
-use smem::bg::{
+use hippo::bg::{
     BackgroundKind, BackgroundStart, background_start, extract_agent_report,
     parse_task_notification,
 };
-use smem::transcript::{ToolCall, ToolResultData};
+use hippo::transcript::{ToolCall, ToolResultData};
+use serde_json::json;
 
 fn call(name: &str, input: serde_json::Value, structured: Option<serde_json::Value>) -> ToolCall {
     ToolCall {

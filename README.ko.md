@@ -1,8 +1,10 @@
-# session-memory (`smem`)
+# hippo
+
+이름은 단기 경험을 장기 기억으로 옮기는 뇌 부위인 해마(hippocampus)에서 따왔습니다.
 
 [English](README.md)
 
-`smem`은 Claude Code에 내 세션의 장기 기억을 만들어 줍니다. agentic loop의 반복을 하나씩 로컬 DB에 기록해 두었다가, 새 프롬프트를 보내면 관련된 과거 맥락을 찾아 Claude에게 전달합니다.
+`hippo`는 Claude Code에 내 세션의 장기 기억을 만들어 줍니다. agentic loop의 반복을 하나씩 로컬 DB에 기록해 두었다가, 새 프롬프트를 보내면 관련된 과거 맥락을 찾아 Claude에게 전달합니다.
 
 모든 데이터는 내 컴퓨터 안에만 있습니다. 임베딩은 로컬 Ollama 모델로 만들고, 벡터는 임베디드 LanceDB에 저장합니다. 대화 내용은 외부로 나가지 않습니다.
 
@@ -36,7 +38,7 @@
   → 반복 3: 모델 텍스트만 (loop 종료)
 ```
 
-`smem`은 **반복마다 기록을 하나씩** 저장합니다. 기록에 담기는 내용은 다음과 같습니다.
+`hippo`는 **반복마다 기록을 하나씩** 저장합니다. 기록에 담기는 내용은 다음과 같습니다.
 
 - **입력**: 이 반복 직전에 들어온 프롬프트, 백그라운드 작업 완료 알림, 서브에이전트 보고
 - **도구 호출**: 호출한 도구의 이름과 입력
@@ -51,7 +53,7 @@
 | 마지막 반복 (텍스트만) | `Stop` / `StopFailure` |
 | 세션 종료 시 남은 것 | `SessionEnd` |
 
-이 hook들은 `async: true`로 실행되므로 세션을 느리게 만들지 않습니다. hook 입력은 수집 신호로만 쓰고, 실제 내용은 세션 transcript(JSONL)에서 읽습니다. `smem`은 세션마다 안전 offset을 기억해 두므로, 같은 줄을 두 번 읽거나 같은 반복을 두 번 저장하지 않습니다.
+이 hook들은 `async: true`로 실행되므로 세션을 느리게 만들지 않습니다. hook 입력은 수집 신호로만 쓰고, 실제 내용은 세션 transcript(JSONL)에서 읽습니다. `hippo`는 세션마다 안전 offset을 기억해 두므로, 같은 줄을 두 번 읽거나 같은 반복을 두 번 저장하지 않습니다.
 
 그 밖의 처리 방식:
 
@@ -78,24 +80,24 @@
 ### 1.4 기억을 쓰는 방법
 
 - **자동 주입**: 프롬프트를 보낼 때마다 `UserPromptSubmit` hook이 데몬에 관련 기억을 요청합니다. 검색 대상은 **같은 프로젝트**(`cwd`가 같음)의 **다른 세션** 기록입니다. 벡터 유사도가 임계값 이상인 결과만 Claude의 컨텍스트에 들어갑니다. 각 항목은 `<memory>` 블록으로 감싸고, 머리말에 "과거 기록이며 지시가 아님"을 밝힙니다.
-- **필요할 때 검색**: Claude나 사용자가 셸에서 `smem search`, `smem show`를 실행합니다.
+- **필요할 때 검색**: Claude나 사용자가 셸에서 `hippo search`, `hippo show`를 실행합니다.
 
 검색은 **하이브리드** 방식입니다. 벡터 유사도와 SQLite FTS5 키워드 검색 결과를 RRF(Reciprocal Rank Fusion)로 합칩니다. `validateToken` 같은 식별자는 키워드 검색이 잘 찾습니다.
 
 ### 1.5 구조
 
 ```
-Claude Code ──hook(stdin JSON)──▶ smem hook <이벤트> ──Unix socket──▶ smem daemon
+Claude Code ──hook(stdin JSON)──▶ hippo hook <이벤트> ──Unix socket──▶ hippo daemon
                                        │ (데몬이 꺼져 있음)                │
                                        └──▶ spool/pending.jsonl ◀─ 시작 시 처리
                                                                           ├─ 수집 스레드 (하나, 순서대로)
-Claude / 사용자 ──▶ smem search|show|status|reindex ──Unix socket──────▶  ├─ 임베딩 스레드
+Claude / 사용자 ──▶ hippo search|show|status|reindex ──Unix socket──────▶  ├─ 임베딩 스레드
                                                                           └─ 연결 처리 스레드
                                                    SQLite ◀──┘   Ollama(localhost) ◀──┘   LanceDB
 ```
 
 - 데몬은 컴퓨터마다 하나만 실행됩니다(파일 잠금). 저장소에는 데몬만 씁니다.
-- 데몬이 꺼져 있으면 수집 요청은 스풀 파일에 쌓였다가, 다음에 데몬이 시작될 때 처리됩니다. `smem` 때문에 Claude Code 세션이 실패하는 일은 없습니다.
+- 데몬이 꺼져 있으면 수집 요청은 스풀 파일에 쌓였다가, 다음에 데몬이 시작될 때 처리됩니다. `hippo` 때문에 Claude Code 세션이 실패하는 일은 없습니다.
 
 ---
 
@@ -124,14 +126,14 @@ cargo build --release
 
 ### 3.2 바이너리를 고정된 위치에 두기
 
-hook 명령에는 `smem install`을 실행한 `smem` 바이너리의 **절대 경로**가 들어갑니다. 그래서 바이너리를 먼저 바뀌지 않을 위치에 둡니다.
+hook 명령에는 `hippo install`을 실행한 `hippo` 바이너리의 **절대 경로**가 들어갑니다. 그래서 바이너리를 먼저 바뀌지 않을 위치에 둡니다.
 
 ```bash
 mkdir -p ~/.local/bin
-cp target/release/smem ~/.local/bin/smem
+cp target/release/hippo ~/.local/bin/hippo
 ```
 
-이후 단계에서는 모두 `~/.local/bin/smem`을 씁니다.
+이후 단계에서는 모두 `~/.local/bin/hippo`를 씁니다.
 
 ### 3.3 Ollama와 임베딩 모델
 
@@ -141,66 +143,66 @@ brew services start ollama       # 지금 시작하고, 로그인할 때마다 �
 ollama pull qwen3-embedding:0.6b
 ```
 
-Ollama는 기본으로 `127.0.0.1:11434`에서만 요청을 받습니다. `smem`은 localhost가 아닌 임베더 URL을 거부합니다.
+Ollama는 기본으로 `127.0.0.1:11434`에서만 요청을 받습니다. `hippo`는 localhost가 아닌 임베더 URL을 거부합니다.
 
 ### 3.4 데몬 실행
 
 방법 A: 터미널에서 실행합니다. 처음 시험해 볼 때 적합합니다.
 
 ```bash
-~/.local/bin/smem daemon
+~/.local/bin/hippo daemon
 ```
 
 방법 B: launchd에 등록해 로그인할 때 자동으로 시작합니다.
 
 ```bash
-mkdir -p ~/.session-memory/logs && chmod 700 ~/.session-memory ~/.session-memory/logs
-~/.local/bin/smem launchd-plist > ~/Library/LaunchAgents/com.session-memory.smem.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.session-memory.smem.plist
+mkdir -p ~/.hippo/logs && chmod 700 ~/.hippo ~/.hippo/logs
+~/.local/bin/hippo launchd-plist > ~/Library/LaunchAgents/com.hippo.daemon.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hippo.daemon.plist
 ```
 
-멈출 때는 `launchctl bootout gui/$(id -u)/com.session-memory.smem`을 실행합니다.
+멈출 때는 `launchctl bootout gui/$(id -u)/com.hippo.daemon`을 실행합니다.
 
 데몬 상태 확인:
 
 ```bash
-~/.local/bin/smem status
+~/.local/bin/hippo status
 ```
 
 ### 3.5 hook 등록
 
-`smem install`은 Claude Code 설정 파일에 hook을 병합합니다. `smem` hook 항목만 바꾸고, 다른 hook과 설정은 그대로 둡니다. **먼저 미리보기로 확인하십시오.**
+`hippo install`은 Claude Code 설정 파일에 hook을 병합합니다. `hippo` hook 항목만 바꾸고, 다른 hook과 설정은 그대로 둡니다. **먼저 미리보기로 확인하십시오.**
 
 ```bash
 # 특정 프로젝트만: <프로젝트>/.claude/settings.local.json (개인 파일, git에 올라가지 않음)
-~/.local/bin/smem install --scope project --project ~/work/my-app --dry-run
-~/.local/bin/smem install --scope project --project ~/work/my-app
+~/.local/bin/hippo install --scope project --project ~/work/my-app --dry-run
+~/.local/bin/hippo install --scope project --project ~/work/my-app
 
 # 모든 세션: ~/.claude/settings.json
-~/.local/bin/smem install --scope user --dry-run
-~/.local/bin/smem install --scope user
+~/.local/bin/hippo install --scope user --dry-run
+~/.local/bin/hippo install --scope user
 ```
 
 `install`이 하는 일:
 
 - 변경 내용(diff)을 출력합니다. `--dry-run`이면 아무것도 쓰지 않습니다.
-- 쓰기 전에 원본을 `<파일>.smem-backup-<유닉스 시각>`으로 백업합니다.
+- 쓰기 전에 원본을 `<파일>.hippo-backup-<유닉스 시각>`으로 백업합니다.
 - 원자적으로 교체하고, 파일 권한을 유지합니다.
 - 다시 실행해도 결과가 같으면 아무것도 바꾸지 않습니다("변경 없음").
 - 심볼릭 링크를 거쳐서는 쓰지 않고, JSON이 깨진 설정 파일은 건드리지 않습니다.
 - 파일은 2칸 들여쓰기 JSON으로 다시 쓰입니다. 키 순서와 값은 유지되지만, 원래 형식은 달라질 수 있습니다. 원본은 백업에 남습니다.
 
-hook 블록만 출력해 직접 넣을 수도 있습니다: `smem hooks-config`.
+hook 블록만 출력해 직접 넣을 수도 있습니다: `hippo hooks-config`.
 
 hook을 등록한 뒤에는 Claude Code 세션을 새로 시작하십시오.
 
 ### 3.6 제거
 
 ```bash
-~/.local/bin/smem uninstall --scope user          # 또는 --scope project --project <경로>
-launchctl bootout gui/$(id -u)/com.session-memory.smem
-rm ~/Library/LaunchAgents/com.session-memory.smem.plist
-rm -rf ~/.session-memory                          # 저장된 기억이 모두 지워집니다
+~/.local/bin/hippo uninstall --scope user          # 또는 --scope project --project <경로>
+launchctl bootout gui/$(id -u)/com.hippo.daemon
+rm ~/Library/LaunchAgents/com.hippo.daemon.plist
+rm -rf ~/.hippo                          # 저장된 기억이 모두 지워집니다
 ```
 
 ---
@@ -212,9 +214,9 @@ rm -rf ~/.session-memory                          # 저장된 기억이 모두 �
 ### 4.1 검색
 
 ```bash
-smem search "토큰 만료 버그"                           # 현재 디렉터리 프로젝트의 반복
-smem search "validateToken" --scope all --kind both    # 모든 프로젝트의 반복과 결과
-smem search "배포" --scope ~/work/my-app --limit 5
+hippo search "토큰 만료 버그"                           # 현재 디렉터리 프로젝트의 반복
+hippo search "validateToken" --scope all --kind both    # 모든 프로젝트의 반복과 결과
+hippo search "배포" --scope ~/work/my-app --limit 5
 ```
 
 | 옵션 | 값 | 기본값 |
@@ -228,8 +230,8 @@ smem search "배포" --scope ~/work/my-app --limit 5
 ### 4.2 한 턴 전체 보기
 
 ```bash
-smem show <prompt_id>                  # 해당 프롬프트의 반복을 순서대로
-smem show <prompt_id> --with-results   # 도구 출력 원문까지
+hippo show <prompt_id>                  # 해당 프롬프트의 반복을 순서대로
+hippo show <prompt_id> --with-results   # 도구 출력 원문까지
 ```
 
 백그라운드 작업의 완료 기록도 함께 나옵니다.
@@ -237,7 +239,7 @@ smem show <prompt_id> --with-results   # 도구 출력 원문까지
 ### 4.3 상태
 
 ```bash
-smem status
+hippo status
 ```
 
 ```
@@ -258,14 +260,14 @@ reindex: idle               # idle | running | done | failed: <사유>
 자동 주입은 가장 잘 맞는 몇 개만 전달합니다. 더 찾아봐야 할 때는 Claude가 CLI를 직접 호출할 수 있습니다. `CLAUDE.md`에 다음과 같은 줄을 넣어 두면 됩니다.
 
 ```
-과거 세션을 찾아봐야 하면 Bash로 `smem search "<질의>"` 또는 `smem show <prompt_id>`를 실행한다.
+과거 세션을 찾아봐야 하면 Bash로 `hippo search "<질의>"` 또는 `hippo show <prompt_id>`를 실행한다.
 ```
 
 ---
 
 ## 5. 설정
 
-파일: `~/.session-memory/config.toml`. 모든 키는 생략할 수 있습니다. 알 수 없는 키는 오류로 처리하므로 오타를 바로 알 수 있습니다. 설정을 바꾼 뒤에는 데몬을 다시 시작하십시오.
+파일: `~/.hippo/config.toml`. 모든 키는 생략할 수 있습니다. 알 수 없는 키는 오류로 처리하므로 오타를 바로 알 수 있습니다. 설정을 바꾼 뒤에는 데몬을 다시 시작하십시오.
 
 ```toml
 [embedder]
@@ -314,12 +316,12 @@ pattern = 'HCI-\d{6}'
 ```
 1. config.toml 수정 (예: 새 모델, 차원, 백엔드)
 2. 데몬 재시작     → status가 "mismatch"를 표시합니다. 키워드 검색은 계속 동작합니다
-3. smem reindex   → 백그라운드에서 새 세대에 전체를 다시 색인합니다
+3. hippo reindex   → 백그라운드에서 새 세대에 전체를 다시 색인합니다
 4. 완료되면        → ACTIVE 포인터가 원자적으로 바뀝니다. 이전 세대는 다음 시작 때 지워집니다
 ```
 
 - 재색인 중에는 기존 저장소로 검색합니다. 그동안 새로 들어온 반복은 큐에서 기다렸다가 전환 후 새 저장소에 들어가므로, 유실되지 않습니다.
-- 재색인 중에 `smem reindex`를 다시 실행하면 거부합니다.
+- 재색인 중에 `hippo reindex`를 다시 실행하면 거부합니다.
 - 벡터 디렉터리: `vectors/<이름>/<세대>/`. `vectors/<이름>/ACTIVE`가 사용 중인 세대를 가리킵니다.
 
 완전히 새로운 백엔드를 추가하는 방법은 [9.4](#94-새-백엔드-추가하기)를 참고하십시오.
@@ -329,15 +331,15 @@ pattern = 'HCI-\d{6}'
 ## 7. 데이터 위치와 보안
 
 ```
-~/.session-memory/            (0700)
+~/.hippo/            (0700)
 ├─ config.toml
 ├─ records.sqlite             (0600) 기준 데이터
 ├─ vectors/<이름>/ACTIVE
 ├─ vectors/<이름>/<세대>/      LanceDB 파일
 ├─ spool/                     데몬이 꺼져 있을 때 쌓인 요청
-├─ logs/smemd.log             데몬 오류 로그
-├─ smem.sock                  (0600) 데몬 소켓
-└─ smem.lock                  단일 실행 잠금
+├─ logs/hippo.log             데몬 오류 로그
+├─ hippo.sock                  (0600) 데몬 소켓
+└─ hippo.lock                  단일 실행 잠금
 ```
 
 보안 조치:
@@ -354,12 +356,12 @@ pattern = 'HCI-\d{6}'
 
 | 증상 | 확인할 것 |
 |------|-----------|
-| `smem: daemon not reachable` | 데몬이 실행 중인지 확인합니다. `smem daemon` 또는 launchd 등록 |
-| `embed_jobs`가 줄지 않음 | Ollama 실행 여부(`curl http://127.0.0.1:11434/api/version`)와 모델 다운로드 여부. `~/.session-memory/logs/smemd.log` 확인 |
-| `compatibility: mismatch` | 모델이나 차원이 바뀌었습니다. `smem reindex` 실행 |
+| `hippo: daemon not reachable` | 데몬이 실행 중인지 확인합니다. `hippo daemon` 또는 launchd 등록 |
+| `embed_jobs`가 줄지 않음 | Ollama 실행 여부(`curl http://127.0.0.1:11434/api/version`)와 모델 다운로드 여부. `~/.hippo/logs/hippo.log` 확인 |
+| `compatibility: mismatch` | 모델이나 차원이 바뀌었습니다. `hippo reindex` 실행 |
 | 자동 주입이 되지 않음 | `[inject] threshold`를 낮춥니다. 주입은 같은 프로젝트의 다른 세션만 대상입니다 |
 | `lance-*`나 `protoc`에서 빌드 실패 | `brew reinstall protobuf` 후 `protoc --version` 확인 |
-| `refusing to modify through a symbolic link` | 설정 파일이 심볼릭 링크입니다. 실제 파일 경로에 `install`을 실행하거나, `smem hooks-config` 출력을 직접 넣으십시오 |
+| `refusing to modify through a symbolic link` | 설정 파일이 심볼릭 링크입니다. 실제 파일 경로에 `install`을 실행하거나, `hippo hooks-config` 출력을 직접 넣으십시오 |
 | `spool_pending`이 0보다 큼 | 데몬이 꺼져 있던 동안의 요청입니다. 데몬이 시작되면 처리됩니다 |
 
 ---
@@ -409,7 +411,7 @@ cargo fmt
 1. `Embedder`(`src/embedder.rs`)나 `VectorStore`(`src/vector.rs`)를 구현합니다.
 2. `tests/common/contract.rs`의 공통 계약 테스트(`embedder_contract` 또는 `vector_store_contract`)를 새 백엔드에 돌립니다. `tests/lance_test.rs`가 예시입니다.
 3. `src/backends.rs`(`build_embedder` 또는 `vector_source`)에 이름을 추가합니다.
-4. `config.toml`에서 선택하고, 데몬을 재시작한 뒤 `smem reindex`를 실행합니다.
+4. `config.toml`에서 선택하고, 데몬을 재시작한 뒤 `hippo reindex`를 실행합니다.
 
 수집, 검색, 데몬 코드는 바꾸지 않아도 됩니다.
 
@@ -420,7 +422,7 @@ cargo fmt
 - 자동 주입의 품질은 `inject.threshold`에 달려 있습니다. 실제 데이터로 조정해야 합니다(SRS OPEN-5).
 - "버그"처럼 2자인 한국어 단어는 키워드 검색으로 찾을 수 없습니다(FTS5 trigram은 3자 이상 필요). 이런 단어는 벡터 검색이 담당합니다.
 - 대화형 세션에서 아직 확인하지 못한 것: 백그라운드 알림 뒤 hook 실행 여부(OPEN-1), Esc 중단(OPEN-2), compaction(OPEN-3), `Stop` 실행 시점에 마지막 줄이 기록되어 있는지(OPEN-6).
-- hook은 항상 기본 데이터 루트(`~/.session-memory`)를 씁니다. `--root`는 hook 명령에 들어가지 않습니다.
+- hook은 항상 기본 데이터 루트(`~/.hippo`)를 씁니다. `--root`는 hook 명령에 들어가지 않습니다.
 - 데몬이 시그널로 종료되면 소켓 파일이 남습니다. 다음 시작 때 지워집니다.
 - 아직 보존 기간 정책이 없습니다. 직접 지우기 전까지 기억이 계속 쌓입니다.
 - 지금은 macOS만 지원합니다.

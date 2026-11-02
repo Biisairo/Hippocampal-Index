@@ -48,7 +48,7 @@ pub enum Response {
 }
 
 impl StatusInfo {
-    /// `smem status` 출력. 재색인이 필요하면 안내를 붙인다. (FR-SWP-10)
+    /// `hippo status` 출력. 재색인이 필요하면 안내를 붙인다. (FR-SWP-10)
     pub fn render(&self) -> String {
         let mut out = format!(
             "iterations: {}\nresults: {}\nembed_jobs: {}\nspool_pending: {}\nvectors: {}\nembed_model: {}\ncompatibility: {}\nreindex: {}\n",
@@ -63,9 +63,9 @@ impl StatusInfo {
         );
         let idle = self.reindex != REINDEX_RUNNING;
         if idle && self.compatibility == COMPAT_MISMATCH {
-            out.push_str("벡터 저장소의 모델 또는 차원이 설정과 다릅니다. `smem reindex`로 다시 색인하십시오. 그동안 키워드 검색만 동작합니다.\n");
+            out.push_str("벡터 저장소의 모델 또는 차원이 설정과 다릅니다. `hippo reindex`로 다시 색인하십시오. 그동안 키워드 검색만 동작합니다.\n");
         } else if idle && self.vectors == 0 && self.iterations > 0 {
-            out.push_str("저장된 기록은 있지만 벡터가 없습니다. `smem reindex`로 색인하십시오.\n");
+            out.push_str("저장된 기록은 있지만 벡터가 없습니다. `hippo reindex`로 색인하십시오.\n");
         }
         out
     }
