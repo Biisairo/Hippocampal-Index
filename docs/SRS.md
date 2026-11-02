@@ -60,7 +60,7 @@
 - [R1] Claude Code Hooks reference — https://code.claude.com/docs/en/hooks
 - [R2] LanceDB 문서 — https://docs.lancedb.com
 - [R3] Qwen3-Embedding — https://github.com/QwenLM/Qwen3-Embedding
-- [R4] 실측 로그 — `probe/r_s1_notool` … `probe/r_s5_bg_bash` (부록 A)
+- [R4] 실측 hook 입력 — `tests/fixtures/hooks/r_s1_notool` … `tests/fixtures/hooks/r_s5_bg_bash` (부록 A)
 
 ### 1.5 문서 구성
 2장은 제품 전체 설명, 3장은 개별 요구사항, 4장은 검증 방법, 부록은 실측 근거와 미해결 항목을 다룬다.
@@ -346,7 +346,7 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 
 ---
 
-## 부록 A. 실측 근거 (Claude Code 2.1.316, `claude -p --settings probe/settings.json`)
+## 부록 A. 실측 근거 (Claude Code 2.1.316, 격리 설정 파일을 준 `claude -p --settings <파일>`)
 
 | 시나리오 | 실행된 hook 순서 |
 |----------|------------------|

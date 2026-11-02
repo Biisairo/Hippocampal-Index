@@ -503,7 +503,7 @@ cargo clippy --all-targets     # 경고가 없어야 함
 cargo fmt
 ```
 
-`tests/fixtures/`의 fixture는 실제 transcript에서 `user`와 `assistant` 줄만 남긴 것입니다. 새로 만들려면 설정 파일을 건드리지 않고 hook을 기록한 뒤(`claude -p --settings probe/settings.json ...`), `python3 probe/make_fixtures.py tests/fixtures`를 실행합니다(스크립트의 세션 id를 고쳐서 사용).
+`tests/fixtures/`의 fixture는 실제 transcript에서 `user`와 `assistant` 줄만 남긴 것입니다. `tests/fixtures/hooks/`에는 실측한 hook 입력이 있습니다. 새로 만들 때는 `~/.claude` 설정을 건드리지 않습니다. 이벤트마다 hook 입력을 파일로 기록하는 격리 설정 파일을 따로 만들고, `claude -p --settings <그 파일>`로 실행합니다. 그다음 transcript에서 `user`와 `assistant` 줄만 남기고, 로컬 경로를 `/Users/user`처럼 바꿉니다.
 
 ### 9.4 새 백엔드 추가하기
 

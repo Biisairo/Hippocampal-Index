@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 fn probe(path: &str) -> String {
     fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("probe")
+            .join("tests/fixtures/hooks")
             .join(path),
     )
     .unwrap()

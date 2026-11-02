@@ -503,7 +503,7 @@ cargo clippy --all-targets     # must have no warnings
 cargo fmt
 ```
 
-Test fixtures in `tests/fixtures/` are real transcripts, reduced to the `user` and `assistant` lines. To make new ones, record hooks without touching your settings (`claude -p --settings probe/settings.json ...`), then run `python3 probe/make_fixtures.py tests/fixtures` (edit the session IDs in the script).
+Test fixtures in `tests/fixtures/` are real transcripts, reduced to the `user` and `assistant` lines. `tests/fixtures/hooks/` holds recorded hook inputs. To make new ones, do not touch your `~/.claude` settings. Write a separate settings file whose hooks save each hook input to a file, and run `claude -p --settings <that file>`. Then keep only the `user` and `assistant` lines of the transcript and replace local paths with something like `/Users/user`.
 
 ### 9.4 Adding a new backend
 
