@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS session_projects (session_id TEXT PRIMARY KEY, projec
 
 const PROJECT_COLUMNS: &str = "id, location, kind, created_at, last_active_at";
 const PROJECT_ID_BYTES: usize = 16;
-const GIT_DIR_NAME: &str = ".git";
+pub const GIT_DIR_NAME: &str = ".git";
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 판정 결과. 위치를 바꿔야 하는 규칙은 (b)와 (c)이다.
@@ -165,7 +165,7 @@ impl Registry {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// `adopt`의 원본: 프로젝트 id, 또는 위치가 경로나 `<경로>/.git`인 프로젝트. (FR-PRJ-7)
+    /// 가져오기의 원본: 프로젝트 id, 또는 위치가 경로나 `<경로>/.git`인 프로젝트. (FR-PRJ-7)
     pub fn find_source(&self, arg: &str) -> Result<Option<String>> {
         if is_project_id(arg) && self.project(arg)?.is_some() {
             return Ok(Some(arg.to_string()));

@@ -6,8 +6,9 @@ use hippo::backends::{BackendError, build_embedder, vector_source};
 use hippo::client::{HookAction, inject_output, launch_disabled, parse_hook, run_hook};
 use hippo::config::{Config, Paths};
 use hippo::generations::active_dir;
-use hippo::ingest::{HookEvent, IngestRequest};
-use hippo::protocol::{ProjectStatus, Request, Response, Scope, StatusInfo};
+use hippo::import::Candidate;
+use hippo::ingest::{HookEvent, ImportOutcome, IngestRequest};
+use hippo::protocol::{ImportSessionReport, ProjectStatus, Request, Response, Scope, StatusInfo};
 use hippo::search::SearchKind;
 use hippo::setup::{hooks_config, launchd_plist};
 use hippo::spool;
@@ -29,6 +30,7 @@ fn ingest_req(event: HookEvent) -> IngestRequest {
         event,
         session_id: "s".into(),
         transcript_path: PathBuf::from("/t/s.jsonl"),
+        prompt_id: Some("p".into()),
     }
 }
 
@@ -45,6 +47,11 @@ fn parses_real_capture_hook_inputs() {
         HookAction::Ingest(r) => {
             assert_eq!(r.event, HookEvent::PostToolBatch);
             assert_eq!(r.session_id, S2_SESSION);
+            assert_eq!(
+                r.prompt_id.as_deref(),
+                Some("8f64252a-0037-484d-a451-35aa2c0076ed"),
+                "기준 턴은 hook 입력의 prompt_id (FR-CAP-7)"
+            );
             assert!(
                 r.transcript_path
                     .to_string_lossy()
@@ -146,9 +153,14 @@ fn protocol_roundtrip() {
             cwd: "/w".into(),
         },
         Request::ProjectList,
-        Request::ProjectAdopt {
-            source: "/old".into(),
-            cwd: "/w".into(),
+        Request::ImportPrepare {
+            from: "/old".into(),
+            to: "/w".into(),
+        },
+        Request::ImportSession {
+            project_id: "0123".into(),
+            session_id: "s".into(),
+            transcript_path: PathBuf::from("/t/s.jsonl"),
         },
     ];
     for r in requests {
@@ -162,6 +174,21 @@ fn protocol_roundtrip() {
         Response::Text { text: "t".into() },
         Response::Inject { context: None },
         status,
+        Response::ImportPlan {
+            project_id: "0123".into(),
+            summary: "변경 없음".into(),
+            sessions: vec![Candidate {
+                session_id: "s".into(),
+                transcript_path: PathBuf::from("/t/s.jsonl"),
+            }],
+        },
+        Response::ImportSession(ImportSessionReport {
+            outcome: ImportOutcome::Imported,
+            iterations: 2,
+            completions: 0,
+            fork_skipped: 1,
+            pending_embeds: 3,
+        }),
         Response::Error {
             message: "e".into(),
         },
@@ -452,4 +479,21 @@ fn status_render_escapes_control_characters_in_location() {
     let out = st.render();
     assert!(!out.contains('\u{1b}'), "{out:?}");
     assert!(out.contains("\\u{1b}"), "{out:?}");
+}
+
+#[test]
+fn spool_line_without_prompt_id_is_still_read() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("pending.jsonl"),
+        "{\"event\":\"Stop\",\"session_id\":\"s\",\"transcript_path\":\"/t/s.jsonl\"}\n",
+    )
+    .unwrap();
+    let taken = spool::take_all(dir.path()).unwrap();
+    assert_eq!(taken[0].1[0].prompt_id, None);
+    let line = serde_json::to_string(&ingest_req(HookEvent::Stop)).unwrap();
+    assert!(
+        line.contains("\"prompt_id\":\"p\""),
+        "스풀에 prompt_id 기록 (FR-CAP-5)"
+    );
 }

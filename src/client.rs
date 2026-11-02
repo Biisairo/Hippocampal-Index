@@ -127,6 +127,7 @@ pub fn parse_hook(event_arg: &str, input: &str) -> HookAction {
                 event,
                 session_id,
                 transcript_path: PathBuf::from(path),
+                prompt_id: field("prompt_id"),
             }),
             _ => HookAction::Skip,
         };

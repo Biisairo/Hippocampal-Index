@@ -79,6 +79,7 @@ impl Env {
                     iterations: vec![item],
                     completions: vec![],
                     state: ExtractorState::default(),
+                    bulk: false,
                 })
                 .unwrap();
         }
@@ -492,6 +493,7 @@ fn render_turn_lists_iterations_and_results() {
                 .collect(),
             completions: vec![],
             state: ExtractorState::default(),
+            bulk: false,
         })
         .unwrap();
     let plain = render_turn(&records, &prompt_id, false).unwrap();
@@ -544,6 +546,7 @@ fn render_turn_shows_background_completions() {
                 ts: "t".into(),
             }],
             state: ExtractorState::default(),
+            bulk: false,
         })
         .unwrap();
     let out = render_turn(&records, &prompt_id, true).unwrap();

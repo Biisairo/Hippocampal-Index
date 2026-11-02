@@ -61,6 +61,9 @@ pub struct ExtractorState {
     /// `next_index`가 기준으로 삼는 턴.
     pub indexed_prompt_id: Option<String>,
     pub next_index: u32,
+    /// 기록을 저장하기 시작한 위치. 이 앞은 가져오기로만 채운다. (FR-EXT-12, FR-IMP-3)
+    #[serde(default)]
+    pub start_offset: u64,
 }
 
 /// 아직 확정되지 않은 항목. 시작 offset과 그 시점의 `promptId`를 함께 기억해 재개에 쓴다.
@@ -107,6 +110,15 @@ impl Extractor {
             let calls = &p.value.tool_calls;
             !calls.is_empty() && calls.iter().all(|c| c.result.is_some())
         });
+        if ready { self.close_open() } else { Vec::new() }
+    }
+
+    /// 가져오기에서 읽은 범위 끝. 모든 도구 호출에 결과가 있는 반복만 확정한다. (FR-IMP-3)
+    pub fn finish_complete(&mut self) -> Vec<Event> {
+        let ready = self
+            .open
+            .as_ref()
+            .is_some_and(|p| p.value.tool_calls.iter().all(|c| c.result.is_some()));
         if ready { self.close_open() } else { Vec::new() }
     }
 

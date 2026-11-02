@@ -21,6 +21,7 @@ fn batch_from_fixture(name: &str) -> Batch {
         iterations: its.into_iter().map(new_iteration).collect(),
         completions: vec![],
         state: ex.state(),
+        bulk: false,
     }
 }
 
@@ -73,6 +74,7 @@ fn batch(session: &str, iterations: Vec<NewIteration>, completions: Vec<NewCompl
         iterations,
         completions,
         state: ExtractorState::default(),
+        bulk: false,
     }
 }
 

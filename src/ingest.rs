@@ -1,4 +1,4 @@
-//! transcript를 읽어 원본 저장소에 반영하는 수집 파이프라인. (SRS 3.2.1~3.2.3)
+//! transcript를 읽어 원본 저장소에 반영하는 수집 파이프라인. (SRS 3.2.1~3.2.3, 3.2.11)
 
 use std::collections::HashMap;
 use std::fs;
@@ -25,12 +25,32 @@ pub struct IngestRequest {
     pub event: HookEvent,
     pub session_id: String,
     pub transcript_path: PathBuf,
+    /// hook 입력의 `prompt_id`. 처음 보는 세션의 기준 턴이다. (FR-CAP-7, FR-EXT-12)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IngestReport {
     pub iterations: usize,
     pub completions: usize,
+}
+
+/// 세션 하나를 가져온 결과. (FR-IMP-7)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportOutcome {
+    Imported,
+    Unchanged,
+    OtherProject,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportReport {
+    pub outcome: ImportOutcome,
+    pub iterations: usize,
+    pub completions: usize,
+    pub fork_skipped: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,33 +69,173 @@ pub enum IngestError {
     Store(#[from] StoreError),
 }
 
+/// 읽은 범위 끝에서 열린 반복을 어떻게 다룰지.
+#[derive(Clone, Copy)]
+enum Finish {
+    Hook(HookEvent),
+    /// 모든 도구 호출에 결과가 있는 반복만 확정한다. (FR-IMP-3)
+    Complete,
+}
+
+/// 저장할 반복과 완료 기록. fork 복사본으로 건너뛴 반복 수를 함께 센다.
+struct Collected {
+    iterations: Vec<NewIteration>,
+    completions: Vec<NewCompletion>,
+    fork_skipped: usize,
+}
+
+/// 실시간 수집. 처음 보는 세션은 hook의 `prompt_id`가 가리키는 턴부터 읽는다. (FR-EXT-1, FR-EXT-12)
 pub fn ingest(
     records: &mut RecordStore,
     redactor: &Redactor,
     options: IngestOptions,
     req: &IngestRequest,
 ) -> Result<IngestReport, IngestError> {
-    let bytes = fs::read(&req.transcript_path).map_err(|source| IngestError::Transcript {
-        path: req.transcript_path.clone(),
-        source,
-    })?;
-    let mut state = records.session_state(&req.session_id)?.unwrap_or_default();
-    if state.safe_offset > bytes.len() as u64 {
-        state = ExtractorState::default();
-    }
+    let bytes = read_transcript(&req.transcript_path)?;
+    let known = records
+        .session_state(&req.session_id)?
+        .filter(|s| s.safe_offset <= bytes.len() as u64);
+    let state = match known {
+        Some(state) => state,
+        None => {
+            let Some(anchor) = req
+                .prompt_id
+                .as_deref()
+                .and_then(|p| prompt_start(&bytes, p))
+            else {
+                return Ok(IngestReport::default());
+            };
+            ExtractorState {
+                safe_offset: anchor,
+                start_offset: anchor,
+                ..ExtractorState::default()
+            }
+        }
+    };
     let mut extractor = Extractor::new(state.clone());
     let events = read_events(
         &mut extractor,
         &bytes,
         state.safe_offset as usize,
-        req.event,
+        Finish::Hook(req.event),
     );
+    let collected = collect(records, redactor, options, events, req, false)?;
+    let report = IngestReport {
+        iterations: collected.iterations.len(),
+        completions: collected.completions.len(),
+    };
+    save(records, req, collected, extractor.state(), false)?;
+    Ok(report)
+}
 
+/// 가져오기. 처음 보는 세션은 처음부터, 실시간 수집이 중간부터 시작한 세션은 그 앞부분을 채운다.
+/// fork 복사본은 건너뛴다. (FR-IMP-3, FR-IMP-4, FR-IMP-5)
+pub fn import_session(
+    records: &mut RecordStore,
+    redactor: &Redactor,
+    options: IngestOptions,
+    session_id: &str,
+    transcript_path: &Path,
+) -> Result<ImportReport, IngestError> {
+    let bytes = read_transcript(transcript_path)?;
+    let req = IngestRequest {
+        event: HookEvent::Stop,
+        session_id: session_id.to_string(),
+        transcript_path: transcript_path.to_path_buf(),
+        prompt_id: None,
+    };
+    let known = records
+        .session_state(session_id)?
+        .filter(|s| s.safe_offset <= bytes.len() as u64);
+    let (collected, state) = match known {
+        Some(live) if live.start_offset > 0 => {
+            let end = (live.start_offset as usize).min(bytes.len());
+            let mut extractor = Extractor::new(ExtractorState::default());
+            let events = read_events(
+                &mut extractor,
+                &bytes[..end],
+                0,
+                Finish::Hook(HookEvent::Stop),
+            );
+            let collected = collect(records, redactor, options, events, &req, true)?;
+            (
+                collected,
+                ExtractorState {
+                    start_offset: 0,
+                    ..live
+                },
+            )
+        }
+        known => {
+            let state = known.unwrap_or_default();
+            let mut extractor = Extractor::new(state.clone());
+            let events = read_events(
+                &mut extractor,
+                &bytes,
+                state.safe_offset as usize,
+                Finish::Complete,
+            );
+            let collected = collect(records, redactor, options, events, &req, true)?;
+            (collected, extractor.state())
+        }
+    };
+    let report = ImportReport {
+        outcome: if collected.iterations.is_empty() && collected.completions.is_empty() {
+            ImportOutcome::Unchanged
+        } else {
+            ImportOutcome::Imported
+        },
+        iterations: collected.iterations.len(),
+        completions: collected.completions.len(),
+        fork_skipped: collected.fork_skipped,
+    };
+    save(records, &req, collected, state, true)?;
+    Ok(report)
+}
+
+fn read_transcript(path: &Path) -> Result<Vec<u8>, IngestError> {
+    fs::read(path).map_err(|source| IngestError::Transcript {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// `promptId`가 같은 첫 user 라인의 시작 위치. 개행으로 끝난 라인만 본다. (FR-EXT-12)
+fn prompt_start(bytes: &[u8], prompt_id: &str) -> Option<u64> {
+    let end = bytes.iter().rposition(|b| *b == b'\n')? + 1;
+    let mut pos = 0usize;
+    for raw in bytes[..end].split_inclusive(|b| *b == b'\n') {
+        let start = pos;
+        pos += raw.len();
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(raw) else {
+            continue;
+        };
+        let is_user = v.get("type").and_then(serde_json::Value::as_str) == Some("user");
+        if is_user && v.get("promptId").and_then(serde_json::Value::as_str) == Some(prompt_id) {
+            return Some(start as u64);
+        }
+    }
+    None
+}
+
+fn collect(
+    records: &RecordStore,
+    redactor: &Redactor,
+    options: IngestOptions,
+    events: Vec<Event>,
+    req: &IngestRequest,
+    skip_forks: bool,
+) -> Result<Collected, IngestError> {
     let mut iterations = Vec::new();
     let mut notifications = Vec::new();
+    let mut fork_skipped = 0;
     for event in events {
         match event {
             Event::Iteration(mut it) => {
+                if skip_forks && records.message_in_other_session(&it.message_id, &it.session_id)? {
+                    fork_skipped += 1;
+                    continue;
+                }
                 redactor.redact_iteration(&mut it);
                 let embed_text = build_embed_text(&it, options.max_tool_input_chars);
                 iterations.push(NewIteration {
@@ -131,19 +291,29 @@ pub fn ingest(
             ts,
         });
     }
+    Ok(Collected {
+        iterations,
+        completions,
+        fork_skipped,
+    })
+}
 
-    let report = IngestReport {
-        iterations: iterations.len(),
-        completions: completions.len(),
-    };
+fn save(
+    records: &mut RecordStore,
+    req: &IngestRequest,
+    collected: Collected,
+    state: ExtractorState,
+    bulk: bool,
+) -> Result<(), IngestError> {
     records.apply(&Batch {
         session_id: req.session_id.clone(),
         transcript_path: req.transcript_path.to_string_lossy().into_owned(),
-        iterations,
-        completions,
-        state: extractor.state(),
+        iterations: collected.iterations,
+        completions: collected.completions,
+        state,
+        bulk,
     })?;
-    Ok(report)
+    Ok(())
 }
 
 /// 세션 시작 경로: 개행으로 끝난 라인 중 `cwd` 필드를 가진 첫 라인의 값. (FR-PRJ-1)
@@ -163,7 +333,7 @@ fn read_events(
     extractor: &mut Extractor,
     bytes: &[u8],
     start: usize,
-    event: HookEvent,
+    finish: Finish,
 ) -> Vec<Event> {
     let tail = &bytes[start..];
     let end = tail.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
@@ -179,10 +349,11 @@ fn read_events(
         ));
         pos = next;
     }
-    events.extend(match event {
-        HookEvent::PostToolBatch => extractor.finish_batch(),
-        HookEvent::Stop | HookEvent::StopFailure => extractor.finish_turn(),
-        HookEvent::SessionEnd => extractor.finish_session(),
+    events.extend(match finish {
+        Finish::Hook(HookEvent::PostToolBatch) => extractor.finish_batch(),
+        Finish::Hook(HookEvent::Stop | HookEvent::StopFailure) => extractor.finish_turn(),
+        Finish::Hook(HookEvent::SessionEnd) => extractor.finish_session(),
+        Finish::Complete => extractor.finish_complete(),
     });
     events
 }

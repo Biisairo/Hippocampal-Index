@@ -47,6 +47,8 @@ pub struct Batch {
     pub iterations: Vec<NewIteration>,
     pub completions: Vec<NewCompletion>,
     pub state: ExtractorState,
+    /// 가져오기로 등록하는 임베딩 작업이면 true. (FR-IMP-5)
+    pub bulk: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -125,6 +127,8 @@ pub struct EmbedJob {
 pub struct PendingJob {
     pub job: EmbedJob,
     pub enqueued_at: i64,
+    /// 가져오기·병합으로 등록한 작업. (FR-STO-7)
+    pub bulk: bool,
 }
 
 /// 병합으로 새로 추가한 반복, 결과, 임베딩 작업 수. (FR-PRJ-9)
@@ -165,6 +169,7 @@ CREATE TABLE IF NOT EXISTS iterations (
     tool_calls TEXT NOT NULL, response_text TEXT NOT NULL, embed_text TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS iterations_prompt ON iterations(prompt_id, iteration_index);
+CREATE INDEX IF NOT EXISTS iterations_message ON iterations(message_id);
 CREATE TABLE IF NOT EXISTS results (
     id TEXT PRIMARY KEY, tool_name TEXT NOT NULL, text TEXT NOT NULL, first_seen_ts TEXT NOT NULL
 );
@@ -183,7 +188,8 @@ CREATE TABLE IF NOT EXISTS bg_completions (
 );
 CREATE INDEX IF NOT EXISTS bg_completions_tool ON bg_completions(tool_use_id, seq);
 CREATE TABLE IF NOT EXISTS embed_jobs (
-    kind TEXT NOT NULL, ref_id TEXT NOT NULL, enqueued_at INTEGER NOT NULL, PRIMARY KEY (kind, ref_id)
+    kind TEXT NOT NULL, ref_id TEXT NOT NULL, enqueued_at INTEGER NOT NULL, bulk INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (kind, ref_id)
 );
 CREATE TABLE IF NOT EXISTS sessions (session_id TEXT PRIMARY KEY, transcript_path TEXT NOT NULL, state TEXT NOT NULL);
 CREATE VIRTUAL TABLE IF NOT EXISTS iterations_fts USING fts5(embed_text, content='iterations', tokenize='trigram');
@@ -228,10 +234,10 @@ impl RecordStore {
     pub fn apply(&mut self, batch: &Batch) -> Result<()> {
         let tx = self.conn.transaction()?;
         for it in &batch.iterations {
-            insert_iteration(&tx, it)?;
+            insert_iteration(&tx, it, batch.bulk)?;
         }
         for c in &batch.completions {
-            insert_completion(&tx, c)?;
+            insert_completion(&tx, c, batch.bulk)?;
         }
         tx.execute(
             "INSERT INTO sessions (session_id, transcript_path, state) VALUES (?1, ?2, ?3)
@@ -240,6 +246,19 @@ impl RecordStore {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// 같은 `message.id`의 반복이 다른 세션으로 이미 있는가. fork 복사본 판정에 쓴다. (FR-IMP-4)
+    pub fn message_in_other_session(&self, message_id: &str, session_id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM iterations WHERE message_id = ?1 AND session_id <> ?2 LIMIT 1",
+                params![message_id, session_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     pub fn session_state(&self, session_id: &str) -> Result<Option<ExtractorState>> {
@@ -367,25 +386,27 @@ impl RecordStore {
     /// 모든 작업을 등록 순서대로 돌려준다. (FR-DMN-6)
     pub fn pending_jobs(&self) -> Result<Vec<PendingJob>> {
         let mut stmt = self.conn.prepare(
-            "SELECT kind, ref_id, enqueued_at FROM embed_jobs ORDER BY enqueued_at, rowid",
+            "SELECT kind, ref_id, enqueued_at, bulk FROM embed_jobs ORDER BY enqueued_at, rowid",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, i64>(2)?,
+                r.get::<_, bool>(3)?,
             ))
         })?;
         let raw = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(raw
             .into_iter()
-            .filter_map(|(kind, ref_id, enqueued_at)| {
+            .filter_map(|(kind, ref_id, enqueued_at, bulk)| {
                 Some(PendingJob {
                     job: EmbedJob {
                         kind: job_kind_from_str(&kind)?,
                         ref_id,
                     },
                     enqueued_at,
+                    bulk,
                 })
             })
             .collect())
@@ -644,7 +665,7 @@ pub fn iteration_id(session_id: &str, message_id: &str) -> String {
     format!("{session_id}:{message_id}")
 }
 
-fn insert_iteration(tx: &Transaction, new: &NewIteration) -> Result<()> {
+fn insert_iteration(tx: &Transaction, new: &NewIteration, bulk: bool) -> Result<()> {
     let it = &new.iteration;
     let id = iteration_id(&it.session_id, &it.message_id);
     let calls: Vec<ToolCallRow> = it
@@ -682,10 +703,10 @@ fn insert_iteration(tx: &Transaction, new: &NewIteration) -> Result<()> {
         "INSERT INTO iterations_fts (rowid, embed_text) VALUES (last_insert_rowid(), ?1)",
         [&new.embed_text],
     )?;
-    enqueue(tx, RecordKind::Iteration, &id)?;
+    enqueue(tx, RecordKind::Iteration, &id, bulk)?;
     for call in &it.tool_calls {
         if let Some(result) = &call.result
-            && let Some(result_id) = insert_result(tx, &call.name, &result.text, &it.ts)?
+            && let Some(result_id) = insert_result(tx, &call.name, &result.text, &it.ts, bulk)?
         {
             tx.execute(
                 "INSERT OR IGNORE INTO iteration_results (iteration_id, tool_use_id, result_id) VALUES (?1, ?2, ?3)",
@@ -703,7 +724,7 @@ fn insert_iteration(tx: &Transaction, new: &NewIteration) -> Result<()> {
     Ok(())
 }
 
-fn insert_completion(tx: &Transaction, c: &NewCompletion) -> Result<()> {
+fn insert_completion(tx: &Transaction, c: &NewCompletion, bulk: bool) -> Result<()> {
     let exists = tx
         .query_row(
             "SELECT 1 FROM bg_completions WHERE line_uuid = ?1",
@@ -725,7 +746,7 @@ fn insert_completion(tx: &Transaction, c: &NewCompletion) -> Result<()> {
         .optional()?;
     let tool_name = kind.as_deref().unwrap_or(UNKNOWN_BG_TOOL);
     let result_id = match &c.result_text {
-        Some(text) => insert_result(tx, tool_name, text, &c.ts)?,
+        Some(text) => insert_result(tx, tool_name, text, &c.ts, bulk)?,
         None => None,
     };
     let seq: u32 = tx.query_row(
@@ -760,6 +781,7 @@ fn insert_result(
     tool_name: &str,
     text: &str,
     ts: &str,
+    bulk: bool,
 ) -> Result<Option<String>> {
     if text.is_empty() {
         return Ok(None);
@@ -777,15 +799,15 @@ fn insert_result(
             "INSERT INTO results_fts (rowid, text) VALUES (last_insert_rowid(), ?1)",
             [text],
         )?;
-        enqueue(tx, RecordKind::Result, &id)?;
+        enqueue(tx, RecordKind::Result, &id, bulk)?;
     }
     Ok(Some(id))
 }
 
-fn enqueue(tx: &Transaction, kind: RecordKind, ref_id: &str) -> Result<()> {
+fn enqueue(tx: &Transaction, kind: RecordKind, ref_id: &str, bulk: bool) -> Result<()> {
     tx.execute(
-        "INSERT OR IGNORE INTO embed_jobs (kind, ref_id, enqueued_at) VALUES (?1, ?2, ?3)",
-        params![job_kind_str(kind), ref_id, now_millis()],
+        "INSERT OR IGNORE INTO embed_jobs (kind, ref_id, enqueued_at, bulk) VALUES (?1, ?2, ?3, ?4)",
+        params![job_kind_str(kind), ref_id, now_millis(), bulk],
     )?;
     Ok(())
 }
@@ -835,16 +857,16 @@ fn merge_attached(conn: &mut Connection, enqueue: bool) -> Result<MergeReport> {
         }
         if enqueue {
             report.jobs += tx.execute(
-                "INSERT OR IGNORE INTO main.embed_jobs (kind, ref_id, enqueued_at)
-                 SELECT ?1, id, ?2 FROM temp.merged",
+                "INSERT OR IGNORE INTO main.embed_jobs (kind, ref_id, enqueued_at, bulk)
+                 SELECT ?1, id, ?2, 1 FROM temp.merged",
                 params![job_kind_str(kind), now],
             )?;
         }
         tx.execute_batch("DROP TABLE temp.merged;")?;
     }
     report.jobs += tx.execute(
-        "INSERT OR IGNORE INTO main.embed_jobs (kind, ref_id, enqueued_at)
-         SELECT kind, ref_id, enqueued_at FROM src.embed_jobs",
+        "INSERT OR IGNORE INTO main.embed_jobs (kind, ref_id, enqueued_at, bulk)
+         SELECT kind, ref_id, enqueued_at, 1 FROM src.embed_jobs",
         [],
     )?;
     tx.execute_batch(

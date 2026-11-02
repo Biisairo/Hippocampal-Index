@@ -62,6 +62,7 @@ fn store_with(iterations: Vec<NewIteration>) -> RecordStore {
             iterations,
             completions: vec![],
             state: ExtractorState::default(),
+            bulk: false,
         })
         .unwrap();
     store

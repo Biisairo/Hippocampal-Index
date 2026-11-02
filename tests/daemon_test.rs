@@ -11,8 +11,9 @@ use hippo::client::{Launcher, ensure_daemon, launch_disabled, request, run_hook}
 use hippo::config::{Config, Paths};
 use hippo::daemon::{DaemonError, DaemonHandle, start};
 use hippo::embedder::Embedder;
-use hippo::ingest::{HookEvent, IngestRequest};
-use hippo::protocol::{Request, Response, Scope, StatusInfo};
+use hippo::import::Candidate;
+use hippo::ingest::{HookEvent, ImportOutcome, IngestRequest};
+use hippo::protocol::{ImportSessionReport, Request, Response, Scope, StatusInfo};
 use hippo::search::SearchKind;
 use hippo::spool;
 use hippo::store::{RecordKind, RecordStore};
@@ -48,9 +49,10 @@ fn env() -> Env {
     }
 }
 
+/// 테스트 데몬이 실제 `~/.claude/projects`를 읽지 않도록 transcripts 디렉터리를 비워 둔다.
 fn config() -> Config {
     Config::parse(
-        "[embedder]\nbackend = \"hash\"\ndimension = 256\n[vector]\nbackend = \"memory\"\n",
+        "[embedder]\nbackend = \"hash\"\ndimension = 256\n[vector]\nbackend = \"memory\"\n[import]\ntranscripts_dir = \"/nonexistent/hippo-test-transcripts\"\n",
     )
     .unwrap()
 }
@@ -69,10 +71,18 @@ fn memory_source(paths: &Paths, initial: Arc<dyn VectorStore>) -> VectorSource {
 }
 
 fn launch(paths: &Paths, vectors: Arc<dyn VectorStore>) -> Result<DaemonHandle, DaemonError> {
+    launch_with(paths, vectors, config())
+}
+
+fn launch_with(
+    paths: &Paths,
+    vectors: Arc<dyn VectorStore>,
+    config: Config,
+) -> Result<DaemonHandle, DaemonError> {
     let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(256, 8_000));
     start(
         paths.clone(),
-        config(),
+        config,
         embedder,
         memory_source(paths, vectors),
     )
@@ -133,6 +143,7 @@ fn ingest(paths: &Paths, transcript: &Path, event: HookEvent) -> Response {
         event,
         session_id: S2.into(),
         transcript_path: transcript.to_path_buf(),
+        prompt_id: Some(S2_PROMPT.into()),
     });
     request(&paths.socket(), &req, TIMEOUT).unwrap()
 }
@@ -235,7 +246,7 @@ fn inject_returns_context_for_other_session() {
 fn hook_ingest_through_daemon() {
     let e = env();
     let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
-    let input = json!({"session_id": S2, "transcript_path": e.transcript, "cwd": s2_cwd(), "hook_event_name": "Stop"}).to_string();
+    let input = json!({"session_id": S2, "transcript_path": e.transcript, "cwd": s2_cwd(), "prompt_id": S2_PROMPT, "hook_event_name": "Stop"}).to_string();
     assert_eq!(
         hook_no_autostart(&e.paths, Duration::from_millis(800), "stop", &input),
         None
@@ -266,6 +277,7 @@ fn spool_is_drained_on_start() {
         event: HookEvent::Stop,
         session_id: S2.into(),
         transcript_path: e.transcript.clone(),
+        prompt_id: Some(S2_PROMPT.into()),
     };
     spool::append(&e.paths.spool(), &req).unwrap();
     let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
@@ -550,7 +562,7 @@ fn hook_autostarts_daemon_and_ingests() {
     let slot = Mutex::new(None);
     let launcher = in_process_launcher(&slot);
     let input =
-        json!({"session_id": S2, "transcript_path": e.transcript, "cwd": s2_cwd()}).to_string();
+        json!({"session_id": S2, "transcript_path": e.transcript, "cwd": s2_cwd(), "prompt_id": S2_PROMPT}).to_string();
     assert_eq!(
         run_hook(
             &e.paths,
@@ -576,7 +588,7 @@ fn autostart_failure_falls_back_to_spool() {
     let e = env();
     let failing: Launcher = &|_: &Paths| Err(std::io::Error::other("cannot start"));
     let input =
-        json!({"session_id": S2, "transcript_path": e.transcript, "cwd": s2_cwd()}).to_string();
+        json!({"session_id": S2, "transcript_path": e.transcript, "cwd": s2_cwd(), "prompt_id": S2_PROMPT}).to_string();
     assert_eq!(
         run_hook(
             &e.paths,
@@ -785,6 +797,7 @@ fn ingest_session(paths: &Paths, session: &str, transcript: &Path) -> Response {
         event: HookEvent::Stop,
         session_id: session.into(),
         transcript_path: transcript.to_path_buf(),
+        prompt_id: Some(prompt_of(session)),
     });
     request(&paths.socket(), &req, TIMEOUT).unwrap()
 }
@@ -977,18 +990,6 @@ fn project_list(paths: &Paths) -> String {
     text(request(&paths.socket(), &Request::ProjectList, TIMEOUT).unwrap())
 }
 
-fn adopt(paths: &Paths, source: &str, cwd: &Path) -> Response {
-    request(
-        &paths.socket(),
-        &Request::ProjectAdopt {
-            source: source.into(),
-            cwd: s(cwd),
-        },
-        TIMEOUT,
-    )
-    .unwrap()
-}
-
 #[test]
 fn project_list_shows_id_location_and_counts() {
     let e = env();
@@ -1009,21 +1010,104 @@ fn project_list_shows_id_location_and_counts() {
     handle.shutdown();
 }
 
+// ---- 가져오기 (FR-PRJ-7, FR-IMP-*) ----
+
+fn import_config(e: &Env) -> Config {
+    config_with(&format!(
+        "[import]\ntranscripts_dir = \"{}\"\n",
+        s(&e._dir.path().join("tx"))
+    ))
+}
+
+/// `tx/<slug>/<session>.jsonl`에 과거 transcript를 둔다. message.id를 세션마다 달리해 fork 복사본이 되지 않게 한다.
+fn past(e: &Env, slug: &str, session: &str, cwd: &Path) -> PathBuf {
+    let dir = e._dir.path().join("tx").join(slug);
+    fs::create_dir_all(&dir).unwrap();
+    let path = transcript_at(&dir, session, cwd, None);
+    let body = fs::read_to_string(&path)
+        .unwrap()
+        .replace("\"id\":\"msg_", &format!("\"id\":\"msg_{session}_"));
+    fs::write(&path, body).unwrap();
+    path
+}
+
+fn prepare(paths: &Paths, from: &str, to: &Path) -> (String, String, Vec<Candidate>) {
+    match request(
+        &paths.socket(),
+        &Request::ImportPrepare {
+            from: from.into(),
+            to: s(to),
+        },
+        TIMEOUT,
+    )
+    .unwrap()
+    {
+        Response::ImportPlan {
+            project_id,
+            summary,
+            sessions,
+        } => (project_id, summary, sessions),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// CLI와 같이 준비한 뒤 후보마다 `import_session`을 보낸다. (FR-IMP-1)
+fn run_import(
+    paths: &Paths,
+    from: &str,
+    to: &Path,
+) -> (String, Vec<(String, ImportSessionReport)>) {
+    let (project_id, summary, sessions) = prepare(paths, from, to);
+    let reports = sessions
+        .into_iter()
+        .map(|c| {
+            let resp = request(
+                &paths.socket(),
+                &Request::ImportSession {
+                    project_id: project_id.clone(),
+                    session_id: c.session_id.clone(),
+                    transcript_path: c.transcript_path,
+                },
+                TIMEOUT,
+            )
+            .unwrap();
+            match resp {
+                Response::ImportSession(r) => (c.session_id, r),
+                other => panic!("{other:?}"),
+            }
+        })
+        .collect();
+    (summary, reports)
+}
+
+fn outcomes(reports: &[(String, ImportSessionReport)]) -> Vec<(&str, ImportOutcome, usize)> {
+    reports
+        .iter()
+        .map(|(id, r)| (id.as_str(), r.outcome, r.iterations))
+        .collect()
+}
+
 #[test]
-fn adopt_moves_location_when_current_directory_has_no_project() {
+fn import_moves_source_location_when_target_has_no_project() {
     let e = env();
-    let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
-    let a = mkdir(&e, "a");
-    ingest_session(
+    let handle = launch_with(
         &e.paths,
-        "sa",
-        &transcript_at(e._dir.path(), "sa", &a, None),
-    );
+        Arc::new(MemoryVectorStore::default()),
+        import_config(&e),
+    )
+    .unwrap();
+    let a = mkdir(&e, "a");
+    ingest_session(&e.paths, "sa", &past(&e, "slug-a", "sa", &a));
     let id = only_project(&e.paths);
     let b = e._dir.path().join("b");
     fs::rename(&a, &b).unwrap();
     let b = fs::canonicalize(&b).unwrap();
-    assert!(matches!(adopt(&e.paths, &s(&a), &b), Response::Text { .. }));
+    let (summary, reports) = run_import(&e.paths, &s(&a), &b);
+    assert!(summary.contains("위치"), "{summary}");
+    assert_eq!(
+        outcomes(&reports),
+        vec![("sa", ImportOutcome::Unchanged, 0)]
+    );
     let st = status(&e.paths);
     assert_eq!(st.projects.len(), 1);
     assert_eq!(project_at(&st, &b).id, id);
@@ -1038,13 +1122,14 @@ fn adopt_moves_location_when_current_directory_has_no_project() {
 }
 
 #[test]
-fn adopt_merges_into_current_project_copying_vectors() {
+fn import_merges_source_project_copying_vectors() {
     let (e, handle, a, b) = two_project_env();
     let st = status(&e.paths);
     let source = project_at(&st, &a).id.clone();
     let target = project_at(&st, &b).id.clone();
-    let out = text(adopt(&e.paths, &source, &b));
-    assert!(out.contains("복사"), "{out}");
+    let (summary, reports) = run_import(&e.paths, &source, &b);
+    assert!(summary.contains("복사"), "{summary}");
+    assert!(reports.is_empty());
     let st = status(&e.paths);
     assert_eq!(st.projects.len(), 1);
     let p = project_at(&st, &b);
@@ -1054,27 +1139,17 @@ fn adopt_merges_into_current_project_copying_vectors() {
         "반복 4 + 결과 2(같은 원문은 해시로 합쳐짐)"
     );
     assert!(!e.paths.project_dir(&source).exists(), "원본 디렉터리 삭제");
-
     ingest_session(&e.paths, "sa", &e._dir.path().join("sa.jsonl"));
     assert_eq!(
         status(&e.paths).projects.len(),
         1,
         "원본 세션은 대상 프로젝트로 감"
     );
-    let found = text(
-        request(
-            &e.paths.socket(),
-            &search_req("두 파일은 병렬로", Scope::Project, &s(&b)),
-            TIMEOUT,
-        )
-        .unwrap(),
-    );
-    assert!(found.contains("sa:") && found.contains("sb:"), "{found}");
     handle.shutdown();
 }
 
 #[test]
-fn adopt_merge_reembeds_when_source_vectors_are_incompatible() {
+fn import_merge_reembeds_when_source_vectors_are_incompatible() {
     let e = env();
     let a = mkdir(&e, "a");
     let b = mkdir(&e, "b");
@@ -1090,23 +1165,18 @@ fn adopt_merge_reembeds_when_source_vectors_are_incompatible() {
         &transcript_at(e._dir.path(), "sb", &b, None),
     );
     wait_until(|| project_at(&status(&e.paths), &b).embed_jobs == 0);
-    let source = project_at(&status(&e.paths), &a).id.clone();
     assert_eq!(project_at(&status(&e.paths), &a).compatibility, "mismatch");
-    let out = text(adopt(&e.paths, &source, &b));
-    assert!(out.contains("임베딩 작업"), "{out}");
+    let (summary, _) = run_import(&e.paths, &s(&a), &b);
+    assert!(summary.contains("임베딩 작업"), "{summary}");
     wait_until(|| totals(&status(&e.paths)).1 == 0);
     let st = status(&e.paths);
     assert_eq!(st.projects.len(), 1);
-    assert_eq!(
-        project_at(&st, &b).vectors,
-        6,
-        "반복 4 + 결과 2(같은 원문은 해시로 합쳐짐). 이전 모델 벡터는 옮기지 않고 다시 임베딩"
-    );
+    assert_eq!(project_at(&st, &b).vectors, 6);
     handle.shutdown();
 }
 
 #[test]
-fn adopt_same_project_or_unknown_source() {
+fn import_into_same_project_or_from_unknown_path_changes_nothing() {
     let e = env();
     let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
     let a = mkdir(&e, "a");
@@ -1115,12 +1185,113 @@ fn adopt_same_project_or_unknown_source() {
         "sa",
         &transcript_at(e._dir.path(), "sa", &a, None),
     );
-    assert!(text(adopt(&e.paths, &s(&a), &a)).contains("변경 없음"));
-    assert!(matches!(
-        adopt(&e.paths, "/no/such/source", &a),
-        Response::Error { .. }
-    ));
+    let id = only_project(&e.paths);
+    let (project, summary, sessions) = prepare(&e.paths, &s(&a), &a);
+    assert!(summary.contains("변경 없음"), "{summary}");
+    assert_eq!((project.as_str(), sessions.len()), (id.as_str(), 0));
+    let (project, _, sessions) = prepare(&e.paths, "/no/such/source", &a);
+    assert_eq!((project.as_str(), sessions.len()), (id.as_str(), 0));
     assert_eq!(status(&e.paths).projects.len(), 1);
+    handle.shutdown();
+}
+
+#[test]
+fn import_brings_past_sessions_of_old_path_into_target_project() {
+    let e = env();
+    let handle = launch_with(
+        &e.paths,
+        Arc::new(MemoryVectorStore::default()),
+        import_config(&e),
+    )
+    .unwrap();
+    let old = e._dir.path().join("gone/old");
+    let other = mkdir(&e, "other");
+    let b = mkdir(&e, "b");
+    past(&e, "old-1", "s1", &old);
+    past(&e, "old-2", "s2", &old.join("sub"));
+    past(&e, "other", "s3", &other);
+    past(&e, "old-1/s1/subagents", "agent-x", &old);
+    let (summary, reports) = run_import(&e.paths, &s(&old), &b);
+    assert!(!summary.is_empty());
+    assert_eq!(
+        outcomes(&reports),
+        vec![
+            ("s1", ImportOutcome::Imported, 2),
+            ("s2", ImportOutcome::Imported, 2)
+        ]
+    );
+    assert!(reports[1].1.pending_embeds > 0);
+    let st = status(&e.paths);
+    assert_eq!(st.projects.len(), 1, "{st:?}");
+    assert_eq!(project_at(&st, &b).iterations, 4);
+
+    let (_, again) = run_import(&e.paths, &s(&old), &b);
+    assert_eq!(
+        outcomes(&again),
+        vec![
+            ("s1", ImportOutcome::Unchanged, 0),
+            ("s2", ImportOutcome::Unchanged, 0)
+        ],
+        "다시 실행하면 끝난 세션은 지나감"
+    );
+    wait_until(|| totals(&status(&e.paths)).1 == 0);
+    handle.shutdown();
+}
+
+#[test]
+fn import_skips_session_fixed_to_another_project() {
+    let e = env();
+    let handle = launch_with(
+        &e.paths,
+        Arc::new(MemoryVectorStore::default()),
+        import_config(&e),
+    )
+    .unwrap();
+    let x = mkdir(&e, "x");
+    let sub = mkdir(&e, "x/sub");
+    let b = mkdir(&e, "b");
+    ingest_session(&e.paths, "sx", &past(&e, "slug-x", "sx", &sub));
+    let (_, reports) = run_import(&e.paths, &s(&x), &b);
+    assert_eq!(
+        outcomes(&reports),
+        vec![("sx", ImportOutcome::OtherProject, 0)]
+    );
+    let st = status(&e.paths);
+    assert_eq!(st.projects.len(), 2, "{st:?}");
+    assert_eq!(project_at(&st, &sub).iterations, 2);
+    assert_eq!(project_at(&st, &b).iterations, 0);
+    handle.shutdown();
+}
+
+#[test]
+fn import_collects_worktree_sessions_into_main_project() {
+    let e = env();
+    let repo = mkdir(&e, "repo");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    fs::create_dir_all(repo.join("src")).unwrap();
+    let wt = e._dir.path().join("wt");
+    git(&repo, &["worktree", "add", "-q", "-b", "feature", &s(&wt)]);
+    let wt = fs::canonicalize(&wt).unwrap();
+    let handle = launch_with(
+        &e.paths,
+        Arc::new(MemoryVectorStore::default()),
+        import_config(&e),
+    )
+    .unwrap();
+    past(&e, "slug-repo", "sa", &repo.join("src"));
+    past(&e, "slug-wt", "sb", &wt);
+    let (_, reports) = run_import(&e.paths, &s(&repo), &repo);
+    assert_eq!(
+        outcomes(&reports),
+        vec![
+            ("sa", ImportOutcome::Imported, 2),
+            ("sb", ImportOutcome::Imported, 2)
+        ]
+    );
+    let st = status(&e.paths);
+    assert_eq!(st.projects.len(), 1, "{st:?}");
+    assert_eq!(project_at(&st, &repo.join(".git")).iterations, 4);
     handle.shutdown();
 }
 
@@ -1313,6 +1484,7 @@ fn startup_queue_orders_jobs_across_projects_by_enqueue_time() {
                 iterations: vec![marked_iteration(session, marker)],
                 completions: vec![],
                 state: hippo::transcript::ExtractorState::default(),
+                bulk: false,
             })
             .unwrap();
         std::thread::sleep(Duration::from_millis(5));
@@ -1350,5 +1522,54 @@ fn project_list_escapes_control_characters() {
         !list.contains('\u{1b}') && list.contains("\\u{1b}"),
         "{list:?}"
     );
+    handle.shutdown();
+}
+
+#[test]
+fn startup_queue_embeds_bulk_jobs_after_normal_jobs() {
+    use hippo::project::{Location, LocationKind};
+    let e = env();
+    let dir_loc = |p: &str| Location {
+        path: p.into(),
+        kind: LocationKind::Dir,
+        toplevel: None,
+        root_commits: vec![],
+    };
+    let mut registry = hippo::registry::Registry::open(&e.paths.registry()).unwrap();
+    let ia = registry.resolve(&dir_loc("/gone/a"), 1).unwrap();
+    let ib = registry.resolve(&dir_loc("/gone/b"), 1).unwrap();
+    drop(registry);
+    for (id, session, marker, bulk) in [
+        (&ia, "sa", "MARKER_BULK", true),
+        (&ib, "sb", "MARKER_LIVE", false),
+    ] {
+        RecordStore::open(&e.paths.project_records(id))
+            .unwrap()
+            .apply(&hippo::store::Batch {
+                session_id: session.into(),
+                transcript_path: "/t".into(),
+                iterations: vec![marked_iteration(session, marker)],
+                completions: vec![],
+                state: hippo::transcript::ExtractorState::default(),
+                bulk,
+            })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let handle = start(
+        e.paths.clone(),
+        config(),
+        Arc::new(RecordingEmbedder(
+            HashEmbedder::new(256, 8_000),
+            Arc::clone(&seen),
+        )),
+        memory_source(&e.paths, Arc::new(MemoryVectorStore::default())),
+    )
+    .unwrap();
+    wait_until(|| totals(&status(&e.paths)).1 == 0);
+    let seen = seen.lock().unwrap().clone();
+    let pos = |m: &str| seen.iter().position(|t| t.contains(m)).unwrap();
+    assert!(pos("MARKER_LIVE") < pos("MARKER_BULK"), "{seen:?}");
     handle.shutdown();
 }

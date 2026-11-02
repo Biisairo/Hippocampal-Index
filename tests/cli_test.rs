@@ -41,11 +41,19 @@ impl Drop for Daemon {
     }
 }
 
+/// 테스트 데몬이 읽는 과거 transcript 디렉터리. 실제 `~/.claude/projects`를 읽지 않는다.
+fn transcripts_dir(root: &Path) -> std::path::PathBuf {
+    root.parent().unwrap().join("tx")
+}
+
 fn spawn_daemon(root: &Path) -> Daemon {
     fs::create_dir_all(root).unwrap();
     fs::write(
         root.join("config.toml"),
-        "[embedder]\nbackend = \"hash\"\ndimension = 64\n[vector]\nbackend = \"memory\"\n",
+        format!(
+            "[embedder]\nbackend = \"hash\"\ndimension = 64\n[vector]\nbackend = \"memory\"\n[import]\ntranscripts_dir = \"{}\"\n",
+            transcripts_dir(root).to_string_lossy()
+        ),
     )
     .unwrap();
     let child = Command::new(BIN)
@@ -327,7 +335,7 @@ fn cli_autostarts_daemon_which_exits_when_idle() {
         .unwrap(),
     )
     .unwrap();
-    let input = serde_json::json!({"session_id": "afd070e6-4625-4b31-8c43-f1f553949222", "transcript_path": transcript, "cwd": "/w"}).to_string();
+    let input = serde_json::json!({"session_id": "afd070e6-4625-4b31-8c43-f1f553949222", "transcript_path": transcript, "cwd": "/w", "prompt_id": "8f64252a-0037-484d-a451-35aa2c0076ed"}).to_string();
     let hook = hippo(&root, &["hook", "stop"], &input);
     assert!(hook.status.success());
     assert!(
@@ -383,8 +391,8 @@ fn project_commands_and_scopes_use_current_directory() {
         })
         .collect();
     let transcript = dir.path().join("s.jsonl");
-    fs::write(&transcript, body).unwrap();
-    let input = serde_json::json!({"session_id": "afd070e6-4625-4b31-8c43-f1f553949222", "transcript_path": transcript, "cwd": work}).to_string();
+    fs::write(&transcript, &body).unwrap();
+    let input = serde_json::json!({"session_id": "afd070e6-4625-4b31-8c43-f1f553949222", "transcript_path": transcript, "cwd": work, "prompt_id": "8f64252a-0037-484d-a451-35aa2c0076ed"}).to_string();
     assert!(hippo(&root, &["hook", "stop"], &input).status.success());
 
     let list = stdout(&hippo(&root, &["project", "list"], ""));
@@ -421,15 +429,35 @@ fn project_commands_and_scopes_use_current_directory() {
     ));
     assert!(shown.contains("[1]"), "{shown}");
 
-    let same = stdout(&hippo_in(&root, &work, &["project", "adopt", "."], ""));
-    assert!(same.contains("변경 없음"), "{same}");
-    let unknown = hippo_in(&root, &work, &["project", "adopt", "/no/such/source"], "");
-    assert_eq!(unknown.status.code(), Some(1));
+    let past_dir = transcripts_dir(&root).join("slug");
+    fs::create_dir_all(&past_dir).unwrap();
+    let past = body
+        .replace("afd070e6-4625-4b31-8c43-f1f553949222", "old-session")
+        .replace("\"id\":\"msg_", "\"id\":\"msg_old_")
+        .replace(
+            &*work.to_string_lossy(),
+            &work.join("sub").to_string_lossy(),
+        );
+    fs::write(past_dir.join("old-session.jsonl"), past).unwrap();
+    let imported = stdout(&hippo_in(&root, &work, &["import"], ""));
+    assert!(
+        imported.contains("[1/1] old-sess 가져옴 반복 2"),
+        "{imported}"
+    );
+    let again = stdout(&hippo_in(&root, &work, &["import", "--from", "."], ""));
+    assert!(again.contains("[1/1] old-sess 변경 없음"), "{again}");
+    let unknown = stdout(&hippo_in(
+        &root,
+        &work,
+        &["import", "--from", "/no/such/source"],
+        "",
+    ));
+    assert!(!unknown.contains("[1/"), "{unknown}");
 
     assert!(hippo(&root, &["reindex"], "").status.success());
     let status = stdout(&hippo(&root, &["status"], ""));
     assert!(
-        status.contains("projects: 1") && status.contains("iterations: 2"),
+        status.contains("projects: 1") && status.contains("iterations: 4"),
         "{status}"
     );
 }

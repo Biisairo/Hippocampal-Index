@@ -1,8 +1,11 @@
 //! 데몬 소켓 요청과 응답. 연결 하나에 JSON 한 줄씩 주고받는다. (IF-SK-1, IF-SK-2)
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
-use crate::ingest::IngestRequest;
+use crate::import::Candidate;
+use crate::ingest::{ImportOutcome, IngestRequest};
 use crate::search::{SearchKind, escape_control};
 
 /// 요청이 다룰 프로젝트. `Project`는 요청의 `cwd`가 속한 프로젝트, `Path`는 그 경로가 속한 프로젝트이다. (IF-CLI-1)
@@ -43,10 +46,27 @@ pub enum Request {
         cwd: String,
     },
     ProjectList,
-    ProjectAdopt {
-        source: String,
-        cwd: String,
+    /// 원본·대상 프로젝트를 정하고 후보 세션을 돌려준다. (FR-PRJ-7, FR-IMP-2)
+    ImportPrepare {
+        from: String,
+        to: String,
     },
+    /// 세션 하나를 가져온다. (FR-IMP-3)
+    ImportSession {
+        project_id: String,
+        session_id: String,
+        transcript_path: PathBuf,
+    },
+}
+
+/// `import_session`의 응답. (FR-IMP-7)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportSessionReport {
+    pub outcome: ImportOutcome,
+    pub iterations: usize,
+    pub completions: usize,
+    pub fork_skipped: usize,
+    pub pending_embeds: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,10 +95,22 @@ pub struct StatusInfo {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     Done,
-    Text { text: String },
-    Inject { context: Option<String> },
+    Text {
+        text: String,
+    },
+    Inject {
+        context: Option<String>,
+    },
     Status(StatusInfo),
-    Error { message: String },
+    ImportPlan {
+        project_id: String,
+        summary: String,
+        sessions: Vec<Candidate>,
+    },
+    ImportSession(ImportSessionReport),
+    Error {
+        message: String,
+    },
 }
 
 impl StatusInfo {

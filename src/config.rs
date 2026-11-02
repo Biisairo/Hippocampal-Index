@@ -89,6 +89,13 @@ pub struct ProjectSection {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ImportSection {
+    /// 과거 transcript를 찾는 디렉터리. (FR-IMP-2)
+    pub transcripts_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PatternEntry {
     pub kind: String,
@@ -113,6 +120,7 @@ pub struct Config {
     pub redact: RedactConfig,
     pub daemon: DaemonSection,
     pub project: ProjectSection,
+    pub import: ImportSection,
 }
 
 impl Config {
@@ -282,6 +290,17 @@ impl Default for ProjectSection {
     fn default() -> Self {
         Self {
             git_timeout_ms: 1_000,
+        }
+    }
+}
+
+impl Default for ImportSection {
+    fn default() -> Self {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        Self {
+            transcripts_dir: home.join(".claude").join("projects"),
         }
     }
 }

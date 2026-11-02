@@ -10,10 +10,11 @@ use hippo::client::{
 };
 use hippo::config::{Config, Paths};
 use hippo::daemon;
+use hippo::ingest::ImportOutcome;
 use hippo::install::{Action, Scope, apply, target_file};
-use hippo::protocol::{Request, Response, Scope as QueryScope};
+use hippo::protocol::{ImportSessionReport, Request, Response, Scope as QueryScope};
 use hippo::registry::is_project_id;
-use hippo::search::SearchKind;
+use hippo::search::{SearchKind, escape_control};
 use hippo::setup::{hooks_config, launchd_plist};
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -67,9 +68,18 @@ enum Command {
         #[arg(long, default_value = SCOPE_ALL)]
         scope: String,
     },
-    /// 프로젝트 목록과 가져오기
+    /// 프로젝트 목록
     #[command(subcommand)]
     Project(ProjectCommand),
+    /// 과거 세션 기록을 프로젝트로 가져온다. 생략한 인자는 현재 디렉터리이다.
+    Import {
+        /// 가져올 기록의 경로(이전 경로 가능) 또는 프로젝트 id
+        #[arg(long)]
+        from: Option<String>,
+        /// 기록을 넣을 프로젝트의 경로
+        #[arg(long)]
+        to: Option<String>,
+    },
     /// settings.json에 넣을 hook 설정
     HooksConfig,
     /// launchd plist
@@ -84,8 +94,6 @@ enum Command {
 enum ProjectCommand {
     /// 프로젝트 목록
     List,
-    /// 원본 프로젝트(id 또는 이전 경로)의 기록을 현재 디렉터리의 프로젝트로 가져온다.
-    Adopt { source: String },
 }
 
 const SCOPE_PROJECT: &str = "project";
@@ -189,15 +197,8 @@ fn main() -> ExitCode {
             Err(e) => fail(&e),
         },
         Command::Project(ProjectCommand::List) => query_daemon(&paths, &Request::ProjectList),
-        Command::Project(ProjectCommand::Adopt { source }) => match current_dir() {
-            Ok(cwd) => {
-                let source = if is_project_id(&source) {
-                    source
-                } else {
-                    absolute(&cwd, &source)
-                };
-                query_daemon(&paths, &Request::ProjectAdopt { source, cwd })
-            }
+        Command::Import { from, to } => match current_dir() {
+            Ok(cwd) => run_import(&paths, &cwd, from, to),
             Err(e) => fail(&e),
         },
         Command::Daemon => run_daemon(paths),
@@ -318,6 +319,118 @@ fn query_daemon(paths: &Paths, req: &Request) -> ExitCode {
         Ok(Response::Error { message }) => fail(&message),
         Ok(other) => fail(&format!("unexpected response: {other:?}")),
         Err(e) => fail(&e.to_string()),
+    }
+}
+
+/// 준비 요청으로 후보를 받고, 세션마다 요청을 하나씩 보내며 진행률을 출력한다. (FR-IMP-1)
+fn run_import(paths: &Paths, cwd: &str, from: Option<String>, to: Option<String>) -> ExitCode {
+    let from = match from {
+        Some(f) if is_project_id(&f) => f,
+        Some(f) => absolute(cwd, &f),
+        None => cwd.to_string(),
+    };
+    let to = to.map_or_else(|| cwd.to_string(), |t| absolute(cwd, &t));
+    let config = match Config::load(&paths.config()) {
+        Ok(c) => c,
+        Err(e) => return fail(&e.to_string()),
+    };
+    ensure_daemon(paths, launcher(&config), STARTUP_WAIT);
+    let (project_id, summary, sessions) = match request(
+        &paths.socket(),
+        &Request::ImportPrepare { from, to },
+        QUERY_TIMEOUT,
+    ) {
+        Ok(Response::ImportPlan {
+            project_id,
+            summary,
+            sessions,
+        }) => (project_id, summary, sessions),
+        Ok(Response::Error { message }) => return fail(&message),
+        Ok(other) => return fail(&format!("unexpected response: {other:?}")),
+        Err(e) => return fail(&e.to_string()),
+    };
+    print!("{}", escape_control(&summary));
+    let total = sessions.len();
+    println!("후보 세션 {total}개");
+    let mut tally = ImportTally::default();
+    for (n, c) in sessions.into_iter().enumerate() {
+        let short: String = c.session_id.chars().take(SESSION_ID_SHORT).collect();
+        let req = Request::ImportSession {
+            project_id: project_id.clone(),
+            session_id: c.session_id,
+            transcript_path: c.transcript_path,
+        };
+        let line = match request(&paths.socket(), &req, QUERY_TIMEOUT) {
+            Ok(Response::ImportSession(r)) => {
+                tally.add(&r);
+                format!(
+                    "{} 반복 {}  남은 임베딩 {}",
+                    outcome_label(r.outcome),
+                    r.iterations,
+                    r.pending_embeds
+                )
+            }
+            Ok(Response::Error { message }) => {
+                tally.errors += 1;
+                format!("오류: {message}")
+            }
+            Ok(other) => return fail(&format!("unexpected response: {other:?}")),
+            Err(e) => return fail(&e.to_string()),
+        };
+        println!(
+            "{}",
+            escape_control(&format!("[{}/{total}] {short} {line}", n + 1))
+        );
+    }
+    println!(
+        "합계: 세션 {total}개 중 가져옴 {}, 변경 없음 {}, 다른 프로젝트 {}, 오류 {}. 반복 {}개 저장, fork 복사본 {}개 건너뜀.",
+        tally.imported,
+        tally.unchanged,
+        tally.other,
+        tally.errors,
+        tally.iterations,
+        tally.fork_skipped
+    );
+    if tally.pending_embeds > 0 {
+        println!(
+            "남은 임베딩 작업 {}개는 데몬이 계속 처리합니다. 진행 상태는 `hippo status`로 확인할 수 있습니다.",
+            tally.pending_embeds
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+const SESSION_ID_SHORT: usize = 8;
+
+#[derive(Default)]
+struct ImportTally {
+    imported: usize,
+    unchanged: usize,
+    other: usize,
+    errors: usize,
+    iterations: usize,
+    fork_skipped: usize,
+    pending_embeds: u64,
+}
+
+impl ImportTally {
+    fn add(&mut self, r: &ImportSessionReport) {
+        match r.outcome {
+            ImportOutcome::Imported => self.imported += 1,
+            ImportOutcome::Unchanged => self.unchanged += 1,
+            ImportOutcome::OtherProject => self.other += 1,
+        }
+        self.iterations += r.iterations;
+        self.fork_skipped += r.fork_skipped;
+        self.pending_embeds = r.pending_embeds;
+    }
+}
+
+fn outcome_label(outcome: ImportOutcome) -> &'static str {
+    match outcome {
+        ImportOutcome::Imported => "가져옴",
+        ImportOutcome::Unchanged => "변경 없음",
+        ImportOutcome::OtherProject => "다른 프로젝트",
     }
 }
 

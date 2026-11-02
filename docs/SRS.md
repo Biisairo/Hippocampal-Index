@@ -2,7 +2,7 @@
 
 | 항목 | 값 |
 |------|----|
-| 문서 버전 | 0.2 (프로젝트별 저장공간 분리) |
+| 문서 버전 | 0.3 (실시간 수집 기준 턴, 과거 기록 가져오기) |
 | 작성일 | 2026-11-02 |
 | 작성자 | biisairo |
 | 준거 표준 | ISO/IEC/IEEE 29148:2018 |
@@ -51,6 +51,10 @@
 | 세션 시작 경로 | transcript에서 `cwd` 필드를 가진 첫 라인의 `cwd`. 세션 중 `cd`로 바뀐 경로가 아니다. |
 | 프로젝트 위치 | 경로가 git 작업 트리 안이면 그 저장소의 git common dir(`git rev-parse --path-format=absolute --git-common-dir`), 아니면 경로 자체. 원본 작업 트리와 그 모든 worktree는 같은 common dir을 가지므로 같은 위치가 된다. 위치는 프로젝트마다 1개이며, 경로 목록이나 경로→프로젝트 라우팅은 기록하지 않는다. |
 | 루트 커밋 | `git rev-list --max-parents=0 HEAD`가 돌려주는 부모 없는 커밋. 저장소에 따라 없거나 여러 개일 수 있다. |
+| 기준 턴 | 처음 보는 세션의 처리 요청에 담긴 hook 입력의 `prompt_id`가 가리키는 턴. 실시간 수집은 이 턴의 첫 라인부터 시작한다(FR-EXT-12). |
+| 시작 offset | 세션의 기록을 저장하기 시작한 transcript 위치. 실시간 수집으로 처음 본 세션은 기준 턴의 첫 라인 위치이고, 처음부터 가져온 세션은 0이다. |
+| 가져오기 (import) | 과거 transcript를 읽어 지정한 프로젝트에 기록을 추가하는 작업(3.2.11). |
+| fork 복사본 | `--fork-session` 등으로 만든 새 세션 transcript에 복사된 이전 세션의 라인. `sessionId`만 새 값이고 `uuid`와 `message.id`는 원본과 같다(부록 A). |
 
 ### 1.4 참조 문서
 - [R1] Claude Code Hooks reference — https://code.claude.com/docs/en/hooks
@@ -102,6 +106,8 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 - A-4 백그라운드 shell의 `<output-file>`은 `/private/tmp` 아래에 있으며 이후 삭제될 수 있다.
 - A-5 git 정보는 `git` 실행 파일로 얻는다. `git`이 없거나 실행이 실패하거나 시간 제한(설정 `[project] git_timeout_ms`, 기본 1,000)을 넘으면 git이 아닌 경로로 본다.
 - A-6 transcript의 `user`, `assistant` 라인에는 그 시점의 `cwd`가 있다. (부록 A)
+- A-7 `message.id`는 API 응답마다 고유하다. 다른 세션의 transcript에 같은 `message.id`가 나오는 경우는 fork 복사본뿐이다. (부록 A)
+- A-8 Claude Code transcript는 `<transcripts 디렉터리>/<slug>/<session_id>.jsonl`에 있고, 서브에이전트 transcript는 `<slug>/<session_id>/subagents/` 아래에 있다. `--resume`과 `--continue`는 같은 파일에 이어 쓴다. (부록 A)
 
 ### 2.6 비목표
 - 서브에이전트 내부 반복 저장 (서브에이전트의 최종 보고만 결과로 저장한다)
@@ -111,7 +117,10 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 - 보존 기간과 자동 삭제 정책
 - MCP 도구 제공
 - 단일 저장소 배치(v0.1, `~/.hippo/records.sqlite`)의 데이터를 프로젝트별 배치로 옮기는 마이그레이션 (v0.1 데이터는 남아 있지 않다)
-- 경로를 다른 프로젝트로 보내는 영구 라우팅 표 (경로가 바뀌면 FR-PRJ-7의 adopt로 기록을 현재 경로의 프로젝트로 가져온다)
+- 경로를 다른 프로젝트로 보내는 영구 라우팅 표 (경로가 바뀌면 `hippo import --from <이전 경로>`로 기록을 현재 경로의 프로젝트로 가져온다)
+- 실시간 수집에서 기준 턴 앞의 기록 저장 (과거 기록은 `hippo import`로만 가져온다)
+- 가져오기의 날짜 범위 지정, 경로가 없어진 과거 세션의 프로젝트 자동 추정
+- 서브에이전트 transcript(`subagents/`) 가져오기 (메인 transcript의 보고만 결과로 저장한다)
 - 프로젝트 사이의 결과 원문 중복 제거 (중복 제거는 프로젝트 안에서만 한다)
 
 ---
@@ -134,20 +143,21 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 #### 3.1.2 CLI 인터페이스
 | ID | 요구사항 | 우선순위 |
 |----|----------|----------|
-| IF-CLI-1 | `hippo search <query> [--scope project\|all\|<path>] [--kind iteration\|result\|both] [--limit N]`는 검색 결과를 사람이 읽을 수 있는 텍스트로 출력해야 한다. 기본값은 `--scope project --kind iteration --limit 10`이다. `project`는 현재 디렉터리가 속한 프로젝트, `<path>`는 그 경로가 속한 프로젝트이다(FR-PRJ-5). `search`, `show`, `status`, `reindex`, `project`는 데몬에 요청하며 클라이언트의 현재 디렉터리를 함께 보낸다. 데몬이 없으면 FR-DMN-7에 따라 띄운 뒤 요청하며, 그래도 응답이 없으면 오류 메시지를 stderr에 출력하고 종료 코드 1로 끝난다. | M |
+| IF-CLI-1 | `hippo search <query> [--scope project\|all\|<path>] [--kind iteration\|result\|both] [--limit N]`는 검색 결과를 사람이 읽을 수 있는 텍스트로 출력해야 한다. 기본값은 `--scope project --kind iteration --limit 10`이다. `project`는 현재 디렉터리가 속한 프로젝트, `<path>`는 그 경로가 속한 프로젝트이다(FR-PRJ-5). `search`, `show`, `status`, `reindex`, `project`, `import`는 데몬에 요청하며 클라이언트의 현재 디렉터리를 함께 보낸다. 데몬이 없으면 FR-DMN-7에 따라 띄운 뒤 요청하며, 그래도 응답이 없으면 오류 메시지를 stderr에 출력하고 종료 코드 1로 끝난다. | M |
 | IF-CLI-2 | `hippo show <prompt_id> [--scope project\|<path>]`는 해당 턴의 반복을 순서대로 복원해 출력해야 한다. `--with-results` 옵션을 주면 연결된 결과 원문도 출력한다. 프로젝트를 찾는 순서는 FR-RET-7을 따른다. | M |
 | IF-CLI-3 | `hippo daemon`은 데몬을 포그라운드로 실행해야 한다. | M |
 | IF-CLI-4 | `hippo launchd-plist`는 데몬 자동 실행용 launchd plist를 stdout에 출력해야 한다. 데몬이 유휴 종료(정상 종료)한 뒤 바로 다시 띄우지 않도록, 비정상 종료일 때만 재시작하게 설정한다. | S |
 | IF-CLI-6 | `hippo install --scope user\|project [--project <경로>] [--dry-run]`는 hook 설정을 Claude Code 설정 파일에 병합해야 한다. `hippo uninstall`은 같은 옵션으로 hippo hook만 제거해야 한다. | M |
 | IF-CLI-5 | `hippo status`는 데몬 상태, 스풀 대기 건수, 재색인 상태와 프로젝트별 표(id, 위치와 위치 존재 여부, 반복 수, 결과 수, 임베딩 대기 건수, 벡터 수, 호환성)를 출력해야 한다. | S |
 | IF-CLI-7 | `hippo reindex [--scope all\|project\|<path>]`는 재색인을 요청해야 한다. 기본값은 `all`이다. | M |
-| IF-CLI-8 | `hippo project list`는 FR-PRJ-6의 목록을, `hippo project adopt <프로젝트 id 또는 경로>`는 FR-PRJ-7의 가져오기를 실행해야 한다. | M |
+| IF-CLI-8 | `hippo project list`는 FR-PRJ-6의 목록을 출력해야 한다. | M |
+| IF-CLI-9 | `hippo import [--from <경로 또는 프로젝트 id>] [--to <경로>]`는 FR-IMP-1~7의 가져오기를 실행해야 한다. 생략한 인자는 현재 디렉터리이다. | M |
 
 #### 3.1.3 데몬 소켓 인터페이스
 | ID | 요구사항 | 우선순위 |
 |----|----------|----------|
 | IF-SK-1 | 데몬은 `~/.hippo/hippo.sock` Unix socket으로 줄 단위 JSON 요청과 응답을 주고받아야 한다. | M |
-| IF-SK-2 | 요청 종류는 `ingest`(hook 이벤트 전달), `inject`(자동 주입 텍스트 생성), `search`, `show`, `status`, `reindex`, `project_list`, `project_adopt`이다. `ingest`를 뺀 요청은 판정에 쓸 `cwd`를 담는다. 연결 하나에 요청 하나, 응답 하나를 주고받는다. | M |
+| IF-SK-2 | 요청 종류는 `ingest`(hook 이벤트 전달), `inject`(자동 주입 텍스트 생성), `search`, `show`, `status`, `reindex`, `project_list`, `import_prepare`, `import_session`이다. `ingest`를 뺀 요청은 판정에 쓸 `cwd`를 담는다. 연결 하나에 요청 하나, 응답 하나를 주고받는다. | M |
 
 #### 3.1.4 Skill
 | ID | 요구사항 | 우선순위 |
@@ -163,13 +173,15 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 | FR-CAP-2 | `PostToolBatch`(메인 루프)를 받으면 해당 세션에 대해 transcript 처리와 batch 완료 판정(FR-EXT-7 b)을 요청해야 한다. | M |
 | FR-CAP-3 | `Stop`과 `StopFailure`(메인 루프)를 받으면 해당 세션에 대해 transcript 처리를 요청하고, 마지막 반복을 완료로 확정해야 한다. | M |
 | FR-CAP-4 | `SessionEnd`를 받으면 해당 세션의 미처리 transcript 라인을 모두 처리하고, 처리 후에도 반복에 붙지 않은 반복 입력은 버려야 한다. 완료 알림은 FR-BG-2에 따라 이미 처리된 상태다. | M |
-| FR-CAP-5 | hook 클라이언트는 데몬에 연결할 수 없으면 요청을 스풀 파일(`spool/pending.jsonl`, 권한 0600)에 한 줄로 추가하고 종료해야 한다. 스풀에는 이벤트, `session_id`, `transcript_path`만 기록한다. | M |
+| FR-CAP-5 | hook 클라이언트는 데몬에 연결할 수 없으면 요청을 스풀 파일(`spool/pending.jsonl`, 권한 0600)에 한 줄로 추가하고 종료해야 한다. 스풀에는 이벤트, `session_id`, `transcript_path`, `prompt_id`(hook 입력에 있을 때)만 기록한다. | M |
+| FR-CAP-7 | 수집 처리 요청은 hook 입력의 `prompt_id`를 담아야 한다. 입력에 없으면 비워 둔다. | M |
 | FR-CAP-6 | 데몬은 시작할 때 스풀에 쌓인 요청을 기록 순서대로 처리해야 한다. 처리 전에 스풀 파일 이름을 바꿔, 처리 중에 새로 들어오는 요청이 새 스풀 파일에 쌓이게 한다. 이전 실행에서 처리하지 못한 이름 바뀐 스풀 파일이 있으면 먼저 처리한다. | M |
 
 #### 3.2.2 transcript 해석 (EXT)
 | ID | 요구사항 | 우선순위 |
 |----|----------|----------|
-| FR-EXT-1 | 데몬은 세션마다(세션이 고정된 프로젝트 저장소에) 안전 offset과 해석기 상태(턴별 다음 `iteration_index` 등)를 저장하고, 안전 offset 뒤의 라인만 읽어야 한다. 안전 offset은 아직 완료되지 않은 반복이나 아직 반복에 붙지 않은 반복 입력이 시작되는 라인 앞이며, 그런 것이 없으면 마지막으로 읽은 라인 끝이다. offset은 완료된 반복의 DB 반영이 끝난 뒤에만 갱신한다. 개행으로 끝나지 않은 마지막 라인은 기록 중인 것으로 보고 읽지 않는다. transcript 길이가 안전 offset보다 짧으면(파일이 다시 쓰인 경우) 상태를 초기화하고 처음부터 다시 읽는다. 이때 FR-EXT-10에 따라 중복 행은 생기지 않는다. | M |
+| FR-EXT-1 | 데몬은 세션마다(세션이 고정된 프로젝트 저장소에) 안전 offset, 시작 offset, 해석기 상태(턴별 다음 `iteration_index` 등)를 저장하고, 안전 offset 뒤의 라인만 읽어야 한다. 안전 offset은 아직 완료되지 않은 반복이나 아직 반복에 붙지 않은 반복 입력이 시작되는 라인 앞이며, 그런 것이 없으면 마지막으로 읽은 라인 끝이다. offset은 완료된 반복의 DB 반영이 끝난 뒤에만 갱신한다. 개행으로 끝나지 않은 마지막 라인은 기록 중인 것으로 보고 읽지 않는다. transcript 길이가 안전 offset보다 짧으면(파일이 다시 쓰인 경우) 상태를 지우고 처음 보는 세션으로 처리한다(FR-EXT-12). 이때 FR-EXT-10에 따라 중복 행은 생기지 않는다. | M |
+| FR-EXT-12 | 실시간 수집에서 세션 상태가 없으면(처음 보는 세션) transcript에서 `promptId`가 요청의 `prompt_id`와 같은 첫 user 라인을 찾아, 그 라인의 시작 위치를 안전 offset과 시작 offset으로 삼아 읽어야 한다. 그 앞의 라인은 저장하지 않는다. 요청에 `prompt_id`가 없거나 그런 라인이 아직 없으면 아무것도 처리하지 않고 상태도 저장하지 않는다. 설치 전 세션의 재개, fork 세션, 설치 때 이미 열려 있던 세션은 이 규칙에 따라 기준 턴부터 저장된다. | M |
 | FR-EXT-2 | `type == "assistant"` 라인을 `message.id`로 묶어 반복 1개로 만들어야 한다. | M |
 | FR-EXT-3 | 반복에서 `text` 블록은 저장하고, `thinking` 블록은 저장하지 않아야 한다. | M |
 | FR-EXT-4 | 반복의 `tool_use` 블록마다 `name`, `input`, `id`를 저장해야 한다. | M |
@@ -195,13 +207,13 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 #### 3.2.4 저장 (STO)
 | ID | 요구사항 | 우선순위 |
 |----|----------|----------|
-| FR-STO-1 | 원본 저장소의 `iterations` 테이블에 반복마다 행 1개를 저장해야 한다. 필드: `id`(`<session_id>:<message_id>`), `session_id`, `prompt_id`, `message_id`, `iteration_index`(턴 안 순번), `cwd`, `ts`, `inputs`(JSON), `tool_calls`(JSON: `id`, `name`, `input`, `is_error`. 결과 원문은 넣지 않는다), `response_text`, `embed_text`. 반복과 결과의 연결은 `iteration_results`(`iteration_id`, `tool_use_id`, `result_id`)에 저장한다. 벡터 저장소에는 `id`, `vector`, `embed_model`과 필터용 메타데이터(`cwd`, `session_id`, `ts`)를 저장한다. | M |
+| FR-STO-1 | 원본 저장소의 `iterations` 테이블에 반복마다 행 1개를 저장해야 한다. 필드: `id`(`<session_id>:<message_id>`), `session_id`, `prompt_id`, `message_id`, `iteration_index`(턴 안 순번), `cwd`, `ts`, `inputs`(JSON), `tool_calls`(JSON: `id`, `name`, `input`, `is_error`. 결과 원문은 넣지 않는다), `response_text`, `embed_text`. 반복과 결과의 연결은 `iteration_results`(`iteration_id`, `tool_use_id`, `result_id`)에 저장한다. 벡터 저장소에는 `id`, `vector`, `embed_model`과 필터용 메타데이터(`cwd`, `session_id`, `ts`)를 저장한다. `ts`는 반복 시각(FR-EXT-11)이며 가져오기에서도 transcript의 원래 값을 쓴다. 자동 주입(FR-RET-4)과 `show` 출력에 이 시각을 표시해 같은 주제의 기록 사이 선후를 알 수 있게 한다. | M |
 | FR-STO-2 | `embed_text`는 다음 순서로 만든다. 비어 있는 섹션은 넣지 않는다.<br>`[입력] <반복 입력>` (입력마다 1줄. 완료 알림은 `<status>: <summary>`)<br>`[툴] <name>(<input compact JSON>)` (호출마다 1줄. JSON이 설정 길이(기본 500자)를 넘으면 그 길이에서 자르고 `…`를 붙인다. 원문 입력은 `tool_calls`에 그대로 남는다)<br>`[응답] <text 블록을 개행으로 이어 붙임>` | M |
 | FR-STO-3 | 원본 저장소의 `results` 테이블에 결과 원문을 원문 단위로 저장해야 한다. 필드: `id`(원문의 SHA-256 hex), `tool_name`(처음 저장한 도구), `text`, `first_seen_ts`. 빈 원문은 저장하지 않는다. 벡터는 벡터 저장소에 청크 단위로 저장한다. | M |
 | FR-STO-4 | 같은 프로젝트 저장소에 같은 `content_hash`가 이미 있으면 결과를 새로 저장하거나 임베딩하지 않고 기존 결과 id를 반복에 연결해야 한다. | M |
 | FR-STO-5 | 결과 원문이나 반복의 `embed_text`가 청크 한도를 넘으면 여러 청크로 나눠 청크마다 벡터를 만들어야 한다. 청크 한도(문자 수)는 임베더의 `max_input_tokens()`와 설정값(기본 8,000) 중 작은 값에 `chars_per_token`(기본 1.0)을 곱한 값이다. 청크는 한도 안에서 마지막 개행 위치에서 나누고, 개행이 없으면 한도에서 나눈다. 청크를 순서대로 이어 붙이면 원문과 같아야 한다. | M |
 | FR-STO-6 | 저장과 임베딩 전에 비밀값 패턴을 `[REDACTED:<종류>]`로 치환해야 한다. 기본 패턴: API 키(`sk-` 뒤 20자 이상, `gh[pousr]_` 뒤 36자 이상, `xox[abprs]-`, `AKIA` 뒤 16자), `Bearer <토큰 16자 이상>`, PEM 개인 키 블록(END 마커가 없으면 BEGIN부터 원문 끝까지), 이름이 `KEY`/`TOKEN`/`SECRET`/`PASSWORD`로 끝나는(대소문자 무시) `이름=값` 또는 `이름: 값`의 값(8자 이상, 이름은 남김). 마스킹은 반복 입력, 응답 텍스트, 도구 입력 JSON의 모든 문자열, 결과 원문에 적용한다. 패턴은 설정 파일로 추가할 수 있어야 하며, 잘못된 패턴은 시작 시 오류로 보고한다. | M |
-| FR-STO-7 | 임베딩은 반복 저장과 분리된 작업 큐로 처리해야 한다. 작업은 반복 저장과 같은 트랜잭션으로 프로젝트 원본 저장소의 `embed_jobs`(`kind`, `ref_id`, `enqueued_at`)에 등록한다. 작업 1건의 처리 순서: 원본 저장소에서 대상 텍스트(반복은 `embed_text`, 결과는 `text`)를 읽고 → 청크로 나누고(FR-STO-5) → 임베딩하고 → 기존 청크 벡터를 지운 뒤 새 벡터를 저장하고 → 작업을 완료 처리한다. 대상 텍스트가 비어 있으면 벡터 없이 완료 처리한다. 임베딩이나 벡터 저장이 실패하면 해당 작업을 큐에 남기고 다음 처리 때 재시도해야 한다. | M |
+| FR-STO-7 | 임베딩은 반복 저장과 분리된 작업 큐로 처리해야 한다. 작업은 반복 저장과 같은 트랜잭션으로 프로젝트 원본 저장소의 `embed_jobs`(`kind`, `ref_id`, `enqueued_at`, `bulk`)에 등록한다. `bulk`는 가져오기(FR-IMP-5)와 병합(FR-PRJ-9)으로 등록한 작업이면 1, 그 밖에는 0이다. 작업 1건의 처리 순서: 원본 저장소에서 대상 텍스트(반복은 `embed_text`, 결과는 `text`)를 읽고 → 청크로 나누고(FR-STO-5) → 임베딩하고 → 기존 청크 벡터를 지운 뒤 새 벡터를 저장하고 → 작업을 완료 처리한다. 대상 텍스트가 비어 있으면 벡터 없이 완료 처리한다. 임베딩이나 벡터 저장이 실패하면 해당 작업을 큐에 남기고 다음 처리 때 재시도해야 한다. | M |
 | FR-STO-8 | 원본 저장소에서 `iterations.embed_text`와 `results.text`에 SQLite FTS5 인덱스(trigram 토크나이저)를 만들어야 한다. FTS 검색어는 공백으로 나눈 토큰 중 3자 이상인 것을 OR로 묶는다. 해당 토큰이 없으면 FTS 결과는 비어 있다. | M |
 | FR-STO-10 | 반복, 결과, 반복-결과 연결, 백그라운드 기록, 임베딩 작업, 세션 해석기 상태의 변경은 한 처리 단위마다 하나의 트랜잭션으로 반영해야 한다. | M |
 | FR-STO-9 | 프로젝트 벡터 저장소의 행 수가 설정된 기준(기본 10만)을 넘으면 그 저장소의 `VectorStore::ensure_index`를 호출해야 한다. | S |
@@ -243,17 +255,28 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 | FR-PRJ-2 | 판정에 쓰는 경로는 심볼릭 링크를 풀어 절대 경로로 바꿔야 한다. 경로가 존재하지 않으면 받은 문자열을 그대로 쓴다. 목록 DB에 기록하는 경로와 git common dir도 같은 방식으로 바꾼 값이다. | M |
 | FR-PRJ-3 | 경로의 git 정보는 작업 트리 최상위(`git -C <경로> rev-parse --show-toplevel`), git common dir(`git -C <경로> rev-parse --path-format=absolute --git-common-dir`), 루트 커밋 목록(`git -C <경로> rev-list --max-parents=0 HEAD`)이다. 커밋이 없으면 루트 커밋 목록은 비어 있다. git 작업 트리가 아니면(A-5 포함) git 정보는 없다. git을 실행하는 것은 프로젝트 위치를 정할 때뿐이다. | M |
 | FR-PRJ-4 | 기록을 포함한 판정은 세션 시작 경로의 프로젝트 위치와 git 정보로 다음 순서를 따른다. 처음 맞는 규칙에서 끝난다. (a) 위치가 어떤 프로젝트의 위치와 같으면 그 프로젝트다. worktree는 이 규칙으로 원본 작업 트리의 프로젝트에 통합된다. (b) git 저장소이고 작업 트리 최상위가 어떤 git이 아닌 프로젝트의 위치와 같으면(그 폴더에서 나중에 `git init`한 경우), 그 프로젝트의 위치를 현재 위치로 바꾼다. (c) git 저장소이고 루트 커밋 중 하나가 어떤 프로젝트의 루트 커밋 목록에 있으며 그 프로젝트의 위치가 존재하지 않으면, 폴더를 옮긴 것으로 보고 그 프로젝트의 위치를 현재 위치로 바꾼다. 후보가 여럿이면 마지막 활동 시각이 가장 최근인 프로젝트를 고른다. (d) 그 밖에는 새 프로젝트를 만든다. (a)~(d) 모두 현재 루트 커밋 중 그 프로젝트에 없는 것을 추가한다. 판정과 기록은 목록 DB 트랜잭션 하나로 한다. 위치를 바꿀 때 이전 위치는 남기지 않는다. | M |
-| FR-PRJ-5 | 조회 전용 판정은 주어진 경로의 git 정보로 FR-PRJ-4의 (a)~(c)를 같은 순서로 적용하되 목록 DB를 바꾸지 않는다. 맞는 규칙이 없으면 "프로젝트 없음"이다. CLI의 `--scope project`/`<path>`, 세션 고정값이 없는 자동 주입, `adopt`의 대상 판정은 조회 전용 판정을 쓴다. | M |
+| FR-PRJ-5 | 조회 전용 판정은 주어진 경로의 git 정보로 FR-PRJ-4의 (a)~(c)를 같은 순서로 적용하되 목록 DB를 바꾸지 않는다. 맞는 규칙이 없으면 "프로젝트 없음"이다. CLI의 `--scope project`/`<path>`, 세션 고정값이 없는 자동 주입, 가져오기의 `from`/`to` 판정(FR-PRJ-7)은 조회 전용 판정을 쓴다. | M |
 | FR-PRJ-6 | `hippo project list`는 프로젝트마다 id, 위치와 위치 존재 여부, 반복 수, 마지막 활동 시각을 마지막 활동 시각이 최근인 순서로 출력해야 한다. | M |
-| FR-PRJ-7 | `hippo project adopt <원본>`은 원본 프로젝트의 기록을 현재 디렉터리의 프로젝트로 가져와야 한다. 원본이 32자 소문자 hex이고 그 id의 프로젝트가 있으면 그 프로젝트이다. 아니면 경로로 보고 FR-PRJ-2로 바꾼 뒤, 위치가 그 경로와 같거나 `<경로>/.git`과 같은 프로젝트이다. 원본이 없으면 오류이다. 대상은 현재 디렉터리의 조회 전용 판정 결과이며, 다음과 같이 처리한다. (a) 대상이 없으면: 원본의 위치를 현재 디렉터리의 프로젝트 위치로 바꾸고 루트 커밋을 추가한다. 데이터는 옮기지 않는다. (b) 대상이 원본과 같으면: 아무것도 바꾸지 않고 "변경 없음"을 출력한다. (c) 대상이 따로 있으면: FR-PRJ-9에 따라 원본의 기록을 대상으로 병합한다. 어느 경우든 이전 위치는 남기지 않는다. 재색인 중이면 오류를 돌려준다. 결과로 가져온 반복 수, 결과 수, 벡터 처리 방식(복사한 벡터 수 또는 등록한 임베딩 작업 수)을 출력한다. | M |
+| FR-PRJ-7 | 가져오기 준비(`import_prepare`)는 원본 프로젝트와 대상 프로젝트를 정해 다음과 같이 처리해야 한다. 원본 프로젝트: `from`이 32자 소문자 hex이고 그 id의 프로젝트가 있으면 그 프로젝트이다. 아니면 경로로 보고 FR-PRJ-2로 바꾼 뒤, 위치가 그 경로와 같거나 `<경로>/.git`과 같은 프로젝트이고, 없으면 그 경로의 조회 전용 판정 결과이다. 원본 프로젝트가 없을 수 있다. 대상 프로젝트는 `to`의 조회 전용 판정 결과이다. (a) 둘 다 없으면: `to`로 FR-PRJ-4의 기록 포함 판정을 해 대상 프로젝트를 만든다. (b) 원본만 있으면: 원본의 위치를 `to`의 프로젝트 위치로 바꾸고 루트 커밋을 추가한다. 데이터는 옮기지 않는다. 원본이 대상이 된다. (c) 대상만 있거나 원본과 대상이 같으면: 바꾸지 않는다. (d) 둘이 따로 있으면: FR-PRJ-9에 따라 원본의 기록을 대상으로 병합한다. 어느 경우든 이전 위치는 남기지 않는다. 재색인 중이면 오류를 돌려준다. 결과로 처리 경우, 대상 프로젝트 id, 병합한 반복 수, 결과 수, 벡터 처리 방식(복사한 벡터 수 또는 등록한 임베딩 작업 수)을 돌려준다. | M |
 | FR-PRJ-8 | 목록 DB에는 `projects`(`id` 기본 키, `location` 고유, `kind`(`git`/`dir`), `created_at`, `last_active_at`), `project_roots`(`root_commit`, `project_id`, 둘을 묶어 기본 키), `session_projects`(`session_id` 기본 키, `project_id`)를 둔다. 목록 DB 쓰기는 데몬만 한다. `last_active_at`은 그 프로젝트의 수집을 처리할 때 갱신한다. | M |
-| FR-PRJ-9 | 병합은 수집 스레드에서 다음 순서로 해야 한다. (1) 원본 프로젝트 원본 저장소의 `iterations`, `results`, `iteration_results`, `bg_tasks`, `bg_completions`, `sessions`, `embed_jobs` 행을 대상 원본 저장소에 추가한다. 같은 키의 기존 행은 바꾸지 않는다. (2) 원본과 대상의 활성 벡터 저장소의 `embed_model`과 차원이 같고 둘 다 설정의 임베더와 호환되면, 원본 벡터를 `scan`으로 읽어 대상에 `upsert`한다. 그렇지 않으면 (1)에서 추가한 반복과 결과마다 대상에 임베딩 작업을 등록한다. (1)과 작업 등록은 대상 원본 저장소의 트랜잭션 하나로 한다. (3) 목록 DB 트랜잭션 하나로 원본 세션의 고정값을 대상으로 바꾸고, 원본의 루트 커밋을 대상에 추가하고, 원본 프로젝트와 그 루트 커밋 행을 지운다. (4) 원본 프로젝트를 닫고 `projects/<원본 id>/` 디렉터리를 지운다. 어느 단계에서 실패해도 같은 `adopt`를 다시 실행하면 중복 행 없이 끝까지 진행되어야 한다. | M |
+| FR-PRJ-9 | 병합은 수집 스레드에서 다음 순서로 해야 한다. (1) 원본 프로젝트 원본 저장소의 `iterations`, `results`, `iteration_results`, `bg_tasks`, `bg_completions`, `sessions`, `embed_jobs` 행을 대상 원본 저장소에 추가한다. 같은 키의 기존 행은 바꾸지 않는다. (2) 원본과 대상의 활성 벡터 저장소의 `embed_model`과 차원이 같고 둘 다 설정의 임베더와 호환되면, 원본 벡터를 `scan`으로 읽어 대상에 `upsert`한다. 그렇지 않으면 (1)에서 추가한 반복과 결과마다 대상에 임베딩 작업을 등록한다. (1)과 작업 등록은 대상 원본 저장소의 트랜잭션 하나로 한다. (3) 목록 DB 트랜잭션 하나로 원본 세션의 고정값을 대상으로 바꾸고, 원본의 루트 커밋을 대상에 추가하고, 원본 프로젝트와 그 루트 커밋 행을 지운다. (4) 원본 프로젝트를 닫고 `projects/<원본 id>/` 디렉터리를 지운다. 어느 단계에서 실패해도 같은 가져오기를 다시 실행하면 중복 행 없이 끝까지 진행되어야 한다. | M |
+
+#### 3.2.11 가져오기 (IMP)
+| ID | 요구사항 | 우선순위 |
+|----|----------|----------|
+| FR-IMP-1 | `hippo import`는 `from`과 `to`(생략하면 현재 디렉터리)를 데몬에 보내 가져오기를 준비하고(FR-PRJ-7), 돌려받은 후보 세션마다 `import_session` 요청을 하나씩 순서대로 보내야 한다. 요청마다 진행률 한 줄(`[n/m]`, session id 앞 8자, 처리 결과, 저장한 반복 수, 대상 프로젝트의 남은 임베딩 작업 수)을 출력하고, 끝나면 합계를 출력한다. 중간에 중단해도 같은 명령을 다시 실행하면 끝난 세션은 "변경 없음"으로 지나가고 남은 세션을 이어서 처리한다. | M |
+| FR-IMP-2 | 후보 세션은 설정 `[import] transcripts_dir`(기본 `~/.claude/projects`) 바로 아래 디렉터리들에 있는 `*.jsonl` 파일이다. 하위 디렉터리(`subagents/` 등)는 읽지 않는다. session id는 파일 이름에서 `.jsonl`을 뺀 값이다. 세션 시작 경로를 FR-PRJ-2로 바꾼 값을 S, `from` 경로를 같은 방식으로 바꾼 값을 F라 할 때 다음 중 하나를 만족하면 후보이다. (a) S가 F와 같거나 F 아래에 있다. (b) S가 존재하고, S의 프로젝트 위치가 F의 프로젝트 위치와 같다(worktree 포함). `from`이 프로젝트 id이면 F는 그 프로젝트의 위치이며, 위치가 `<경로>/.git`이면 `<경로>`이다. 세션 시작 경로가 없는 파일은 후보가 아니다. 후보는 transcript 첫 `timestamp`의 오름차순으로 정렬하고, 같으면 파일 경로 순으로 정렬한다. `timestamp`가 없는 파일은 그 뒤에 파일 수정 시각 순으로 둔다. | M |
+| FR-IMP-3 | `import_session`은 대상 프로젝트에서 다음과 같이 세션 하나를 처리해야 한다. 세션 고정값이 다른 프로젝트이면 처리하지 않고 "다른 프로젝트"로 돌려준다. 고정값이 없으면 대상 프로젝트로 고정한다. (a) 세션 상태가 없으면 transcript를 처음부터 읽고 시작 offset을 0으로 저장한다. (b) 상태가 있고 시작 offset이 0보다 크면, 새 해석기로 0부터 시작 offset 앞까지 읽어 시작 offset 위치에서 턴을 완료로 확정하고(FR-EXT-7 c와 같다), 그 반복을 저장한 뒤 시작 offset을 0으로 바꾼다. 안전 offset과 다른 해석기 상태는 바꾸지 않는다. (c) 상태가 있고 시작 offset이 0이면 실시간 수집과 같이 안전 offset 뒤를 읽는다. (a)와 (c)에서는 세션이 대기 중인지 끝났는지 구분하지 않고, 읽은 범위 끝의 마지막 반복을 모양으로 판단한다. 그 반복의 모든 `tool_use`에 `tool_result`가 있으면(`tool_use`가 없는 반복 포함) 완료로 저장하고, 결과가 없는 `tool_use`가 있으면 보류한다(FR-EXT-8). 반복에 붙지 않은 반복 입력도 보류한다. 보류한 것은 이후의 실시간 수집이나 가져오기에서 이어서 처리한다. 저장한 것이 없으면 "변경 없음"이다. | M |
+| FR-IMP-4 | 가져오기에서는 `message.id`가 같고 `session_id`가 다른 반복이 대상 원본 저장소에 이미 있으면, 그 반복(결과 연결과 임베딩 작업 포함)을 저장하지 않아야 한다. 후보를 오래된 순서로 처리하므로 fork 복사본은 원본 세션에 남는다. 반복 id 규칙(FR-EXT-10)은 바꾸지 않는다. | M |
+| FR-IMP-5 | 가져오기로 등록한 임베딩 작업은 `bulk = 1`로 등록해야 한다. | M |
+| FR-IMP-6 | 데몬은 쓰기 스레드에서 `import_session`보다 다른 쓰기 작업(실시간 수집, 가져오기 준비)을 먼저 처리해야 한다. `import_session` 하나는 세션 하나만 처리한다. | M |
+| FR-IMP-7 | `import_session`의 응답은 처리 결과(`가져옴`, `변경 없음`, `다른 프로젝트`, `오류: <사유>`), 저장한 반복 수, 완료 알림 수, fork 복사본으로 건너뛴 반복 수, 대상 프로젝트의 남은 임베딩 작업 수를 담아야 한다. 재색인 중이면 오류를 돌려준다. | M |
 
 #### 3.2.6 교체 가능성 (SWP)
 | ID | 요구사항 | 우선순위 |
 |----|----------|----------|
 | FR-SWP-1 | 임베더는 `Embedder` 트레이트로 추상화해야 한다. 트레이트는 최소한 `model_id()`, `dimension()`, `max_input_tokens()`, `embed(texts) -> vectors`를 제공한다. 임베더를 사용하는 코드는 구체 백엔드 타입에 의존하지 않아야 한다. | M |
-| FR-SWP-2 | 벡터 저장소는 `VectorStore` 트레이트로 추상화해야 한다. 트레이트는 최소한 `info`, `upsert`, `delete`, `search(vector, filter, limit)`, `count`, `ensure_index`, `scan`(모든 벡터 레코드를 차례로 읽음. FR-PRJ-7의 복사에 쓴다)을 제공한다. 필터는 백엔드 중립 타입(`kind`, `cwd`, `session_id` 제외, `embed_model`)으로 표현한다. 벡터 레코드 id는 `<kind>:<ref_id>#<chunk_index>`이다. 결과 벡터에는 `cwd`와 `session_id`를 넣지 않는다. 검색 점수는 코사인 유사도이며 클수록 가깝다. 저장소는 처음 저장한 벡터의 `embed_model`과 차원을 `info`로 돌려주고, 차원이 다른 벡터의 저장은 오류로 거부해야 한다. | M |
+| FR-SWP-2 | 벡터 저장소는 `VectorStore` 트레이트로 추상화해야 한다. 트레이트는 최소한 `info`, `upsert`, `delete`, `search(vector, filter, limit)`, `count`, `ensure_index`, `scan`(모든 벡터 레코드를 차례로 읽음. FR-PRJ-9의 복사에 쓴다)을 제공한다. 필터는 백엔드 중립 타입(`kind`, `cwd`, `session_id` 제외, `embed_model`)으로 표현한다. 벡터 레코드 id는 `<kind>:<ref_id>#<chunk_index>`이다. 결과 벡터에는 `cwd`와 `session_id`를 넣지 않는다. 검색 점수는 코사인 유사도이며 클수록 가깝다. 저장소는 처음 저장한 벡터의 `embed_model`과 차원을 `info`로 돌려주고, 차원이 다른 벡터의 저장은 오류로 거부해야 한다. | M |
 | FR-SWP-3 | 사용할 임베더 백엔드, 모델, 차원과 벡터 저장소 백엔드는 `config.toml`로 선택해야 한다. 백엔드를 추가할 때 수집, 해석, 검색 로직을 수정하지 않아야 한다. | M |
 | FR-SWP-4 | 원본 저장소는 벡터 없이도 반복, 결과, 임베딩 대상 텍스트를 모두 보관해야 한다. 벡터 저장소의 내용은 원본 저장소에서 다시 만들 수 있어야 한다. | M |
 | FR-SWP-5 | `hippo reindex`는 데몬에 재색인을 요청하고, 데몬은 범위(IF-CLI-7)의 프로젝트마다 차례로, 현재 설정의 임베더와 벡터 저장소 백엔드로 그 프로젝트의 원본 저장소 전체를 새 세대 디렉터리(`projects/<id>/vectors/<이름>/<세대>/`)에 다시 색인해야 한다. 재색인은 백그라운드로 실행하며 그동안 기존 저장소로 검색할 수 있어야 한다(호환되지 않으면 FTS 전용). 재색인 중에는 임베딩 작업 스레드를 멈춰, 그 사이 들어온 작업이 전환 후 새 저장소에 반영되게 한다. 프로젝트마다 완료하면 그 프로젝트의 `vectors/<이름>/ACTIVE` 포인터를 원자적으로 바꿔 전환하고 호환성을 다시 판정한다. 한 프로젝트가 실패하면 그 프로젝트를 실패로 기록하고 다음 프로젝트를 계속한다. 이미 재색인 중이면 오류를 돌려준다. 교체 절차: 설정 변경 → 데몬 재시작 → `hippo reindex`. | M |
@@ -273,7 +296,7 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 | FR-DMN-5 | 데몬은 시작할 때 데이터 루트와 하위 디렉터리를 권한 0700으로 만들거나 맞추고, 잠금을 얻은 뒤 남아 있는 소켓 파일을 지우고 새로 만들어야 한다. 소켓 파일 권한은 0600이다. | M |
 | FR-DMN-7 | hook 클라이언트와 CLI는 데몬에 연결할 수 없으면, 설정 `[daemon] autostart`(기본 true)가 켜져 있을 때 같은 실행 파일로 `daemon` 명령을 분리된 프로세스(별도 프로세스 그룹)로 띄워야 한다. 데몬의 stderr는 `logs/daemon.err`에 덧붙인다. 띄운 뒤에는 소켓에 연결될 때까지 기다린다(수집과 CLI는 최대 5초, 자동 주입은 남은 시간 예산까지). 여러 클라이언트가 동시에 띄워도 FR-DMN-1에 따라 하나만 남는다. | M |
 | FR-DMN-8 | 데몬은 마지막 요청을 받은 뒤 `[daemon] idle_timeout_secs`(기본 1800, 0이면 종료하지 않음) 동안 요청이 없으면 스스로 종료해야 한다. 재색인 중에는 종료하지 않는다. 종료할 때 소켓 파일을 지운다. 남은 임베딩 작업은 원본 저장소에 남아 다음 실행 때 처리된다. | M |
-| FR-DMN-6 | 수집과 프로젝트 가져오기(FR-PRJ-7)는 전용 스레드 하나가 요청 순서대로 처리해야 한다. 임베딩 작업은 별도 스레드 하나가 처리한다. 데몬은 메모리에 (프로젝트 id, 작업) 단일 FIFO 큐를 두고, 수집이나 가져오기가 커밋될 때 등록된 작업을 큐 끝에 넣는다. 데몬이 시작할 때 모든 프로젝트의 `embed_jobs`를 `enqueued_at` 순으로 읽어 큐를 채운다. 임베딩 스레드는 큐 앞에서부터 같은 프로젝트의 작업을 `job_batch`개까지 묶어 처리한다. 실패하면 작업을 큐에 남기고 일정 시간 뒤 재시도한다. 벡터 저장소가 호환되지 않는 프로젝트(FR-SWP-6)의 작업은 큐에서 빼고 원본 저장소에만 남긴다. 그 프로젝트의 재색인이 끝나면 남은 작업을 다시 큐에 넣는다. | M |
+| FR-DMN-6 | 수집, 가져오기 준비(FR-PRJ-7), 세션 가져오기(FR-IMP-3)는 전용 쓰기 스레드 하나가 처리해야 한다. 쓰기 스레드는 FR-IMP-6의 우선순위를 따르고, 같은 우선순위 안에서는 요청 순서대로 처리한다. 임베딩 작업은 별도 스레드 하나가 처리한다. 데몬은 메모리에 (프로젝트 id, 작업) 큐를 두 단계(일반, `bulk`)로 두고, 커밋될 때 등록된 작업을 `bulk` 값에 맞는 단계의 끝에 넣는다. 데몬이 시작할 때 모든 프로젝트의 `embed_jobs`를 `enqueued_at` 순으로 읽어 `bulk` 값에 맞는 단계에 넣는다. 임베딩 스레드는 일반 단계가 비어 있을 때만 `bulk` 단계에서 꺼내며, 한 단계의 앞에서부터 같은 프로젝트의 작업을 `job_batch`개까지 묶어 처리한다. 실패하면 작업을 큐에 남기고 일정 시간 뒤 재시도한다. 벡터 저장소가 호환되지 않는 프로젝트(FR-SWP-6)의 작업은 큐에서 빼고 원본 저장소에만 남긴다. 그 프로젝트의 재색인이 끝나면 남은 작업을 다시 큐에 넣는다. | M |
 | FR-DMN-9 | 데몬은 프로젝트의 벡터 저장소와 호환성 상태를 처음 필요할 때 열고, 열어 둔 프로젝트 수가 설정 `[daemon] max_open_projects`(기본 8)를 넘으면 가장 오래 쓰지 않은 프로젝트를 닫아야 한다. 사용 중인 저장소는 마지막 사용이 끝난 뒤 닫는다. 원본 저장소는 작업마다 연다. | M |
 
 ### 3.3 성능 요구사항
@@ -287,7 +310,7 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 ### 3.4 논리 데이터 요구사항
 | ID | 요구사항 |
 |----|----------|
-| DR-1 | 데이터 루트는 `~/.hippo/`이며 하위에 `registry.sqlite`(목록 DB, FR-PRJ-8), `projects/<id>/records.sqlite`(프로젝트 원본 저장소. 세션 해석기 상태, 백그라운드 기록, 임베딩 작업 큐 포함), `projects/<id>/vectors/<저장소명>/<세대>/`(벡터 저장소)와 `projects/<id>/vectors/<저장소명>/ACTIVE`(사용 중인 세대), `spool/`, `logs/`, `config.toml`을 둔다. 프로젝트 id는 무작위 128비트 값의 소문자 hex 32자이다. |
+| DR-1 | 데이터 루트는 `~/.hippo/`이며 하위에 `registry.sqlite`(목록 DB, FR-PRJ-8), `projects/<id>/records.sqlite`(프로젝트 원본 저장소. 세션 해석기 상태, 백그라운드 기록, 임베딩 작업 큐 포함), `projects/<id>/vectors/<저장소명>/<세대>/`(벡터 저장소)와 `projects/<id>/vectors/<저장소명>/ACTIVE`(사용 중인 세대), `spool/`, `logs/`, `config.toml`을 둔다. 가져오기는 transcript를 읽기만 하며 `[import] transcripts_dir` 아래를 바꾸지 않는다. 프로젝트 id는 무작위 128비트 값의 소문자 hex 32자이다. |
 | DR-2 | 데이터 루트와 하위 디렉터리의 권한은 `0700`, SQLite 파일의 권한은 `0600`이어야 한다. |
 | DR-3 | 모든 벡터 행은 생성에 쓴 `embed_model`과 차원을 기록해야 한다. |
 
@@ -308,14 +331,15 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 | 요구사항 | 방법 | 검증 내용 |
 |----------|------|-----------|
 | IF-HK-*, FR-CAP-* | 테스트 | 부록 A의 실측 hook 입력을 fixture로 사용해 이벤트별 동작과 `agent_id` 필터를 확인 |
-| FR-EXT-* | 테스트 | 실측 transcript fixture(s1~s5)로 반복 분리, 입력 연결, 완료 판정, 멱등성 확인 |
+| FR-EXT-* | 테스트 | 실측 transcript fixture(s1~s5)로 반복 분리, 입력 연결, 완료 판정, 멱등성 확인. 처음 보는 세션이 기준 턴부터 저장되는지, `prompt_id`가 없거나 찾지 못하면 아무것도 저장하지 않는지, 파일이 다시 쓰이면 기준 턴부터 다시 읽는지 확인 |
 | FR-BG-* | 테스트 | s4, s5 fixture로 대기 기록 생성, 알림 파싱, 결과 연결, 반복 알림 순번 확인. output-file이 없는 경우 포함 |
 | FR-STO-1~5, 7~9 | 테스트 | 임시 원본 저장소와 메모리 벡터 저장소에 저장 후 행, 해시 중복 제거, 청크 분할 확인. 임베딩은 테스트용 결정론적 임베더로 대체 |
 | FR-STO-6, QA-4 | 테스트 | 패턴별 비밀값이 DB에 남지 않는지 확인 |
 | FR-RET-* | 테스트 | 고정 데이터셋으로 필터, 임계값, 길이 제한, 시간 예산 초과 시 무주입 확인 |
 | FR-SWP-* | 테스트 | 계약 테스트를 모든 백엔드에 적용. 임베더 교체 후 `reindex` 전후 검색 동작, 차원 불일치 시 FTS 전용 전환 확인 |
 | FR-DMN-*, QA-1 | 테스트 | 중복 실행 거부, 강제 종료 후 재시작 시 누락과 중복 없음 확인. `max_open_projects`를 넘을 때 닫힘, 여러 프로젝트 작업의 단일 FIFO 처리 순서 확인 |
-| FR-PRJ-* | 테스트 | 임시 디렉터리에 git 저장소를 만들어(`git init`, 커밋, `git worktree add`, `mv`, 두 번째 clone) worktree 통합, 판정 규칙 (a)~(d), 세션 중 `cd`해도 고정값 유지, 조회 전용 판정이 목록 DB를 바꾸지 않음 확인. `adopt`의 세 경우, 벡터 복사와 재임베딩 분기, 중간 실패 후 재실행 멱등성 확인 |
+| FR-PRJ-* | 테스트 | 임시 디렉터리에 git 저장소를 만들어(`git init`, 커밋, `git worktree add`, `mv`, 두 번째 clone) worktree 통합, 판정 규칙 (a)~(d), 세션 중 `cd`해도 고정값 유지, 조회 전용 판정이 목록 DB를 바꾸지 않음 확인. 가져오기 준비의 네 경우(FR-PRJ-7), 벡터 복사와 재임베딩 분기, 중간 실패 후 재실행 멱등성 확인 |
+| FR-IMP-* | 테스트 | 임시 transcripts 디렉터리로 후보 선택(하위 경로, worktree, 없어진 경로, 프로젝트 id, `subagents/` 제외, 정렬), 세션 상태별 처리 (a)~(c), 끝 반복의 완료·보류 판정, 다른 프로젝트 세션 건너뜀, fork 복사본 건너뜀, 재실행 시 "변경 없음", `bulk` 작업 등록과 임베딩 큐 우선순위, 쓰기 작업 우선순위 확인 |
 | PR-1~4 | 시연 | 벤치마크 스크립트로 측정 |
 | QA-3 | 검사 | 코드 리뷰와 실행 중 네트워크 연결 목록 확인(`lsof -i`) |
 | 부록 B 항목 | 시연 | 대화형 세션에서 확인 |
@@ -346,6 +370,13 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 - `TaskCreated`, `TaskCompleted`, `Notification`은 s5에서 실행되지 않았다.
 - 백그라운드 완료 알림은 메인 transcript에 `type: user`, 문자열 content의 `<task-notification>`으로 기록되며 `<tool-use-id>`가 시작 호출의 `tool_use_id`와 같다.
 
+재개와 분기(2026-11-02, 격리 설정 `claude -p`):
+- `--resume <id>`와 `--continue`는 같은 session id로 같은 transcript 파일에 이어 쓴다. 이전 라인을 복사하지 않는다(uuid 중복 0). `SessionStart`의 `source`는 `resume`이다.
+- `--resume <id> --fork-session`은 새 session id로 새 파일을 만들고 이전 라인을 모두 복사한다. 복사한 라인은 `sessionId`만 새 값이고 `uuid`와 `message.id`는 원본과 같다. `SessionStart`의 `source`는 `fork`이다.
+- 실제 로그 335개에서 assistant `message.id` 24,824개 중 두 파일 이상에 나온 것은 101개였고, 모두 시작 시각이 같은 한 쌍(fork)이었다.
+- `Stop`과 `UserPromptSubmit` 입력의 `prompt_id`는 그 턴 user 라인의 `promptId`와 같다.
+- transcript에 턴 종료를 일정하게 표시하는 라인은 없다(`system` 라인의 `turn_duration`, `stop_hook_summary`는 환경에 따라 있거나 없다).
+
 ## 부록 B. 미해결 항목 (구현 전 또는 구현 중 확인)
 
 | ID | 항목 | 영향 요구사항 |
@@ -355,4 +386,6 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 | OPEN-3 | 컨텍스트 압축(compaction)이 transcript 파일을 다시 쓰는지, 덧붙이기만 하는지 | FR-EXT-1 |
 | OPEN-4 | 실제 데이터로 `qwen3-embedding:0.6b`와 `bge-m3`의 검색 품질 비교 | C-3 |
 | OPEN-5 | 자동 주입 임계값 기본값(0.40)의 적정성. 확정값이 아니라 조정용 설정값이다. 실측(qwen3-embedding:0.6b, 표본 4개)에서 관련 0.46~0.68, 무관 0.21~0.30이었다. 실제 사용 데이터로 다시 조정한다. 검색 질의 지시문 접두사 도입 여부도 함께 검토한다 | FR-RET-3 |
+| OPEN-7 | `SessionEnd` 입력에 `prompt_id`가 있는지. 없으면 처음 보는 세션의 `SessionEnd`만으로는 아무것도 저장하지 않는다(FR-EXT-12) | FR-CAP-4 |
+| OPEN-8 | 대화형 `/resume`과 대화형 분기가 `claude -p`의 `--resume`, `--fork-session`과 같은 방식으로 transcript를 쓰는지 | FR-EXT-12, FR-IMP-4 |
 | OPEN-6 | `Stop` hook 실행 시점에 마지막 assistant 라인이 transcript에 기록되어 있는지. 기록 전이면 그 반복은 응답 없이 저장되고 이후 같은 `message.id` 라인은 버려진다 | FR-EXT-7, FR-EXT-10 |

@@ -57,6 +57,14 @@ Your prompt
 
 These hooks run with `async: true`, so they never slow down your session. The hook payload is only a trigger. The content comes from the session transcript (JSONL). `hippo` keeps a safe byte offset per session, so it reads each line once and never records the same iteration twice.
 
+**Live capture starts at the turn the hook reports.** When `hippo` sees a session for the first time, it does not read the transcript from the beginning. It starts at the first line of the turn that the hook payload's `prompt_id` points to. So in these cases the conversation before that turn is not stored:
+
+- Sessions that were already open when you installed the hooks
+- Sessions started before hippo was installed and reopened with `claude --resume` or `--continue`
+- Sessions branched with `--fork-session` and similar. Branching copies the earlier conversation into a new file.
+
+When you reopen a session that is already being captured, Claude Code appends to the same file, so capture continues after the saved position. To store the earlier history, use `hippo import` (see [4.4](#44-projects-and-importing-past-records)).
+
 Other details:
 
 - **Subagents**: `hippo` skips their internal iterations. A foreground subagent's final report arrives as the result of the `Agent` tool call, so it is stored with that call.
@@ -68,7 +76,7 @@ Memory is stored **separately for each project**. Records of other projects do n
 
 - **When the project is decided**: when the daemon first processes a session, from the **session start directory** (the `cwd` of the first transcript line that has one). A `cd` during the session does not change it.
 - **Project location**: the git common dir (`.git`) for a git repository, otherwise the directory itself. Sessions opened in a subdirectory and git worktrees belong to the same project as the main checkout.
-- **Moved folders**: for a git repository, if the root commit matches and the old location no longer exists, the project follows it automatically. For a folder without git, use `hippo project adopt` ([4.4](#44-projects)).
+- **Moved folders**: for a git repository, if the root commit matches and the old location no longer exists, the project follows it automatically. For a folder without git, use `hippo import --from <old path>` ([4.4](#44-projects-and-importing-past-records)).
 
 ```
 ~/.hippo/registry.sqlite      registry: projects, locations, root commits, session → project
@@ -292,19 +300,35 @@ projects: 2
 
 `embed_jobs` counts iterations and results still waiting for embedding. `compatibility` is `empty`, `compatible`, or `mismatch`. `(위치 없음)` means the location no longer exists. If a project needs a reindex, `status` tells you.
 
-### 4.4 Projects
+### 4.4 Projects and importing past records
 
 ```bash
-hippo project list                      # id, kind (git/dir), location, iterations, last activity
-hippo project adopt <id or old path>    # bring an old project's records into the current directory's project
+hippo project list                       # id, kind (git/dir), location, iterations, last activity
+hippo import                             # past sessions of the current folder (subfolders and worktrees too) into the current project
+hippo import --from ~/old/app            # sessions you ran at an old path into the current folder's project
+hippo import --from <project id> --to ~/work/app
 ```
 
-Use `adopt` after you move a folder that is not a git repository. Run it in the moved folder:
+`import` reads the past transcripts that Claude Code keeps (`~/.claude/projects/*/*.jsonl`) and adds their records to the project of the `--to` folder. An argument you leave out is the current folder. Subagent transcripts are not read.
 
-- If the current folder has no project yet, the old project's location changes to the current folder. The data stays as it is.
-- If the current folder already has a project (you opened a session after the move), the old project's records are merged into it and the old project is deleted. If the embedding model is the same, the vectors are copied. Otherwise they are embedded again.
+- **Which sessions**: sessions whose start path is the `--from` path or below it. The path does not need to exist any more. If `--from` is a git repository, sessions opened in its worktrees are included too. Older sessions are processed first.
+- **If `--from` already has a project**: that project is first moved into the `--to` project. If `--to` has no project, only the location changes. Otherwise the records are merged and the old project is deleted. When merging, vectors are copied if the embedding model is the same, and embedded again if it is not. The old location is not kept, so later sessions go to the current folder's project without any extra mapping.
+- **Sessions already captured live**: only the part before the point where live capture started is filled in. Iterations that already exist are not stored again.
+- **The iteration at the end of a transcript**: stored if every tool call has its result. If a tool call has no result yet, it is held. A held iteration is processed when the session is reopened or when you run `import` again.
+- **Copies from branched sessions**: an iteration is skipped if an iteration with the same `message.id` already exists under another session.
+- **Sessions fixed to another project**: skipped and reported as "다른 프로젝트" (other project).
 
-In both cases the old location is not kept, so later sessions are stored in the current folder's project without any extra mapping. Git repositories follow their root commit automatically, so they rarely need `adopt`.
+Progress is printed one line per session (the CLI output is in Korean):
+
+```
+후보 세션 120개
+[1/120] d767e162 가져옴 반복 42  남은 임베딩 310
+[2/120] 2f74fd43 가져옴 반복 3  남은 임베딩 318
+...
+합계: 세션 120개 중 가져옴 118, 변경 없음 2, 다른 프로젝트 0, 오류 0. 반복 2410개 저장, fork 복사본 101개 건너뜀.
+```
+
+You can stop with Ctrl-C at any time. Run the same command again and finished sessions pass as "변경 없음" (unchanged) while the rest continue. The daemon keeps working on the remaining embedding jobs. It always handles live capture and its embeddings before import work, so your current conversation is still stored and searchable while an import runs.
 
 ### 4.5 Let Claude use the memory
 
@@ -360,6 +384,9 @@ max_open_projects = 8              # project vector stores kept open at the same
 
 [project]
 git_timeout_ms = 1000              # time limit for git; if exceeded, the folder is treated as non-git
+
+[import]
+transcripts_dir = "/Users/me/.claude/projects"   # where past transcripts are found. Default: $HOME/.claude/projects (`~` is not expanded)
 
 [[redact.patterns]]                # extra secret patterns (regex)
 kind = "internal"
@@ -451,6 +478,8 @@ Security measures:
 | `store.rs` | SQLite source store, deduplication, FTS5, project merge |
 | `project.rs` | path normalization, git information, project location |
 | `registry.rs` | registry: project resolution, session binding, relocation, absorption |
+| `import.rs` | candidate selection for importing past records |
+| `queue.rs` | two-lane queues that take live work before import work |
 | `embedder.rs`, `vector.rs` | `Embedder` and `VectorStore` traits |
 | `ollama.rs`, `lance.rs` | Real backends |
 | `testing.rs` | `HashEmbedder`, `MemoryVectorStore` (deterministic test backends) |
@@ -496,6 +525,8 @@ Ingest, search, and the daemon do not change.
 - When the daemon stops with a signal, the socket file stays. It is removed at the next start.
 - There is no retention policy yet. Memory grows until you delete it.
 - Results (tool outputs) are deduplicated only within a project. The same output in two projects is stored twice.
-- A moved folder without git is not followed automatically. Use `hippo project adopt`.
+- A moved folder without git is not followed automatically. Use `hippo import --from <old path>`.
+- Live capture stores from the turn the hook reports. Use `hippo import` for the history before it.
+- For past sessions whose old path is gone, `hippo` cannot tell which project they belong to. Give the old path with `--from`.
 - Data in the single-store layout of v0.1 (`~/.hippo/records.sqlite`) is not migrated to the new layout.
 - macOS only for now.

@@ -6,22 +6,37 @@ use std::path::{Path, PathBuf};
 
 use common::*;
 use hippo::ingest::{
-    HookEvent, IngestError, IngestOptions, IngestRequest, ingest, session_start_cwd,
+    HookEvent, ImportOutcome, ImportReport, IngestError, IngestOptions, IngestRequest,
+    import_session, ingest, session_start_cwd,
 };
 use hippo::redact::Redactor;
-use hippo::store::RecordStore;
+use hippo::store::{RecordStore, iteration_id};
 use serde_json::{Value, json};
 
 const OPTS: IngestOptions = IngestOptions {
     max_tool_input_chars: 500,
 };
 
+/// 기존 시나리오는 transcript의 첫 턴을 기준 턴으로 삼는다. (FR-EXT-12)
 fn req(event: HookEvent, session: &str, path: &Path) -> IngestRequest {
     IngestRequest {
         event,
         session_id: session.into(),
         transcript_path: path.to_path_buf(),
+        prompt_id: first_prompt(path),
     }
+}
+
+fn first_prompt(path: &Path) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()?
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find_map(|v| {
+            v.get("promptId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
 }
 
 fn run(
@@ -501,5 +516,284 @@ fn session_start_cwd_ignores_unterminated_and_missing_lines() {
     assert_eq!(
         session_start_cwd(b"not json\n{\"cwd\":\"/x\"}\n").as_deref(),
         Some("/x")
+    );
+}
+
+// ---- 기준 턴(FR-EXT-12)과 가져오기(FR-IMP-3~5) ----
+
+fn turn(prompt: &str) -> Vec<String> {
+    vec![
+        user_line(
+            &format!("u-{prompt}"),
+            prompt,
+            json!(format!("질문 {prompt}")),
+        ),
+        assistant_line(
+            &format!("a-{prompt}"),
+            &format!("m-{prompt}"),
+            json!([{"type": "text", "text": format!("답변 {prompt}")}]),
+        ),
+    ]
+}
+
+/// 도구 호출만 있고 결과가 아직 없는 턴.
+fn open_tool_turn(prompt: &str) -> Vec<String> {
+    vec![
+        user_line(
+            &format!("u-{prompt}"),
+            prompt,
+            json!(format!("질문 {prompt}")),
+        ),
+        assistant_line(
+            &format!("a-{prompt}"),
+            &format!("m-{prompt}"),
+            json!([{"type": "tool_use", "id": format!("tu-{prompt}"), "name": "Bash", "input": {"command": "ls"}}]),
+        ),
+    ]
+}
+
+fn tool_result_and_answer(prompt: &str) -> Vec<String> {
+    vec![
+        user_line(
+            &format!("r-{prompt}"),
+            prompt,
+            json!([{"type": "tool_result", "tool_use_id": format!("tu-{prompt}"), "content": "결과 파일 목록"}]),
+        ),
+        assistant_line(
+            &format!("b-{prompt}"),
+            &format!("n-{prompt}"),
+            json!([{"type": "text", "text": format!("마무리 {prompt}")}]),
+        ),
+    ]
+}
+
+fn in_session(lines: &[String], session: &str) -> String {
+    joined(lines).replace(
+        "\"sessionId\":\"S\"",
+        &format!("\"sessionId\":\"{session}\""),
+    )
+}
+
+fn concat(parts: &[Vec<String>]) -> Vec<String> {
+    parts.concat()
+}
+
+fn write_transcript(dir: &Path, session: &str, body: &str) -> PathBuf {
+    let path = dir.join(format!("{session}.jsonl"));
+    fs::write(&path, body).unwrap();
+    path
+}
+
+fn live(
+    store: &mut RecordStore,
+    event: HookEvent,
+    session: &str,
+    path: &Path,
+    prompt: Option<&str>,
+) -> hippo::ingest::IngestReport {
+    ingest(
+        store,
+        &Redactor::new(&[]).unwrap(),
+        OPTS,
+        &IngestRequest {
+            event,
+            session_id: session.into(),
+            transcript_path: path.to_path_buf(),
+            prompt_id: prompt.map(str::to_string),
+        },
+    )
+    .unwrap()
+}
+
+fn import(store: &mut RecordStore, session: &str, path: &Path) -> ImportReport {
+    import_session(store, &Redactor::new(&[]).unwrap(), OPTS, session, path).unwrap()
+}
+
+fn has(store: &RecordStore, session: &str, message: &str) -> bool {
+    store
+        .iteration(&iteration_id(session, message))
+        .unwrap()
+        .is_some()
+}
+
+#[test]
+fn first_seen_session_starts_at_hook_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = joined(&turn("p1"));
+    let body = in_session(&concat(&[turn("p1"), turn("p2")]), "S");
+    let path = write_transcript(dir.path(), "S", &body);
+    let mut store = RecordStore::open_in_memory().unwrap();
+    let report = live(&mut store, HookEvent::Stop, "S", &path, Some("p2"));
+    assert_eq!(report.iterations, 1);
+    assert!(!has(&store, "S", "m-p1"), "기준 턴 앞은 저장하지 않음");
+    assert!(has(&store, "S", "m-p2"));
+    let state = store.session_state("S").unwrap().unwrap();
+    assert_eq!(state.start_offset, first.len() as u64);
+    assert_eq!(state.safe_offset, body.len() as u64);
+}
+
+#[test]
+fn first_seen_session_without_or_unknown_prompt_stores_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_transcript(dir.path(), "S", &in_session(&turn("p1"), "S"));
+    let mut store = RecordStore::open_in_memory().unwrap();
+    for prompt in [None, Some("no-such-prompt")] {
+        let report = live(&mut store, HookEvent::Stop, "S", &path, prompt);
+        assert_eq!(report.iterations, 0, "{prompt:?}");
+        assert!(store.session_state("S").unwrap().is_none(), "{prompt:?}");
+    }
+}
+
+#[test]
+fn known_session_continues_from_safe_offset_regardless_of_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_transcript(dir.path(), "S", &in_session(&turn("p1"), "S"));
+    let mut store = RecordStore::open_in_memory().unwrap();
+    live(&mut store, HookEvent::Stop, "S", &path, Some("p1"));
+    fs::write(&path, in_session(&concat(&[turn("p1"), turn("p2")]), "S")).unwrap();
+    let report = live(&mut store, HookEvent::Stop, "S", &path, Some("p2"));
+    assert_eq!(report.iterations, 1);
+    assert!(has(&store, "S", "m-p1") && has(&store, "S", "m-p2"));
+    assert_eq!(store.session_state("S").unwrap().unwrap().start_offset, 0);
+}
+
+#[test]
+fn fork_session_stores_only_turns_after_fork() {
+    let dir = tempfile::tempdir().unwrap();
+    let copied = in_session(&concat(&[turn("p1"), turn("p2")]), "B");
+    let body = format!("{copied}{}", in_session(&turn("p3"), "B"));
+    let path = write_transcript(dir.path(), "B", &body);
+    let mut store = RecordStore::open_in_memory().unwrap();
+    let report = live(&mut store, HookEvent::Stop, "B", &path, Some("p3"));
+    assert_eq!(report.iterations, 1);
+    assert!(!has(&store, "B", "m-p1") && !has(&store, "B", "m-p2"));
+    assert!(has(&store, "B", "m-p3"));
+}
+
+#[test]
+fn rewritten_transcript_restarts_at_hook_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_transcript(
+        dir.path(),
+        "S",
+        &in_session(&concat(&[turn("p1"), turn("p2")]), "S"),
+    );
+    let mut store = RecordStore::open_in_memory().unwrap();
+    live(&mut store, HookEvent::Stop, "S", &path, Some("p1"));
+    fs::write(&path, in_session(&turn("p5"), "S")).unwrap();
+    let report = live(&mut store, HookEvent::Stop, "S", &path, Some("p5"));
+    assert_eq!(report.iterations, 1);
+    assert!(has(&store, "S", "m-p5"));
+}
+
+#[test]
+fn import_reads_unseen_session_from_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = in_session(&concat(&[turn("p1"), turn("p2")]), "S");
+    let path = write_transcript(dir.path(), "S", &body);
+    let mut store = RecordStore::open_in_memory().unwrap();
+    let report = import(&mut store, "S", &path);
+    assert_eq!(report.outcome, ImportOutcome::Imported);
+    assert_eq!((report.iterations, report.fork_skipped), (2, 0));
+    let state = store.session_state("S").unwrap().unwrap();
+    assert_eq!(
+        (state.start_offset, state.safe_offset),
+        (0, body.len() as u64)
+    );
+    let again = import(&mut store, "S", &path);
+    assert_eq!(again.outcome, ImportOutcome::Unchanged);
+    assert_eq!(again.iterations, 0);
+}
+
+#[test]
+fn import_holds_last_iteration_with_missing_tool_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let head = in_session(&turn("p1"), "S");
+    let body = format!("{head}{}", in_session(&open_tool_turn("p2"), "S"));
+    let path = write_transcript(dir.path(), "S", &body);
+    let mut store = RecordStore::open_in_memory().unwrap();
+    let report = import(&mut store, "S", &path);
+    assert_eq!(report.iterations, 1);
+    assert!(!has(&store, "S", "m-p2"), "결과가 없는 도구 호출은 보류");
+    assert_eq!(
+        store.session_state("S").unwrap().unwrap().safe_offset,
+        head.len() as u64
+    );
+
+    let done = format!("{body}{}", in_session(&tool_result_and_answer("p2"), "S"));
+    fs::write(&path, done).unwrap();
+    let report = import(&mut store, "S", &path);
+    assert_eq!(report.outcome, ImportOutcome::Imported);
+    assert_eq!(report.iterations, 2);
+    assert!(has(&store, "S", "m-p2") && has(&store, "S", "n-p2"));
+}
+
+#[test]
+fn import_backfills_turns_before_live_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = in_session(&concat(&[turn("p1"), turn("p2")]), "S");
+    let path = write_transcript(dir.path(), "S", &body);
+    let mut store = RecordStore::open_in_memory().unwrap();
+    live(&mut store, HookEvent::Stop, "S", &path, Some("p2"));
+    let before = store.session_state("S").unwrap().unwrap();
+    assert!(before.start_offset > 0);
+
+    let report = import(&mut store, "S", &path);
+    assert_eq!(report.outcome, ImportOutcome::Imported);
+    assert_eq!(report.iterations, 1);
+    assert!(has(&store, "S", "m-p1"));
+    let after = store.session_state("S").unwrap().unwrap();
+    assert_eq!(after.start_offset, 0);
+    assert_eq!(
+        after.safe_offset, before.safe_offset,
+        "실시간 offset은 그대로"
+    );
+    assert_eq!(
+        import(&mut store, "S", &path).outcome,
+        ImportOutcome::Unchanged
+    );
+    assert_eq!(store.counts().unwrap().iterations, 2);
+}
+
+#[test]
+fn import_skips_fork_copies_of_other_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = write_transcript(
+        dir.path(),
+        "A",
+        &in_session(&concat(&[turn("p1"), turn("p2")]), "A"),
+    );
+    let b = write_transcript(
+        dir.path(),
+        "B",
+        &in_session(&concat(&[turn("p1"), turn("p2"), turn("p3")]), "B"),
+    );
+    let mut store = RecordStore::open_in_memory().unwrap();
+    assert_eq!(import(&mut store, "A", &a).iterations, 2);
+    let report = import(&mut store, "B", &b);
+    assert_eq!((report.iterations, report.fork_skipped), (1, 2));
+    assert!(!has(&store, "B", "m-p1") && has(&store, "B", "m-p3"));
+    assert_eq!(store.counts().unwrap().iterations, 3);
+}
+
+#[test]
+fn imported_embed_jobs_are_bulk_and_live_jobs_are_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = write_transcript(dir.path(), "A", &in_session(&turn("p1"), "A"));
+    let b = write_transcript(dir.path(), "B", &in_session(&turn("p9"), "B"));
+    let mut store = RecordStore::open_in_memory().unwrap();
+    import(&mut store, "A", &a);
+    live(&mut store, HookEvent::Stop, "B", &b, Some("p9"));
+    let jobs = store.pending_jobs().unwrap();
+    let bulk: Vec<_> = jobs
+        .iter()
+        .map(|j| (j.job.ref_id.clone(), j.bulk))
+        .collect();
+    assert_eq!(
+        bulk,
+        vec![
+            (iteration_id("A", "m-p1"), true),
+            (iteration_id("B", "m-p9"), false)
+        ]
     );
 }

@@ -1,12 +1,12 @@
 //! 상주 데몬. 쓰기 스레드, 임베딩 스레드, 연결 처리 스레드로 구성한다. (SRS 3.2.7, 3.2.10)
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -16,15 +16,20 @@ use crate::config::{Config, Paths};
 use crate::embedder::Embedder;
 use crate::fsutil::{ensure_private_dir, open_private_append, set_private_file};
 use crate::generations::{activate, active_dir, cleanup_inactive, new_generation};
+use crate::import::candidates;
 use crate::indexer::{ChunkConfig, Compatibility, compatibility, process_jobs, reindex};
-use crate::ingest::{IngestOptions, IngestRequest, ingest, session_start_cwd};
-use crate::project::{Location, locate};
-use crate::protocol::{
-    COMPAT_MISMATCH, MISSING_LOCATION, ProjectStatus, REINDEX_RUNNING, Request, Response, Scope,
-    StatusInfo,
+use crate::ingest::{
+    ImportOutcome, ImportReport, IngestOptions, IngestRequest, import_session, ingest,
+    session_start_cwd,
 };
+use crate::project::{Location, locate, normalize};
+use crate::protocol::{
+    COMPAT_MISMATCH, ImportSessionReport, MISSING_LOCATION, ProjectStatus, REINDEX_RUNNING,
+    Request, Response, Scope, StatusInfo,
+};
+use crate::queue::{EmbedQueue, Lane, LaneQueue};
 use crate::redact::Redactor;
-use crate::registry::{Registry, RegistryError};
+use crate::registry::{GIT_DIR_NAME, Registry, RegistryError, is_project_id};
 use crate::search::{
     InjectConfig, ProjectSearch, SearchError, SearchKind, SearchRequest, VectorBackends,
     build_injection, escape_control, missing_turn, render_hits, render_project_hits, render_turn,
@@ -59,14 +64,29 @@ const NO_PROJECT: &str = "프로젝트 없음\n";
 
 type Reply = Sender<Response>;
 
-/// 쓰기 스레드가 순서대로 처리하는 작업. (FR-DMN-6)
+/// 쓰기 스레드가 처리하는 작업. 세션 가져오기는 다른 작업보다 뒤에 처리한다. (FR-DMN-6, FR-IMP-6)
 enum WriteJob {
     Ingest(IngestRequest, Reply),
-    Adopt {
-        source: String,
-        cwd: String,
+    ImportPrepare {
+        from: String,
+        to: String,
         reply: Reply,
     },
+    ImportSession {
+        project_id: String,
+        session_id: String,
+        transcript_path: PathBuf,
+        reply: Reply,
+    },
+}
+
+impl WriteJob {
+    fn lane(&self) -> Lane {
+        match self {
+            Self::ImportSession { .. } => Lane::Bulk,
+            Self::Ingest(..) | Self::ImportPrepare { .. } => Lane::Normal,
+        }
+    }
 }
 
 /// 프로젝트 하나의 벡터 저장소와 호환성 상태. (FR-DMN-9, FR-SWP-6)
@@ -132,48 +152,6 @@ impl OpenProjects {
 
     fn remove(&mut self, id: &str) {
         self.entries.retain(|(k, _)| k != id);
-    }
-}
-
-/// 모든 프로젝트의 임베딩 작업을 도착 순서대로 담는 단일 FIFO. (FR-DMN-6)
-#[derive(Default)]
-struct EmbedQueue {
-    items: VecDeque<(String, EmbedJob)>,
-    queued: HashSet<(String, EmbedJob)>,
-}
-
-impl EmbedQueue {
-    fn push(&mut self, project: &str, job: EmbedJob) {
-        let item = (project.to_string(), job);
-        if self.queued.insert(item.clone()) {
-            self.items.push_back(item);
-        }
-    }
-
-    /// 앞에서부터 같은 프로젝트의 작업을 `limit`개까지.
-    fn front_batch(&self, limit: usize) -> Option<(String, Vec<EmbedJob>)> {
-        let project = self.items.front()?.0.clone();
-        let jobs = self
-            .items
-            .iter()
-            .take_while(|(p, _)| *p == project)
-            .take(limit.max(1))
-            .map(|(_, j)| j.clone())
-            .collect();
-        Some((project, jobs))
-    }
-
-    fn remove(&mut self, project: &str, jobs: &[EmbedJob]) {
-        self.items
-            .retain(|(p, j)| !(p == project && jobs.contains(j)));
-        for job in jobs {
-            self.queued.remove(&(project.to_string(), job.clone()));
-        }
-    }
-
-    fn remove_project(&mut self, project: &str) {
-        self.items.retain(|(p, _)| p != project);
-        self.queued.retain(|(p, _)| p != project);
     }
 }
 
@@ -293,7 +271,7 @@ impl Shared {
         match (records.pending_jobs(), self.queue.lock()) {
             (Ok(jobs), Ok(mut queue)) => {
                 for p in jobs {
-                    queue.push(id, p.job);
+                    queue.push(id, p.job, p.bulk);
                 }
             }
             (Err(e), _) => self.log(&format!("project {id}: reading embed jobs failed: {e}")),
@@ -310,16 +288,17 @@ impl Shared {
                 .records(&id)
                 .and_then(|r| r.pending_jobs().map_err(|e| e.to_string()))
             {
-                Ok(jobs) => {
-                    all.extend(jobs.into_iter().map(|p| (p.enqueued_at, id.clone(), p.job)))
-                }
+                Ok(jobs) => all.extend(
+                    jobs.into_iter()
+                        .map(|p| (p.enqueued_at, id.clone(), p.job, p.bulk)),
+                ),
                 Err(e) => self.log(&format!("project {id}: reading embed jobs failed: {e}")),
             }
         }
-        all.sort_by_key(|(at, _, _)| *at);
+        all.sort_by_key(|(at, _, _, _)| *at);
         let mut queue = lock(&self.queue)?;
-        for (_, id, job) in all {
-            queue.push(&id, job);
+        for (_, id, job, bulk) in all {
+            queue.push(&id, job, bulk);
         }
         Ok(())
     }
@@ -492,20 +471,65 @@ fn spawn_writer(shared: Arc<Shared>, redactor: Redactor, rx: Receiver<WriteJob>)
             }
             Err(e) => shared.log(&format!("spool read failed: {e}")),
         }
+        let mut pending = LaneQueue::default();
         while !shared.stop.load(Ordering::SeqCst) {
-            match rx.recv_timeout(WRITE_POLL) {
-                Ok(WriteJob::Ingest(req, reply)) => {
+            let mut disconnected = false;
+            if pending.is_empty() {
+                match rx.recv_timeout(WRITE_POLL) {
+                    Ok(job) => {
+                        let lane = job.lane();
+                        pending.push(job, lane);
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => disconnected = true,
+                }
+            }
+            loop {
+                match rx.try_recv() {
+                    Ok(job) => {
+                        let lane = job.lane();
+                        pending.push(job, lane);
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+            match pending.pop() {
+                Some(WriteJob::Ingest(req, reply)) => {
                     let _ = reply.send(run(&req));
                 }
-                Ok(WriteJob::Adopt { source, cwd, reply }) => {
-                    let resp = adopt(&shared, &source, &cwd).unwrap_or_else(|message| {
-                        shared.log(&format!("adopt {source} failed: {message}"));
+                Some(WriteJob::ImportPrepare { from, to, reply }) => {
+                    let resp = import_prepare(&shared, &from, &to).unwrap_or_else(|message| {
+                        shared.log(&format!("import prepare {from} failed: {message}"));
                         Response::Error { message }
                     });
                     let _ = reply.send(resp);
                 }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => break,
+                Some(WriteJob::ImportSession {
+                    project_id,
+                    session_id,
+                    transcript_path,
+                    reply,
+                }) => {
+                    let resp = import_one(
+                        &shared,
+                        &redactor,
+                        options,
+                        &project_id,
+                        &session_id,
+                        &transcript_path,
+                    )
+                    .unwrap_or_else(|message| {
+                        shared.log(&format!("import {session_id} failed: {message}"));
+                        Response::Error { message }
+                    });
+                    let _ = reply.send(resp);
+                }
+                None if disconnected => break,
+                None => {}
             }
         }
     })
@@ -558,33 +582,163 @@ fn ingest_session(
     Ok(())
 }
 
-/// 원본 프로젝트의 기록을 현재 디렉터리의 프로젝트로 가져온다. 이전 위치는 남기지 않는다. (FR-PRJ-7)
-fn adopt(shared: &Shared, source: &str, cwd: &str) -> Result<Response, String> {
-    let source_id = lock(&shared.registry)?
-        .find_source(source)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("원본 프로젝트를 찾을 수 없습니다: {source}"))?;
-    if shared.reindexing.load(Ordering::SeqCst) {
-        return Err("재색인 중에는 프로젝트를 가져올 수 없습니다".into());
-    }
-    let loc = shared.locate(cwd);
-    let target = lock(&shared.registry)?
-        .lookup(&loc)
-        .map_err(|e| e.to_string())?;
-    let text = match target {
-        None => {
-            lock(&shared.registry)?
-                .relocate(&source_id, &loc)
-                .map_err(|e| e.to_string())?;
-            format!(
-                "프로젝트 {source_id}의 위치를 {}(으)로 바꿨습니다.\n",
-                loc.path
-            )
-        }
-        Some(target) if target == source_id => "변경 없음\n".to_string(),
-        Some(target) => merge(shared, &source_id, &target)?,
+/// 가져오기의 원본 경로와 그 프로젝트 위치. `from`이 프로젝트 id이면 그 프로젝트의 위치에서 정한다. (FR-IMP-2)
+fn import_origin(shared: &Shared, from: &str) -> Result<(PathBuf, String), String> {
+    let row = if is_project_id(from) {
+        lock(&shared.registry)?
+            .project(from)
+            .map_err(|e| e.to_string())?
+    } else {
+        None
     };
-    Ok(Response::Text { text })
+    Ok(match row {
+        Some(row) => {
+            let location = PathBuf::from(&row.location);
+            let path = match location.file_name() {
+                Some(name) if name == GIT_DIR_NAME => location.parent().map(Path::to_path_buf),
+                _ => None,
+            }
+            .unwrap_or(location);
+            (path, row.location)
+        }
+        None => (normalize(Path::new(from)), shared.locate(from).path),
+    })
+}
+
+/// 원본·대상 프로젝트를 정해 위치를 바꾸거나 병합한다. 후보 세션은 연결 스레드가 찾는다. (FR-PRJ-7)
+fn import_prepare(shared: &Shared, from: &str, to: &str) -> Result<Response, String> {
+    if shared.reindexing.load(Ordering::SeqCst) {
+        return Err("재색인 중에는 가져올 수 없습니다".into());
+    }
+    let to_loc = shared.locate(to);
+    let found = lock(&shared.registry)?
+        .find_source(from)
+        .map_err(|e| e.to_string())?;
+    let source = match found {
+        Some(id) => Some(id),
+        None if is_project_id(from) => None,
+        None => {
+            let from_loc = shared.locate(from);
+            lock(&shared.registry)?
+                .lookup(&from_loc)
+                .map_err(|e| e.to_string())?
+        }
+    };
+    let target = lock(&shared.registry)?
+        .lookup(&to_loc)
+        .map_err(|e| e.to_string())?;
+    let (project_id, summary) = match (source, target) {
+        (None, None) => {
+            let id = lock(&shared.registry)?
+                .resolve(&to_loc, now_secs())
+                .map_err(|e| e.to_string())?;
+            let text = format!("프로젝트 {id}을(를) {}에 만들었습니다.\n", to_loc.path);
+            (id, text)
+        }
+        (Some(source), None) => {
+            lock(&shared.registry)?
+                .relocate(&source, &to_loc)
+                .map_err(|e| e.to_string())?;
+            let text = format!(
+                "프로젝트 {source}의 위치를 {}(으)로 바꿨습니다.\n",
+                to_loc.path
+            );
+            (source, text)
+        }
+        (Some(source), Some(target)) if source != target => {
+            let text = merge(shared, &source, &target)?;
+            (target, text)
+        }
+        (_, Some(target)) => (target, "변경 없음\n".to_string()),
+    };
+    Ok(Response::ImportPlan {
+        project_id,
+        summary,
+        sessions: Vec::new(),
+    })
+}
+
+/// 쓰기 스레드에서 프로젝트를 정한 뒤, 이 스레드에서 transcript를 훑어 후보를 붙인다. (FR-IMP-1, FR-IMP-2)
+fn import_plan(shared: &Shared, from: String, to: String) -> Result<Response, String> {
+    let (from_path, from_location) = import_origin(shared, &from)?;
+    let resp = send_write(
+        shared,
+        |reply| WriteJob::ImportPrepare { from, to, reply },
+        "import",
+    );
+    let Response::ImportPlan {
+        project_id,
+        summary,
+        ..
+    } = resp
+    else {
+        return Ok(resp);
+    };
+    let locate = |p: &Path| shared.locate(&p.to_string_lossy());
+    let sessions = candidates(
+        &shared.config.import.transcripts_dir,
+        &from_path,
+        &from_location,
+        &locate,
+    );
+    Ok(Response::ImportPlan {
+        project_id,
+        summary,
+        sessions,
+    })
+}
+
+/// 세션 하나를 대상 프로젝트로 가져온다. 다른 프로젝트에 고정된 세션은 건너뛴다. (FR-IMP-3, FR-IMP-7)
+fn import_one(
+    shared: &Shared,
+    redactor: &Redactor,
+    options: IngestOptions,
+    project_id: &str,
+    session_id: &str,
+    transcript_path: &Path,
+) -> Result<Response, String> {
+    if shared.reindexing.load(Ordering::SeqCst) {
+        return Err("재색인 중에는 가져올 수 없습니다".into());
+    }
+    let bound = {
+        let mut registry = lock(&shared.registry)?;
+        if registry
+            .project(project_id)
+            .map_err(|e| e.to_string())?
+            .is_none()
+        {
+            return Err(format!("프로젝트가 없습니다: {project_id}"));
+        }
+        let bound = registry
+            .session_project(session_id)
+            .map_err(|e| e.to_string())?;
+        if bound.is_none() {
+            registry
+                .bind_session(session_id, project_id)
+                .map_err(|e| e.to_string())?;
+        }
+        bound
+    };
+    let mut records = shared.records(project_id)?;
+    let report = match bound {
+        Some(other) if other != project_id => ImportReport {
+            outcome: ImportOutcome::OtherProject,
+            iterations: 0,
+            completions: 0,
+            fork_skipped: 0,
+        },
+        _ => import_session(&mut records, redactor, options, session_id, transcript_path)
+            .map_err(|e| e.to_string())?,
+    };
+    shared.enqueue_pending(project_id, &records);
+    let pending_embeds = records.counts().map_err(|e| e.to_string())?.embed_jobs;
+    Ok(Response::ImportSession(ImportSessionReport {
+        outcome: report.outcome,
+        iterations: report.iterations,
+        completions: report.completions,
+        fork_skipped: report.fork_skipped,
+        pending_embeds,
+    }))
 }
 
 /// 원본의 기록을 대상으로 병합하고 원본을 지운다. (FR-PRJ-9)
@@ -854,11 +1008,21 @@ fn handle_request(shared: &Arc<Shared>, req: Request) -> Response {
         Request::Ingest(ingest_req) => {
             return send_write(shared, |tx| WriteJob::Ingest(ingest_req, tx), "ingest");
         }
-        Request::ProjectAdopt { source, cwd } => {
+        Request::ImportPrepare { from, to } => import_plan(shared, from, to),
+        Request::ImportSession {
+            project_id,
+            session_id,
+            transcript_path,
+        } => {
             return send_write(
                 shared,
-                |reply| WriteJob::Adopt { source, cwd, reply },
-                "adopt",
+                |reply| WriteJob::ImportSession {
+                    project_id,
+                    session_id,
+                    transcript_path,
+                    reply,
+                },
+                "import",
             );
         }
         Request::Reindex { scope, cwd } => return start_reindex(shared, &scope, &cwd),
