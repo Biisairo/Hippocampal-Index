@@ -116,12 +116,13 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 | IF-HK-1 | `smem hook <event>`는 stdin으로 hook 입력 JSON 1개를 받아야 한다. `<event>`는 `post-tool-batch`, `stop`, `stop-failure`, `session-end`, `user-prompt-submit` 중 하나이다. | M |
 | IF-HK-2 | `user-prompt-submit`을 뺀 모든 hook은 항상 종료 코드 0으로 끝나야 하며 stdout에 아무것도 출력하지 않아야 한다. | M |
 | IF-HK-3 | `user-prompt-submit`은 주입할 기억이 있으면 `hookSpecificOutput.additionalContext`를 담은 JSON 1개를 stdout에 출력하고, 없으면 아무것도 출력하지 않아야 한다. 어떤 경우에도 프롬프트를 차단하지 않아야 한다(종료 코드 0). | M |
-| IF-HK-4 | `smem hooks-config`는 Claude Code `settings.json`에 넣을 hook 설정 JSON을 stdout에 출력해야 한다. 수집 hook(`PostToolBatch`, `Stop`, `StopFailure`, `SessionEnd`)은 `async: true`로 설정한다. | M |
+| IF-HK-4 | `smem hooks-config`는 Claude Code `settings.json`에 넣을 hook 설정 JSON을 stdout에 출력해야 한다. 수집 hook(`PostToolBatch`, `Stop`, `StopFailure`, `SessionEnd`)은 `async: true`로 설정한다. `UserPromptSubmit`은 동기로 두고 `timeout`(초)을 시간 예산보다 크게 설정한다. 명령 경로는 실행 중인 `smem`의 절대 경로를 쓴다. | M |
+| IF-HK-5 | 수집 hook 클라이언트는 데몬에 요청을 보내고 처리 완료 응답을 기다린다(기본 10초). 연결할 수 없으면 FR-CAP-5에 따라 스풀에 기록한다. 응답 대기 중 시간이 지나면 그대로 종료한다. | M |
 
 #### 3.1.2 CLI 인터페이스
 | ID | 요구사항 | 우선순위 |
 |----|----------|----------|
-| IF-CLI-1 | `smem search <query> [--scope cwd\|all\|<path>] [--kind iteration\|result\|both] [--limit N]`는 검색 결과를 사람이 읽을 수 있는 텍스트로 출력해야 한다. 기본값은 `--scope cwd --kind iteration --limit 10`이다. | M |
+| IF-CLI-1 | `smem search <query> [--scope cwd\|all\|<path>] [--kind iteration\|result\|both] [--limit N]`는 검색 결과를 사람이 읽을 수 있는 텍스트로 출력해야 한다. 기본값은 `--scope cwd --kind iteration --limit 10`이다. `search`, `show`, `status`는 데몬에 요청하며, 데몬이 응답하지 않으면 오류 메시지를 stderr에 출력하고 종료 코드 1로 끝난다. | M |
 | IF-CLI-2 | `smem show <prompt_id>`는 해당 턴의 반복을 순서대로 복원해 출력해야 한다. `--with-results` 옵션을 주면 연결된 결과 원문도 출력한다. | M |
 | IF-CLI-3 | `smem daemon`은 데몬을 포그라운드로 실행해야 한다. | M |
 | IF-CLI-4 | `smem launchd-plist`는 데몬 자동 실행용 launchd plist를 stdout에 출력해야 한다. | S |
@@ -131,7 +132,7 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 | ID | 요구사항 | 우선순위 |
 |----|----------|----------|
 | IF-SK-1 | 데몬은 `~/.session-memory/smem.sock` Unix socket으로 줄 단위 JSON 요청과 응답을 주고받아야 한다. | M |
-| IF-SK-2 | 요청 종류는 `ingest`(hook 이벤트 전달), `search`, `show`, `status`이다. | M |
+| IF-SK-2 | 요청 종류는 `ingest`(hook 이벤트 전달), `inject`(자동 주입 텍스트 생성), `search`, `show`, `status`이다. 연결 하나에 요청 하나, 응답 하나를 주고받는다. | M |
 
 #### 3.1.4 Skill
 | ID | 요구사항 | 우선순위 |
@@ -147,8 +148,8 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 | FR-CAP-2 | `PostToolBatch`(메인 루프)를 받으면 해당 세션에 대해 transcript 처리와 batch 완료 판정(FR-EXT-7 b)을 요청해야 한다. | M |
 | FR-CAP-3 | `Stop`과 `StopFailure`(메인 루프)를 받으면 해당 세션에 대해 transcript 처리를 요청하고, 마지막 반복을 완료로 확정해야 한다. | M |
 | FR-CAP-4 | `SessionEnd`를 받으면 해당 세션의 미처리 transcript 라인을 모두 처리하고, 처리 후에도 반복에 붙지 않은 반복 입력은 버려야 한다. 완료 알림은 FR-BG-2에 따라 이미 처리된 상태다. | M |
-| FR-CAP-5 | hook 클라이언트는 데몬에 연결할 수 없으면 요청을 스풀 파일에 추가하고 종료해야 한다. | M |
-| FR-CAP-6 | 데몬은 시작할 때 스풀에 쌓인 요청을 기록 순서대로 처리해야 한다. | M |
+| FR-CAP-5 | hook 클라이언트는 데몬에 연결할 수 없으면 요청을 스풀 파일(`spool/pending.jsonl`, 권한 0600)에 한 줄로 추가하고 종료해야 한다. 스풀에는 이벤트, `session_id`, `transcript_path`만 기록한다. | M |
+| FR-CAP-6 | 데몬은 시작할 때 스풀에 쌓인 요청을 기록 순서대로 처리해야 한다. 처리 전에 스풀 파일 이름을 바꿔, 처리 중에 새로 들어오는 요청이 새 스풀 파일에 쌓이게 한다. 이전 실행에서 처리하지 못한 이름 바뀐 스풀 파일이 있으면 먼저 처리한다. | M |
 
 #### 3.2.2 transcript 해석 (EXT)
 | ID | 요구사항 | 우선순위 |
@@ -171,7 +172,7 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 | FR-BG-1 | `tool_input.run_in_background == true`인 `Bash` 또는 `Agent` 호출은 `tool_use_id`를 키로 하는 대기(pending) 기록을 만들어야 한다. 작업 id는 해당 tool_result 라인의 `toolUseResult` 객체에서 얻는다(Bash: `backgroundTaskId`, Agent: `agentId`). | M |
 | FR-BG-2 | 반복 입력에서 `<task-notification>`을 찾으면 반복 완료를 기다리지 않고 즉시 `task-id`, `tool-use-id`, `output-file`, `status`, `summary`를 파싱해 처리해야 한다. 알림은 transcript 라인의 `uuid`로 식별하며, 같은 `uuid`의 알림을 다시 처리해도 결과가 바뀌지 않아야 한다. | M |
 | FR-BG-3 | 파싱한 `tool-use-id`로 대기 기록을 찾아 완료 결과를 연결해야 한다. 대기 기록이 없으면 알림만 반복 입력으로 저장한다. | M |
-| FR-BG-7 | 작업 종류(Bash/Agent)는 같은 처리 단위의 시작 호출이나 원본 저장소의 대기 기록에서 찾는다. 찾지 못하면 `output-file` 내용을 그대로 결과로 저장한다. | M |
+| FR-BG-7 | 작업 종류(Bash/Agent)와 작업 id는 같은 처리 단위의 시작 호출이나 원본 저장소의 대기 기록에서 찾는다. 다음을 모두 만족할 때만 `output-file`을 읽어야 한다: (a) 시작 호출을 찾음, (b) 알림의 `task-id`가 시작 호출의 작업 id와 같음, (c) `output-file`이 `…/<session_id>/tasks/<task_id>.output` 형태임, (d) Bash는 해당 경로가 심볼릭 링크가 아닌 일반 파일임, (e) Agent는 링크를 따라간 실제 경로가 `<transcript 디렉터리>/<session_id>/subagents/agent-<task_id>.jsonl`임. 하나라도 만족하지 않으면 결과 없이 상태와 요약만 저장한다. 위조된 알림으로 임의 파일을 읽지 않기 위한 제한이다. | M |
 | FR-BG-4 | Bash 작업은 알림을 감지한 즉시 `output-file` 내용을 읽어 결과로 저장해야 한다. 파일이 없으면 `status`와 `summary`만 저장한다. | M |
 | FR-BG-5 | Agent 작업은 `output-file`(서브에이전트 transcript)에서 마지막 `SubagentHandback` 호출의 `tool_input.message`를 결과로 저장해야 한다. 이 호출이 없으면 마지막 assistant `text`를 저장한다. | M |
 | FR-BG-6 | 같은 `task-id`로 `uuid`가 다른 알림이 여러 번 오면 기존 결과를 덮어쓰지 않고 순번을 붙여 추가해야 한다. | M |
@@ -220,6 +221,8 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 | FR-DMN-2 | 원본 저장소와 벡터 저장소 쓰기는 데몬만 수행해야 한다. | M |
 | FR-DMN-3 | 데몬은 세션 단위 처리 요청을 직렬로 처리해 같은 세션을 동시에 처리하지 않아야 한다. | M |
 | FR-DMN-4 | 데몬은 처리 오류를 `~/.session-memory/logs/`에 기록하고 계속 동작해야 한다. | M |
+| FR-DMN-5 | 데몬은 시작할 때 데이터 루트와 하위 디렉터리를 권한 0700으로 만들거나 맞추고, 잠금을 얻은 뒤 남아 있는 소켓 파일을 지우고 새로 만들어야 한다. 소켓 파일 권한은 0600이다. | M |
+| FR-DMN-6 | 수집은 전용 스레드 하나가 요청 순서대로 처리해야 한다. 임베딩 작업은 별도 스레드가 처리하며, 수집이 끝날 때마다 깨어나고 실패하면 일정 시간 뒤 재시도한다. 벡터 저장소가 호환되지 않으면(FR-SWP-6) 임베딩 작업 스레드는 작업을 처리하지 않는다. | M |
 
 ### 3.3 성능 요구사항
 | ID | 요구사항 |

@@ -4,6 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::time::Instant;
 
+use serde::{Deserialize, Serialize};
+
 use crate::embed_text::input_text;
 use crate::embedder::{EmbedError, Embedder};
 use crate::store::{FtsFilter, RecordKind, RecordStore, StoreError, StoredIteration};
@@ -28,14 +30,15 @@ pub struct VectorBackends<'a> {
     pub vectors: &'a dyn VectorStore,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SearchKind {
     Iteration,
     Result,
     Both,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchRequest {
     pub query: String,
     pub kind: SearchKind,

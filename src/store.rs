@@ -174,6 +174,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS results_fts USING fts5(text, content='results
 ";
 
 const PENDING_STATUS: &str = "pending";
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(unix)]
 const DIR_MODE: u32 = 0o700;
 #[cfg(unix)]
@@ -193,6 +194,7 @@ impl RecordStore {
     pub fn open(path: &Path) -> Result<Self> {
         prepare_owner_only(path)?;
         let conn = Connection::open(path)?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         Self::init(conn)
     }
