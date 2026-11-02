@@ -1,0 +1,23 @@
+{
+  "session_id": "78507f8e-dc4c-49a8-8c47-a6e478d0ed71",
+  "transcript_path": "/Users/user/.claude/projects/-Users-user-personal-session-db-probe/78507f8e-dc4c-49a8-8c47-a6e478d0ed71.jsonl",
+  "cwd": "/Users/user/personal/session_db/probe",
+  "prompt_id": "f7c6e6ed-bc5a-4105-8eec-b11a67768855",
+  "permission_mode": "auto",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "백그라운드 작업(ID `bm0rqrvzr`)이 실행 중입니다. 완료 알림이 오면 출력 결과를 알려 드리겠습니다.",
+  "background_tasks": [
+    {
+      "id": "bm0rqrvzr",
+      "type": "shell",
+      "status": "running",
+      "description": "Run sleep then echo in background",
+      "command": "sleep 5; echo bg-done"
+    }
+  ],
+  "session_crons": []
+}

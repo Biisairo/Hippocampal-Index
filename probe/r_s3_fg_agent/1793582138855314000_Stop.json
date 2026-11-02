@@ -1,0 +1,15 @@
+{
+  "session_id": "24ae434f-f9cb-4ed9-9edf-98fede93c411",
+  "transcript_path": "/Users/user/.claude/projects/-Users-user-personal-session-db-probe/24ae434f-f9cb-4ed9-9edf-98fede93c411.jsonl",
+  "cwd": "/Users/user/personal/session_db/probe",
+  "prompt_id": "c3e9403c-a9fb-4d94-a355-4c15cf1141c0",
+  "permission_mode": "auto",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "현재 디렉터리 파일 목록: log_hook.py, settings.json, out_s1_notool.json, out_s2_tools.json, out_s3_fg_agent.json, r_s1_notool/1793582109369841000_Stop.json, r_s2_tools/(PostToolUse 2개, PostToolBatch 1개, Stop 1개), logs/1793582130144456000_SubagentStart.json",
+  "background_tasks": [],
+  "session_crons": []
+}

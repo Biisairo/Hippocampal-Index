@@ -1,0 +1,15 @@
+{
+  "session_id": "40c046b1-c6a7-4e0c-8d41-f78b1f948059",
+  "transcript_path": "/Users/user/.claude/projects/-Users-user-personal-session-db-probe/40c046b1-c6a7-4e0c-8d41-f78b1f948059.jsonl",
+  "cwd": "/Users/user/personal/session_db/probe",
+  "prompt_id": "5fbbafee-ddf5-46cb-a3bf-064b78a94b05",
+  "permission_mode": "auto",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "24",
+  "background_tasks": [],
+  "session_crons": []
+}

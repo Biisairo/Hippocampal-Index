@@ -1,0 +1,21 @@
+{
+  "session_id": "78507f8e-dc4c-49a8-8c47-a6e478d0ed71",
+  "transcript_path": "/Users/user/.claude/projects/-Users-user-personal-session-db-probe/78507f8e-dc4c-49a8-8c47-a6e478d0ed71.jsonl",
+  "cwd": "/Users/user/personal/session_db/probe",
+  "prompt_id": "d5e737c4-c70e-406c-abb0-0431487c643c",
+  "permission_mode": "auto",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolBatch",
+  "tool_calls": [
+    {
+      "tool_name": "Read",
+      "tool_input": {
+        "file_path": "/private/tmp/claude-501/-Users-user-personal-session-db-probe/78507f8e-dc4c-49a8-8c47-a6e478d0ed71/tasks/bm0rqrvzr.output"
+      },
+      "tool_use_id": "toolu_01UV9kVomc8QUj9d8M6c8B27",
+      "tool_response": "1\tbg-done\n2\t\n3\t[exited with code 0]\n4\t"
+    }
+  ]
+}

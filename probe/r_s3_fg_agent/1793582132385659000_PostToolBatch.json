@@ -1,0 +1,24 @@
+{
+  "session_id": "24ae434f-f9cb-4ed9-9edf-98fede93c411",
+  "transcript_path": "/Users/user/.claude/projects/-Users-user-personal-session-db-probe/24ae434f-f9cb-4ed9-9edf-98fede93c411.jsonl",
+  "cwd": "/Users/user/personal/session_db/probe",
+  "prompt_id": "c3e9403c-a9fb-4d94-a355-4c15cf1141c0",
+  "permission_mode": "auto",
+  "agent_id": "a9a4012efcf2e2824",
+  "agent_type": "Explore",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolBatch",
+  "tool_calls": [
+    {
+      "tool_name": "Glob",
+      "tool_input": {
+        "pattern": "*",
+        "path": "/Users/user/personal/session_db/probe"
+      },
+      "tool_use_id": "toolu_01QZKon8iiLvikNrZ1W5jNrm",
+      "tool_response": "log_hook.py\nsettings.json\nr_s1_notool/1793582109369841000_Stop.json\nout_s1_notool.json\nr_s2_tools/1793582115571723000_PostToolUse.json\nr_s2_tools/1793582115916786000_PostToolUse.json\nr_s2_tools/1793582115945504000_PostToolBatch.json\nr_s2_tools/1793582122364771000_Stop.json\nout_s2_tools.json\nout_s3_fg_agent.json\nlogs/1793582130144456000_SubagentStart.json"
+    }
+  ]
+}

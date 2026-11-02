@@ -1,0 +1,27 @@
+{
+  "session_id": "afd070e6-4625-4b31-8c43-f1f553949222",
+  "transcript_path": "/Users/user/.claude/projects/-Users-user-personal-session-db-probe/afd070e6-4625-4b31-8c43-f1f553949222.jsonl",
+  "cwd": "/Users/user/personal/session_db/probe",
+  "prompt_id": "8f64252a-0037-484d-a451-35aa2c0076ed",
+  "permission_mode": "auto",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Read",
+  "tool_input": {
+    "file_path": "/Users/user/personal/session_db/probe/log_hook.py"
+  },
+  "tool_response": {
+    "type": "text",
+    "file": {
+      "filePath": "/Users/user/personal/session_db/probe/log_hook.py",
+      "content": "import json, os, sys, time\nraw = sys.stdin.read()\nd = json.loads(raw) if raw.strip() else {}\nev = d.get(\"hook_event_name\", \"unknown\")\nout = os.path.join(os.path.dirname(os.path.abspath(__file__)), \"logs\", f\"{time.time_ns()}_{ev}.json\")\nwith open(out, \"w\") as f:\n    json.dump(d, f, ensure_ascii=False, indent=2)\n",
+      "numLines": 8,
+      "startLine": 1,
+      "totalLines": 8
+    }
+  },
+  "tool_use_id": "toolu_01LWq9quNriksCyMsAvfgvjK",
+  "duration_ms": 2
+}

@@ -1,0 +1,31 @@
+{
+  "session_id": "40c046b1-c6a7-4e0c-8d41-f78b1f948059",
+  "transcript_path": "/Users/user/.claude/projects/-Users-user-personal-session-db-probe/40c046b1-c6a7-4e0c-8d41-f78b1f948059.jsonl",
+  "cwd": "/Users/user/personal/session_db/probe",
+  "prompt_id": "2fdc563f-33d6-411f-9db5-1b3a841e4150",
+  "permission_mode": "auto",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Agent",
+  "tool_input": {
+    "description": "Count files via Glob",
+    "prompt": "Glob 도구를 정확히 한 번만 호출해서 /Users/user/personal/session_db/probe 디렉터리의 파일 개수를 세라. pattern은 \"**/*\", path는 /Users/user/personal/session_db/probe 로 지정한다. 다른 도구는 쓰지 않는다. 결과로 파일 개수(숫자)만 보고한다.",
+    "subagent_type": "Explore",
+    "run_in_background": true
+  },
+  "tool_response": {
+    "isAsync": true,
+    "status": "async_launched",
+    "agentId": "a65370863753f6d78",
+    "description": "Count files via Glob",
+    "resolvedModel": "claude-opus-5-5",
+    "prompt": "Glob 도구를 정확히 한 번만 호출해서 /Users/user/personal/session_db/probe 디렉터리의 파일 개수를 세라. pattern은 \"**/*\", path는 /Users/user/personal/session_db/probe 로 지정한다. 다른 도구는 쓰지 않는다. 결과로 파일 개수(숫자)만 보고한다.",
+    "outputFile": "/private/tmp/claude-501/-Users-user-personal-session-db-probe/40c046b1-c6a7-4e0c-8d41-f78b1f948059/tasks/a65370863753f6d78.output",
+    "canReadOutputFile": true,
+    "canContinueAgent": true
+  },
+  "tool_use_id": "toolu_011MdRAe8c4q2Ua6xuusj2hf",
+  "duration_ms": 5
+}

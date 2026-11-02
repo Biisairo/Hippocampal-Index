@@ -1,0 +1,15 @@
+{
+  "session_id": "78507f8e-dc4c-49a8-8c47-a6e478d0ed71",
+  "transcript_path": "/Users/user/.claude/projects/-Users-user-personal-session-db-probe/78507f8e-dc4c-49a8-8c47-a6e478d0ed71.jsonl",
+  "cwd": "/Users/user/personal/session_db/probe",
+  "prompt_id": "d5e737c4-c70e-406c-abb0-0431487c643c",
+  "permission_mode": "auto",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "출력은 `bg-done`입니다(exit code 0).",
+  "background_tasks": [],
+  "session_crons": []
+}

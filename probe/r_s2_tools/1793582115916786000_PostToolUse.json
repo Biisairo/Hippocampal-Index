@@ -1,0 +1,27 @@
+{
+  "session_id": "afd070e6-4625-4b31-8c43-f1f553949222",
+  "transcript_path": "/Users/user/.claude/projects/-Users-user-personal-session-db-probe/afd070e6-4625-4b31-8c43-f1f553949222.jsonl",
+  "cwd": "/Users/user/personal/session_db/probe",
+  "prompt_id": "8f64252a-0037-484d-a451-35aa2c0076ed",
+  "permission_mode": "auto",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Read",
+  "tool_input": {
+    "file_path": "/Users/user/personal/session_db/probe/settings.json"
+  },
+  "tool_response": {
+    "type": "text",
+    "file": {
+      "filePath": "/Users/user/personal/session_db/probe/settings.json",
+      "content": "{\n  \"hooks\": {\n    \"PostToolBatch\": [\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"python3 /Users/user/personal/session_db/probe/log_hook.py\"\n          }\n        ]\n      }\n    ],\n    \"PostToolUse\": [\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"python3 /Users/user/personal/session_db/probe/log_hook.py\"\n          }\n        ]\n      }\n    ],\n    \"Stop\": [\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"python3 /Users/user/personal/session_db/probe/log_hook.py\"\n          }\n        ]\n      }\n    ],\n    \"StopFailure\": [\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"python3 /Users/user/personal/session_db/probe/log_hook.py\"\n          }\n        ]\n      }\n    ],\n    \"SubagentStart\": [\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"python3 /Users/user/personal/session_db/probe/log_hook.py\"\n          }\n        ]\n      }\n    ],\n    \"SubagentStop\": [\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"python3 /Users/user/personal/session_db/probe/log_hook.py\"\n          }\n        ]\n      }\n    ]\n  }\n}",
+      "numLines": 64,
+      "startLine": 1,
+      "totalLines": 64
+    }
+  },
+  "tool_use_id": "toolu_01XmbosqF2xMEXPkrnzwo4zm",
+  "duration_ms": 1
+}

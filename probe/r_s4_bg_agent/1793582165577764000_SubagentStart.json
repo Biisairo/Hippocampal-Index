@@ -1,0 +1,9 @@
+{
+  "session_id": "40c046b1-c6a7-4e0c-8d41-f78b1f948059",
+  "transcript_path": "/Users/user/.claude/projects/-Users-user-personal-session-db-probe/40c046b1-c6a7-4e0c-8d41-f78b1f948059.jsonl",
+  "cwd": "/Users/user/personal/session_db/probe",
+  "prompt_id": "2fdc563f-33d6-411f-9db5-1b3a841e4150",
+  "agent_id": "a65370863753f6d78",
+  "agent_type": "Explore",
+  "hook_event_name": "SubagentStart"
+}

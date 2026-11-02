@@ -1,0 +1,25 @@
+{
+  "session_id": "40c046b1-c6a7-4e0c-8d41-f78b1f948059",
+  "transcript_path": "/Users/user/.claude/projects/-Users-user-personal-session-db-probe/40c046b1-c6a7-4e0c-8d41-f78b1f948059.jsonl",
+  "cwd": "/Users/user/personal/session_db/probe",
+  "prompt_id": "5fbbafee-ddf5-46cb-a3bf-064b78a94b05",
+  "permission_mode": "auto",
+  "agent_id": "a65370863753f6d78",
+  "agent_type": "Explore",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "SubagentStop",
+  "stop_hook_active": false,
+  "agent_transcript_path": "/Users/user/.claude/projects/-Users-user-personal-session-db-probe/40c046b1-c6a7-4e0c-8d41-f78b1f948059/subagents/agent-a65370863753f6d78.jsonl",
+  "background_tasks": [
+    {
+      "id": "a65370863753f6d78",
+      "type": "subagent",
+      "status": "running",
+      "description": "Count files via Glob",
+      "agent_type": "Explore"
+    }
+  ],
+  "session_crons": []
+}

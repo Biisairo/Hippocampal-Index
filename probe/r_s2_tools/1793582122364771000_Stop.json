@@ -1,0 +1,15 @@
+{
+  "session_id": "afd070e6-4625-4b31-8c43-f1f553949222",
+  "transcript_path": "/Users/user/.claude/projects/-Users-user-personal-session-db-probe/afd070e6-4625-4b31-8c43-f1f553949222.jsonl",
+  "cwd": "/Users/user/personal/session_db/probe",
+  "prompt_id": "8f64252a-0037-484d-a451-35aa2c0076ed",
+  "permission_mode": "auto",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "두 파일은 병렬로 다 읽었지만, 직후 안전 분류기가 응답을 중단해서 `ls` 단계는 실행되지 않았습니다. 그래서 디렉터리 목록은 확인하지 못했습니다.\n\n**요약:** `settings.json`은 6개 hook 이벤트(PostToolBatch, PostToolUse, Stop, StopFailure, SubagentStart, SubagentStop)에서 `log_hook.py`를 호출하고, `log_hook.py`는 stdin으로 받은 hook 페이로드를 `logs/<나노초 타임스탬프>_<이벤트명>.json`에 저장합니다.\n\n`ls` 결과가 필요하면 다시 요청해 주세요.",
+  "background_tasks": [],
+  "session_crons": []
+}

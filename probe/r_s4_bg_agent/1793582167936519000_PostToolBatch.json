@@ -1,0 +1,24 @@
+{
+  "session_id": "40c046b1-c6a7-4e0c-8d41-f78b1f948059",
+  "transcript_path": "/Users/user/.claude/projects/-Users-user-personal-session-db-probe/40c046b1-c6a7-4e0c-8d41-f78b1f948059.jsonl",
+  "cwd": "/Users/user/personal/session_db/probe",
+  "prompt_id": "2fdc563f-33d6-411f-9db5-1b3a841e4150",
+  "permission_mode": "auto",
+  "agent_id": "a65370863753f6d78",
+  "agent_type": "Explore",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolBatch",
+  "tool_calls": [
+    {
+      "tool_name": "Glob",
+      "tool_input": {
+        "pattern": "**/*",
+        "path": "/Users/user/personal/session_db/probe"
+      },
+      "tool_use_id": "toolu_019oToQRHu1gSGeTReDYupog",
+      "tool_response": "log_hook.py\nsettings.json\nr_s1_notool/1793582109369841000_Stop.json\nout_s1_notool.json\nr_s2_tools/1793582115571723000_PostToolUse.json\nr_s2_tools/1793582115916786000_PostToolUse.json\nr_s2_tools/1793582115945504000_PostToolBatch.json\nr_s2_tools/1793582122364771000_Stop.json\nout_s2_tools.json\nr_s3_fg_agent/1793582130144456000_SubagentStart.json\nr_s3_fg_agent/1793582132341674000_PostToolUse.json\nr_s3_fg_agent/1793582132385659000_PostToolBatch.json\nr_s3_fg_agent/1793582135928510000_PostToolUse.json\nr_s3_fg_agent/1793582135979500000_PostToolBatch.json\nr_s3_fg_agent/1793582136025917000_SubagentStop.json\nr_s3_fg_agent/1793582136084297000_PostToolUse.json\nr_s3_fg_agent/1793582136129803000_PostToolBatch.json\nr_s3_fg_agent/1793582138855314000_Stop.json\nout_s3_fg_agent.json\nout_s4_bg_agent.json\nlogs/1793582165577764000_SubagentStart.json\nlogs/1793582165578283000_PostToolUse.json\nlogs/1793582165620461000_PostToolBatch.json\nlogs/1793582167650029000_Stop.json"
+    }
+  ]
+}

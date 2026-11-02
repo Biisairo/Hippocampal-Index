@@ -1,0 +1,23 @@
+{
+  "session_id": "78507f8e-dc4c-49a8-8c47-a6e478d0ed71",
+  "transcript_path": "/Users/user/.claude/projects/-Users-user-personal-session-db-probe/78507f8e-dc4c-49a8-8c47-a6e478d0ed71.jsonl",
+  "cwd": "/Users/user/personal/session_db/probe",
+  "prompt_id": "f7c6e6ed-bc5a-4105-8eec-b11a67768855",
+  "permission_mode": "auto",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolBatch",
+  "tool_calls": [
+    {
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": "sleep 5; echo bg-done",
+        "description": "Run sleep then echo in background",
+        "run_in_background": true
+      },
+      "tool_use_id": "toolu_01D9M8zTeQeTTXW1FhAmqgRV",
+      "tool_response": "Command running in background with ID: bm0rqrvzr. Output is being written to: /private/tmp/claude-501/-Users-user-personal-session-db-probe/78507f8e-dc4c-49a8-8c47-a6e478d0ed71/tasks/bm0rqrvzr.output. You will be notified when it completes. To check interim output, use Read on that file path."
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "session_id": "40c046b1-c6a7-4e0c-8d41-f78b1f948059",
+  "transcript_path": "/Users/user/.claude/projects/-Users-user-personal-session-db-probe/40c046b1-c6a7-4e0c-8d41-f78b1f948059.jsonl",
+  "cwd": "/Users/user/personal/session_db/probe",
+  "prompt_id": "2fdc563f-33d6-411f-9db5-1b3a841e4150",
+  "permission_mode": "auto",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "Explore 에이전트가 백그라운드에서 Glob으로 파일 개수를 세고 있습니다. 완료 알림이 오면 숫자를 한 줄로 알려 드리겠습니다.",
+  "background_tasks": [
+    {
+      "id": "a65370863753f6d78",
+      "type": "subagent",
+      "status": "running",
+      "description": "Count files via Glob",
+      "agent_type": "Explore"
+    }
+  ],
+  "session_crons": []
+}
