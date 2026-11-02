@@ -21,7 +21,7 @@ fn defaults_match_srs() {
             c.inject.total_chars,
             c.inject.budget_ms
         ),
-        (0.55, 3, 800, 4_000, 800)
+        (0.40, 3, 800, 4_000, 800)
     );
     assert_eq!(c.index.vector_index_threshold, 100_000);
     assert!(c.redact.patterns.is_empty());

@@ -8,6 +8,8 @@ pub mod embedder;
 pub mod fsutil;
 pub mod indexer;
 pub mod ingest;
+pub mod lance;
+pub mod ollama;
 pub mod protocol;
 pub mod redact;
 pub mod search;

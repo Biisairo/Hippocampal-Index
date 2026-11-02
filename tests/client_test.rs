@@ -316,6 +316,14 @@ fn backend_selection() {
             .unwrap(),
         0
     );
+    let real = Config::default();
+    assert_eq!(
+        build_embedder(&real).unwrap().model_id(),
+        "qwen3-embedding:0.6b"
+    );
+    let lance = build_vector_store(&real, &paths).unwrap();
+    assert_eq!(lance.count().unwrap(), 0);
+    assert!(paths.vectors("default").exists(), "LanceDB 디렉터리 생성");
     config.embedder.backend = "nope".into();
     assert!(matches!(
         build_embedder(&config),

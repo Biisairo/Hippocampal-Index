@@ -26,6 +26,8 @@ pub struct EmbedderConfig {
     pub dimension: usize,
     pub max_input_tokens: usize,
     pub url: String,
+    /// Ollama가 모델을 메모리에 유지하는 시간. 첫 호출의 모델 로딩 지연을 피한다.
+    pub keep_alive: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -186,6 +188,7 @@ impl Default for EmbedderConfig {
             dimension: 1024,
             max_input_tokens: 32_000,
             url: "http://127.0.0.1:11434".into(),
+            keep_alive: "30m".into(),
         }
     }
 }
@@ -215,7 +218,7 @@ impl Default for EmbedTextConfig {
 impl Default for InjectSection {
     fn default() -> Self {
         Self {
-            threshold: 0.55,
+            threshold: 0.40,
             top_k: 3,
             per_item_chars: 800,
             total_chars: 4_000,

@@ -157,18 +157,19 @@ fn daemon_serves_status_search_show() {
 }
 
 #[test]
-fn daemon_refuses_unavailable_backend() {
+fn daemon_refuses_invalid_config() {
     let dir = tempfile::tempdir_in("/tmp").unwrap();
+    fs::write(
+        dir.path().join("config.toml"),
+        "[embedder]\nurl = \"https://api.example.com\"\n",
+    )
+    .unwrap();
     let out = Command::new(BIN)
         .arg("--root")
         .arg(dir.path())
         .arg("daemon")
         .output()
         .unwrap();
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "기본 설정(ollama)은 아직 사용할 수 없음"
-    );
-    assert!(!out.stderr.is_empty());
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("localhost"));
 }

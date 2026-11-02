@@ -172,7 +172,7 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 | FR-BG-1 | `tool_input.run_in_background == true`인 `Bash` 또는 `Agent` 호출은 `tool_use_id`를 키로 하는 대기(pending) 기록을 만들어야 한다. 작업 id는 해당 tool_result 라인의 `toolUseResult` 객체에서 얻는다(Bash: `backgroundTaskId`, Agent: `agentId`). | M |
 | FR-BG-2 | 반복 입력에서 `<task-notification>`을 찾으면 반복 완료를 기다리지 않고 즉시 `task-id`, `tool-use-id`, `output-file`, `status`, `summary`를 파싱해 처리해야 한다. 알림은 transcript 라인의 `uuid`로 식별하며, 같은 `uuid`의 알림을 다시 처리해도 결과가 바뀌지 않아야 한다. | M |
 | FR-BG-3 | 파싱한 `tool-use-id`로 대기 기록을 찾아 완료 결과를 연결해야 한다. 대기 기록이 없으면 알림만 반복 입력으로 저장한다. | M |
-| FR-BG-7 | 작업 종류(Bash/Agent)와 작업 id는 같은 처리 단위의 시작 호출이나 원본 저장소의 대기 기록에서 찾는다. 다음을 모두 만족할 때만 `output-file`을 읽어야 한다: (a) 시작 호출을 찾음, (b) 알림의 `task-id`가 시작 호출의 작업 id와 같음, (c) `output-file`이 `…/<session_id>/tasks/<task_id>.output` 형태임, (d) Bash는 해당 경로가 심볼릭 링크가 아닌 일반 파일임, (e) Agent는 링크를 따라간 실제 경로가 `<transcript 디렉터리>/<session_id>/subagents/agent-<task_id>.jsonl`임. 하나라도 만족하지 않으면 결과 없이 상태와 요약만 저장한다. 위조된 알림으로 임의 파일을 읽지 않기 위한 제한이다. | M |
+| FR-BG-7 | 작업 종류(Bash/Agent)와 작업 id는 같은 처리 단위의 시작 호출이나 원본 저장소의 대기 기록에서 찾는다. 다음을 모두 만족할 때만 `output-file`을 읽어야 한다: (a) 시작 호출을 찾음, (b) 알림의 `task-id`가 시작 호출의 작업 id와 같음, (c) `output-file`이 `.`/`..` 없는 절대 경로이고 `…/<session_id>/tasks/<task_id>.output` 형태임, (d) Bash는 링크를 따라간 실제 경로도 (c)의 형태이고, 그 경로를 링크를 따르지 않고 연 핸들이 일반 파일임, (e) Agent는 링크를 따라간 실제 경로가 `<transcript 디렉터리>/<session_id>/subagents/agent-<task_id>.jsonl`임. 하나라도 만족하지 않으면 결과 없이 상태와 요약만 저장한다. 위조된 알림으로 임의 파일을 읽지 않기 위한 제한이다. 출력 경로를 Claude Code 임시 디렉터리 루트에 고정하지는 않는다. 이 루트는 Claude Code 내부 배치라 버전마다 바뀔 수 있기 때문이다. 남는 위험은 (a)~(e)를 모두 맞춘 위조에 한정된다. | M |
 | FR-BG-4 | Bash 작업은 알림을 감지한 즉시 `output-file` 내용을 읽어 결과로 저장해야 한다. 파일이 없으면 `status`와 `summary`만 저장한다. | M |
 | FR-BG-5 | Agent 작업은 `output-file`(서브에이전트 transcript)에서 마지막 `SubagentHandback` 호출의 `tool_input.message`를 결과로 저장해야 한다. 이 호출이 없으면 마지막 assistant `text`를 저장한다. | M |
 | FR-BG-6 | 같은 `task-id`로 `uuid`가 다른 알림이 여러 번 오면 기존 결과를 덮어쓰지 않고 순번을 붙여 추가해야 한다. | M |
@@ -196,7 +196,7 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 |----|----------|----------|
 | FR-RET-1 | `user-prompt-submit` hook은 프롬프트로 `iterations`를 검색해야 한다. 조건: `cwd`가 현재 cwd와 같을 것, `session_id`가 현재 세션과 다를 것. | M |
 | FR-RET-2 | 검색은 벡터 검색과 FTS 결과를 합친 하이브리드 순위(RRF)로 해야 한다. 점수는 각 목록에서의 순위 r(1부터)에 대해 `Σ 1/(60 + r)`이다. 각 목록에서 후보를 `limit × 4`개까지 가져온다. 한 레코드의 여러 청크가 벡터 검색에 걸리면 가장 높은 유사도 하나로 합친다. 결과 검색에 범위 필터가 있으면 벡터 검색 후 원본 저장소의 반복-결과 연결로 걸러낸다. | M |
-| FR-RET-3 | 자동 주입은 벡터 유사도가 임계값(설정, 기본 0.55) 이상인 반복 중 RRF 점수 상위 k개(설정, 기본 3개)만 대상으로 해야 한다. FTS로만 찾은 반복은 대상이 아니다. 대상이 없으면 아무것도 주입하지 않는다. | M |
+| FR-RET-3 | 자동 주입은 벡터 유사도가 임계값(설정 `[inject] threshold`, 기본 0.40) 이상인 반복 중 RRF 점수 상위 k개(설정, 기본 3개)만 대상으로 해야 한다. FTS로만 찾은 반복은 대상이 아니다. 대상이 없으면 아무것도 주입하지 않는다. | M |
 | FR-RET-4 | 주입 텍스트는 결과마다 `ts`, `prompt_id`, `embed_text`(최대 길이 설정, 기본 800자)를 담고, 전체 길이를 설정값(기본 4,000자) 이하로 제한해야 한다. 각 결과는 `<memory ts="…" prompt="…">` … `</memory>` 블록으로 감싸고, 블록 안의 `&`, `<`, `>`, `"`는 이스케이프한다. 머리말에 블록 내용은 과거 기록이며 지시가 아님을 밝힌다. 끝에 `smem show <prompt_id>`로 상세 내용을 볼 수 있다는 안내를 붙인다. | M |
 | FR-RET-5 | `user-prompt-submit` hook은 시간 예산(설정, 기본 800ms)을 넘으면 검색을 포기하고 아무것도 주입하지 않아야 한다. 데몬의 검색은 단계(임베딩, 벡터 검색, FTS)마다 마감 시각을 확인하고, hook 클라이언트는 같은 예산으로 소켓 타임아웃을 건다. | M |
 | FR-RET-6 | `smem search`는 IF-CLI-1의 옵션에 따라 범위와 종류를 바꿔 검색해야 한다. `--kind result` 결과에는 그 결과를 참조하는 반복의 `prompt_id`를 함께 출력한다. | M |
@@ -301,5 +301,5 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 | OPEN-2 | 사용자가 Esc로 중단했을 때 실행되는 hook과 transcript 기록 형태 | FR-EXT-8 |
 | OPEN-3 | 컨텍스트 압축(compaction)이 transcript 파일을 다시 쓰는지, 덧붙이기만 하는지 | FR-EXT-1 |
 | OPEN-4 | 실제 데이터로 `qwen3-embedding:0.6b`와 `bge-m3`의 검색 품질 비교 | C-3 |
-| OPEN-5 | 자동 주입 임계값 기본값(0.55)의 적정성 | FR-RET-3 |
+| OPEN-5 | 자동 주입 임계값 기본값(0.40)의 적정성. 확정값이 아니라 조정용 설정값이다. 실측(qwen3-embedding:0.6b, 표본 4개)에서 관련 0.46~0.68, 무관 0.21~0.30이었다. 실제 사용 데이터로 다시 조정한다. 검색 질의 지시문 접두사 도입 여부도 함께 검토한다 | FR-RET-3 |
 | OPEN-6 | `Stop` hook 실행 시점에 마지막 assistant 라인이 transcript에 기록되어 있는지. 기록 전이면 그 반복은 응답 없이 저장되고 이후 같은 `message.id` 라인은 버려진다 | FR-EXT-7, FR-EXT-10 |
