@@ -123,7 +123,11 @@ fn s4_background_agent_message_and_notification() {
                 line_uuid,
                 notification,
                 session_id,
-            } => Some((line_uuid.clone(), notification.clone(), session_id.clone())),
+                ts,
+            } => {
+                assert!(ts.starts_with("2026-"), "알림 라인의 timestamp");
+                Some((line_uuid.clone(), notification.clone(), session_id.clone()))
+            }
             Event::Iteration(_) => None,
         })
         .collect();

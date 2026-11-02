@@ -1,7 +1,9 @@
 pub mod bg;
+pub mod config;
 pub mod embed_text;
 pub mod embedder;
 pub mod indexer;
+pub mod ingest;
 pub mod redact;
 pub mod search;
 pub mod store;

@@ -47,6 +47,7 @@ pub enum Event {
     Notification {
         session_id: String,
         line_uuid: String,
+        ts: String,
         notification: TaskNotification,
     },
 }
@@ -179,6 +180,7 @@ impl Extractor {
             events.push(Event::Notification {
                 session_id: str_field(v, "sessionId").unwrap_or_default().to_string(),
                 line_uuid: str_field(v, "uuid").unwrap_or_default().to_string(),
+                ts: str_field(v, "timestamp").unwrap_or_default().to_string(),
                 notification: n.clone(),
             });
             IterationInput::TaskNotification(n)

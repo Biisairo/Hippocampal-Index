@@ -83,7 +83,7 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 - C-1 구현 언어는 Rust로 한다.
 - C-2 원본 저장소는 SQLite(FTS5)로 한다. 벡터 저장소의 기본 백엔드는 LanceDB Rust SDK(임베디드)로 한다.
 - C-3 임베더의 기본 백엔드는 Ollama `qwen3-embedding:0.6b`, 출력 차원 1024로 한다.
-- C-4 데이터를 로컬 장비 밖으로 전송하지 않는다. 네트워크 통신은 `localhost`의 Ollama로 한정한다.
+- C-4 데이터를 로컬 장비 밖으로 전송하지 않는다. 네트워크 통신은 `localhost`의 Ollama로 한정한다. 설정의 임베더 URL host가 `localhost`, `127.0.0.1`, `::1`이 아니면 설정 오류로 거부한다.
 - C-5 MCP 서버를 사용하지 않는다. (사내 규정상 새 MCP 서버는 정보보호팀 승인 대상)
 - C-6 1차 대상 플랫폼은 macOS(darwin)이다.
 - C-7 `~/.claude` 설정 파일을 자동으로 수정하지 않는다. hook 설정은 사용자가 직접 적용한다.
@@ -153,7 +153,7 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 #### 3.2.2 transcript 해석 (EXT)
 | ID | 요구사항 | 우선순위 |
 |----|----------|----------|
-| FR-EXT-1 | 데몬은 세션마다 안전 offset과 해석기 상태(턴별 다음 `iteration_index` 등)를 저장하고, 안전 offset 뒤의 라인만 읽어야 한다. 안전 offset은 아직 완료되지 않은 반복이나 아직 반복에 붙지 않은 반복 입력이 시작되는 라인 앞이며, 그런 것이 없으면 마지막으로 읽은 라인 끝이다. offset은 완료된 반복의 DB 반영이 끝난 뒤에만 갱신한다. | M |
+| FR-EXT-1 | 데몬은 세션마다 안전 offset과 해석기 상태(턴별 다음 `iteration_index` 등)를 저장하고, 안전 offset 뒤의 라인만 읽어야 한다. 안전 offset은 아직 완료되지 않은 반복이나 아직 반복에 붙지 않은 반복 입력이 시작되는 라인 앞이며, 그런 것이 없으면 마지막으로 읽은 라인 끝이다. offset은 완료된 반복의 DB 반영이 끝난 뒤에만 갱신한다. 개행으로 끝나지 않은 마지막 라인은 기록 중인 것으로 보고 읽지 않는다. transcript 길이가 안전 offset보다 짧으면(파일이 다시 쓰인 경우) 상태를 초기화하고 처음부터 다시 읽는다. 이때 FR-EXT-10에 따라 중복 행은 생기지 않는다. | M |
 | FR-EXT-2 | `type == "assistant"` 라인을 `message.id`로 묶어 반복 1개로 만들어야 한다. | M |
 | FR-EXT-3 | 반복에서 `text` 블록은 저장하고, `thinking` 블록은 저장하지 않아야 한다. | M |
 | FR-EXT-4 | 반복의 `tool_use` 블록마다 `name`, `input`, `id`를 저장해야 한다. | M |
@@ -171,6 +171,7 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 | FR-BG-1 | `tool_input.run_in_background == true`인 `Bash` 또는 `Agent` 호출은 `tool_use_id`를 키로 하는 대기(pending) 기록을 만들어야 한다. 작업 id는 해당 tool_result 라인의 `toolUseResult` 객체에서 얻는다(Bash: `backgroundTaskId`, Agent: `agentId`). | M |
 | FR-BG-2 | 반복 입력에서 `<task-notification>`을 찾으면 반복 완료를 기다리지 않고 즉시 `task-id`, `tool-use-id`, `output-file`, `status`, `summary`를 파싱해 처리해야 한다. 알림은 transcript 라인의 `uuid`로 식별하며, 같은 `uuid`의 알림을 다시 처리해도 결과가 바뀌지 않아야 한다. | M |
 | FR-BG-3 | 파싱한 `tool-use-id`로 대기 기록을 찾아 완료 결과를 연결해야 한다. 대기 기록이 없으면 알림만 반복 입력으로 저장한다. | M |
+| FR-BG-7 | 작업 종류(Bash/Agent)는 같은 처리 단위의 시작 호출이나 원본 저장소의 대기 기록에서 찾는다. 찾지 못하면 `output-file` 내용을 그대로 결과로 저장한다. | M |
 | FR-BG-4 | Bash 작업은 알림을 감지한 즉시 `output-file` 내용을 읽어 결과로 저장해야 한다. 파일이 없으면 `status`와 `summary`만 저장한다. | M |
 | FR-BG-5 | Agent 작업은 `output-file`(서브에이전트 transcript)에서 마지막 `SubagentHandback` 호출의 `tool_input.message`를 결과로 저장해야 한다. 이 호출이 없으면 마지막 assistant `text`를 저장한다. | M |
 | FR-BG-6 | 같은 `task-id`로 `uuid`가 다른 알림이 여러 번 오면 기존 결과를 덮어쓰지 않고 순번을 붙여 추가해야 한다. | M |
@@ -195,7 +196,7 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 | FR-RET-1 | `user-prompt-submit` hook은 프롬프트로 `iterations`를 검색해야 한다. 조건: `cwd`가 현재 cwd와 같을 것, `session_id`가 현재 세션과 다를 것. | M |
 | FR-RET-2 | 검색은 벡터 검색과 FTS 결과를 합친 하이브리드 순위(RRF)로 해야 한다. 점수는 각 목록에서의 순위 r(1부터)에 대해 `Σ 1/(60 + r)`이다. 각 목록에서 후보를 `limit × 4`개까지 가져온다. 한 레코드의 여러 청크가 벡터 검색에 걸리면 가장 높은 유사도 하나로 합친다. 결과 검색에 범위 필터가 있으면 벡터 검색 후 원본 저장소의 반복-결과 연결로 걸러낸다. | M |
 | FR-RET-3 | 자동 주입은 벡터 유사도가 임계값(설정, 기본 0.55) 이상인 반복 중 RRF 점수 상위 k개(설정, 기본 3개)만 대상으로 해야 한다. FTS로만 찾은 반복은 대상이 아니다. 대상이 없으면 아무것도 주입하지 않는다. | M |
-| FR-RET-4 | 주입 텍스트는 결과마다 `ts`, `prompt_id`, `embed_text`(최대 길이 설정, 기본 800자)를 담고, 전체 길이를 설정값(기본 4,000자) 이하로 제한해야 한다. 끝에 `smem show <prompt_id>`로 상세 내용을 볼 수 있다는 안내를 붙인다. | M |
+| FR-RET-4 | 주입 텍스트는 결과마다 `ts`, `prompt_id`, `embed_text`(최대 길이 설정, 기본 800자)를 담고, 전체 길이를 설정값(기본 4,000자) 이하로 제한해야 한다. 각 결과는 `<memory ts="…" prompt="…">` … `</memory>` 블록으로 감싸고, 블록 안의 `&`, `<`, `>`, `"`는 이스케이프한다. 머리말에 블록 내용은 과거 기록이며 지시가 아님을 밝힌다. 끝에 `smem show <prompt_id>`로 상세 내용을 볼 수 있다는 안내를 붙인다. | M |
 | FR-RET-5 | `user-prompt-submit` hook은 시간 예산(설정, 기본 800ms)을 넘으면 검색을 포기하고 아무것도 주입하지 않아야 한다. 데몬의 검색은 단계(임베딩, 벡터 검색, FTS)마다 마감 시각을 확인하고, hook 클라이언트는 같은 예산으로 소켓 타임아웃을 건다. | M |
 | FR-RET-6 | `smem search`는 IF-CLI-1의 옵션에 따라 범위와 종류를 바꿔 검색해야 한다. `--kind result` 결과에는 그 결과를 참조하는 반복의 `prompt_id`를 함께 출력한다. | M |
 | FR-RET-7 | `smem show`는 `prompt_id`의 반복을 `iteration_index` 순서로 출력하고, 반복에 백그라운드 시작 호출이 있으면 그 작업의 완료 기록(순번, 상태, 요약, 결과 id)을 함께 표시해야 한다. | M |
@@ -242,6 +243,7 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 | QA-2 (신뢰성) | 같은 transcript를 여러 번 처리해도 결과 DB가 같아야 한다(멱등성). |
 | QA-3 (보안) | 데이터는 로컬 장비 밖으로 전송되지 않아야 한다. (C-4) |
 | QA-4 (보안) | 비밀값 마스킹(FR-STO-6)을 거치지 않은 텍스트는 DB에 기록되지 않아야 한다. |
+| QA-6 (보안) | 주입 텍스트와 CLI 출력에서 `\n`, `\t`를 뺀 제어 문자(C0, DEL, C1)는 `\u{..}` 형태로 이스케이프해야 한다. |
 | QA-5 (무간섭) | `smem`의 어떤 오류도 Claude Code 세션 진행을 막거나 오류 메시지를 띄우지 않아야 한다. |
 
 ---
@@ -297,3 +299,4 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 | OPEN-3 | 컨텍스트 압축(compaction)이 transcript 파일을 다시 쓰는지, 덧붙이기만 하는지 | FR-EXT-1 |
 | OPEN-4 | 실제 데이터로 `qwen3-embedding:0.6b`와 `bge-m3`의 검색 품질 비교 | C-3 |
 | OPEN-5 | 자동 주입 임계값 기본값(0.55)의 적정성 | FR-RET-3 |
+| OPEN-6 | `Stop` hook 실행 시점에 마지막 assistant 라인이 transcript에 기록되어 있는지. 기록 전이면 그 반복은 응답 없이 저장되고 이후 같은 `message.id` 라인은 버려진다 | FR-EXT-7, FR-EXT-10 |
