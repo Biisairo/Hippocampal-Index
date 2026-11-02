@@ -117,15 +117,15 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 | IF-HK-2 | `user-prompt-submit`을 뺀 모든 hook은 항상 종료 코드 0으로 끝나야 하며 stdout에 아무것도 출력하지 않아야 한다. | M |
 | IF-HK-3 | `user-prompt-submit`은 주입할 기억이 있으면 `hookSpecificOutput.additionalContext`를 담은 JSON 1개를 stdout에 출력하고, 없으면 아무것도 출력하지 않아야 한다. 어떤 경우에도 프롬프트를 차단하지 않아야 한다(종료 코드 0). | M |
 | IF-HK-4 | `hippo hooks-config`는 Claude Code `settings.json`에 넣을 hook 설정 JSON을 stdout에 출력해야 한다. 수집 hook(`PostToolBatch`, `Stop`, `StopFailure`, `SessionEnd`)은 `async: true`로 설정한다. `UserPromptSubmit`은 동기로 두고 `timeout`(초)을 시간 예산보다 크게 설정한다. 명령 경로는 실행 중인 `hippo`의 절대 경로를 쓴다. | M |
-| IF-HK-5 | 수집 hook 클라이언트는 데몬에 요청을 보내고 처리 완료 응답을 기다린다(기본 10초). 연결할 수 없으면 FR-CAP-5에 따라 스풀에 기록한다. 응답 대기 중 시간이 지나면 그대로 종료한다. | M |
+| IF-HK-5 | 수집 hook 클라이언트는 데몬에 요청을 보내고 처리 완료 응답을 기다린다(기본 10초). 요청이 실패하면 FR-DMN-7에 따라 데몬을 띄운 뒤 한 번 다시 보낸다. 그래도 실패하면 FR-CAP-5에 따라 스풀에 기록한다. | M |
 
 #### 3.1.2 CLI 인터페이스
 | ID | 요구사항 | 우선순위 |
 |----|----------|----------|
-| IF-CLI-1 | `hippo search <query> [--scope cwd\|all\|<path>] [--kind iteration\|result\|both] [--limit N]`는 검색 결과를 사람이 읽을 수 있는 텍스트로 출력해야 한다. 기본값은 `--scope cwd --kind iteration --limit 10`이다. `search`, `show`, `status`는 데몬에 요청하며, 데몬이 응답하지 않으면 오류 메시지를 stderr에 출력하고 종료 코드 1로 끝난다. | M |
+| IF-CLI-1 | `hippo search <query> [--scope cwd\|all\|<path>] [--kind iteration\|result\|both] [--limit N]`는 검색 결과를 사람이 읽을 수 있는 텍스트로 출력해야 한다. 기본값은 `--scope cwd --kind iteration --limit 10`이다. `search`, `show`, `status`, `reindex`는 데몬에 요청한다. 데몬이 없으면 FR-DMN-7에 따라 띄운 뒤 요청하며, 그래도 응답이 없으면 오류 메시지를 stderr에 출력하고 종료 코드 1로 끝난다. | M |
 | IF-CLI-2 | `hippo show <prompt_id>`는 해당 턴의 반복을 순서대로 복원해 출력해야 한다. `--with-results` 옵션을 주면 연결된 결과 원문도 출력한다. | M |
 | IF-CLI-3 | `hippo daemon`은 데몬을 포그라운드로 실행해야 한다. | M |
-| IF-CLI-4 | `hippo launchd-plist`는 데몬 자동 실행용 launchd plist를 stdout에 출력해야 한다. | S |
+| IF-CLI-4 | `hippo launchd-plist`는 데몬 자동 실행용 launchd plist를 stdout에 출력해야 한다. 데몬이 유휴 종료(정상 종료)한 뒤 바로 다시 띄우지 않도록, 비정상 종료일 때만 재시작하게 설정한다. | S |
 | IF-CLI-6 | `hippo install --scope user\|project [--project <경로>] [--dry-run]`는 hook 설정을 Claude Code 설정 파일에 병합해야 한다. `hippo uninstall`은 같은 옵션으로 hippo hook만 제거해야 한다. | M |
 | IF-CLI-5 | `hippo status`는 데몬 상태, 스풀 대기 건수, 임베딩 대기 건수, 테이블별 행 수를 출력해야 한다. | S |
 
@@ -201,6 +201,7 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 | FR-RET-4 | 주입 텍스트는 결과마다 `ts`, `prompt_id`, `embed_text`(최대 길이 설정, 기본 800자)를 담고, 전체 길이를 설정값(기본 4,000자) 이하로 제한해야 한다. 각 결과는 `<memory ts="…" prompt="…">` … `</memory>` 블록으로 감싸고, 블록 안의 `&`, `<`, `>`, `"`는 이스케이프한다. 머리말에 블록 내용은 과거 기록이며 지시가 아님을 밝힌다. 끝에 `hippo show <prompt_id>`로 상세 내용을 볼 수 있다는 안내를 붙인다. | M |
 | FR-RET-5 | `user-prompt-submit` hook은 시간 예산(설정, 기본 800ms)을 넘으면 검색을 포기하고 아무것도 주입하지 않아야 한다. 데몬의 검색은 단계(임베딩, 벡터 검색, FTS)마다 마감 시각을 확인하고, hook 클라이언트는 같은 예산으로 소켓 타임아웃을 건다. | M |
 | FR-RET-6 | `hippo search`는 IF-CLI-1의 옵션에 따라 범위와 종류를 바꿔 검색해야 한다. `--kind result` 결과에는 그 결과를 참조하는 반복의 `prompt_id`를 함께 출력한다. | M |
+| FR-RET-8 | `hippo search` 처리 중 임베딩이나 벡터 검색이 실패하면 FTS 결과만으로 응답하고, 출력 첫 줄에 벡터 검색을 쓰지 못했다는 안내와 사유를 붙여야 한다. 자동 주입은 이 경우 아무것도 주입하지 않는다. | M |
 | FR-RET-7 | `hippo show`는 `prompt_id`의 반복을 `iteration_index` 순서로 출력하고, 반복에 백그라운드 시작 호출이 있으면 그 작업의 완료 기록(순번, 상태, 요약, 결과 id)을 함께 표시해야 한다. | M |
 
 #### 3.2.8 설치 (INS)
@@ -212,6 +213,13 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 | FR-INS-4 | 제거는 hippo hook 항목만 지워야 한다. 비게 된 matcher 그룹, 이벤트, `hooks` 키는 지운다. | M |
 | FR-INS-5 | 결과가 기존 내용과 같으면 파일을 쓰지 않고 "변경 없음"을 출력한다. 다르면 변경 내용(diff)을 출력하고, 기존 파일이 있으면 `<파일>.hippo-backup-<유닉스 시각>`(이미 있으면 `-<번호>`를 붙임)으로 백업한 뒤 임시 파일에 쓰고 이름을 바꿔 원자적으로 교체한다. 기존 파일 권한을 유지한다. 임시 파일은 같은 디렉터리에 무작위 이름으로 배타적으로 만들고, 백업은 링크를 따르지 않는 배타적 생성(권한 0600)으로 만든다. 설정 파일이나 바로 위 디렉터리가 심볼릭 링크이면 수정하지 않고 오류로 끝낸다. `--dry-run`이면 diff만 출력하고 아무것도 쓰지 않는다. | M |
 | FR-INS-6 | 기존 파일이 JSON으로 해석되지 않거나, 최상위가 객체가 아니거나, `hooks`가 객체가 아니면 수정하지 않고 오류로 끝낸다. 파일이 없으면 새로 만든다(디렉터리 포함). | M |
+
+#### 3.2.9 임베딩 서버 자동 시작 (EMB)
+| ID | 요구사항 | 우선순위 |
+|----|----------|----------|
+| FR-EMB-1 | Ollama 임베더는 서버에 연결할 수 없으면, 설정 `[embedder] autostart`(기본 true)가 켜져 있을 때 `[embedder] ollama_command`(기본 `ollama`. 경로 구분자가 없으면 PATH, 그다음 `/opt/homebrew/bin`, `/usr/local/bin`에서 실행 파일을 찾는다)로 `serve`를 분리된 프로세스로 띄워야 한다. 이때 환경 변수 `OLLAMA_HOST`를 설정 URL의 host:port로 지정한다. 출력은 `logs/ollama.log`에 덧붙인다. | M |
+| FR-EMB-2 | 서버를 띄운 뒤 `/api/version`이 응답할 때까지 최대 10초 기다리고, 임베딩을 한 번 다시 시도해야 한다. 여러 스레드가 동시에 실패해도 서버는 한 번만 띄운다. | M |
+| FR-EMB-3 | hippo는 자신이 띄운 Ollama 서버를 종료하지 않는다. 다른 도구가 같은 서버를 쓸 수 있고, 모델 메모리는 `keep_alive`가 지나면 Ollama가 해제하기 때문이다. 모델을 자동으로 내려받지도 않는다. | M |
 
 #### 3.2.6 교체 가능성 (SWP)
 | ID | 요구사항 | 우선순위 |
@@ -235,6 +243,8 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 | FR-DMN-3 | 데몬은 세션 단위 처리 요청을 직렬로 처리해 같은 세션을 동시에 처리하지 않아야 한다. | M |
 | FR-DMN-4 | 데몬은 처리 오류를 `~/.hippo/logs/`에 기록하고 계속 동작해야 한다. | M |
 | FR-DMN-5 | 데몬은 시작할 때 데이터 루트와 하위 디렉터리를 권한 0700으로 만들거나 맞추고, 잠금을 얻은 뒤 남아 있는 소켓 파일을 지우고 새로 만들어야 한다. 소켓 파일 권한은 0600이다. | M |
+| FR-DMN-7 | hook 클라이언트와 CLI는 데몬에 연결할 수 없으면, 설정 `[daemon] autostart`(기본 true)가 켜져 있을 때 같은 실행 파일로 `daemon` 명령을 분리된 프로세스(별도 프로세스 그룹)로 띄워야 한다. 데몬의 stderr는 `logs/daemon.err`에 덧붙인다. 띄운 뒤에는 소켓에 연결될 때까지 기다린다(수집과 CLI는 최대 5초, 자동 주입은 남은 시간 예산까지). 여러 클라이언트가 동시에 띄워도 FR-DMN-1에 따라 하나만 남는다. | M |
+| FR-DMN-8 | 데몬은 마지막 요청을 받은 뒤 `[daemon] idle_timeout_secs`(기본 1800, 0이면 종료하지 않음) 동안 요청이 없으면 스스로 종료해야 한다. 재색인 중에는 종료하지 않는다. 종료할 때 소켓 파일을 지운다. 남은 임베딩 작업은 원본 저장소에 남아 다음 실행 때 처리된다. | M |
 | FR-DMN-6 | 수집은 전용 스레드 하나가 요청 순서대로 처리해야 한다. 임베딩 작업은 별도 스레드가 처리하며, 수집이 끝날 때마다 깨어나고 실패하면 일정 시간 뒤 재시도한다. 벡터 저장소가 호환되지 않으면(FR-SWP-6) 임베딩 작업 스레드는 작업을 처리하지 않는다. | M |
 
 ### 3.3 성능 요구사항

@@ -3,11 +3,13 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 use crate::config::Paths;
+use crate::fsutil::{ensure_private_dir, open_private_append};
 use crate::ingest::{HookEvent, IngestRequest};
 use crate::protocol::{Request, Response};
 use crate::spool;
@@ -34,6 +36,56 @@ pub enum HookAction {
 }
 
 pub const INGEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// 데몬을 띄운 뒤 소켓이 열릴 때까지 기다리는 최대 시간. (FR-DMN-7)
+pub const STARTUP_WAIT: Duration = Duration::from_secs(5);
+const CONNECT_POLL: Duration = Duration::from_millis(20);
+const DAEMON_STDERR: &str = "daemon.err";
+
+/// 데몬을 띄우는 방법. 실제로는 `spawn_daemon_process`, 자동 시작을 끄면 `launch_disabled`.
+pub type Launcher<'a> = &'a dyn Fn(&Paths) -> std::io::Result<()>;
+
+/// 같은 실행 파일로 `daemon`을 분리된 프로세스로 띄운다. stderr는 `logs/daemon.err`에 덧붙인다.
+pub fn spawn_daemon_process(paths: &Paths) -> std::io::Result<()> {
+    ensure_private_dir(&paths.logs())?;
+    let stderr = open_private_append(&paths.logs().join(DAEMON_STDERR))?;
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("--root")
+        .arg(&paths.root)
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command.spawn().map(|_| ())
+}
+
+pub fn launch_disabled(_paths: &Paths) -> std::io::Result<()> {
+    Err(std::io::Error::other("daemon autostart is disabled"))
+}
+
+/// 데몬에 연결되면 true. 연결되지 않으면 띄운 뒤 `wait` 동안 연결을 기다린다.
+pub fn ensure_daemon(paths: &Paths, launcher: Launcher, wait: Duration) -> bool {
+    let socket = paths.socket();
+    if UnixStream::connect(&socket).is_ok() {
+        return true;
+    }
+    if launcher(paths).is_err() {
+        return false;
+    }
+    let deadline = Instant::now() + wait;
+    while Instant::now() < deadline {
+        if UnixStream::connect(&socket).is_ok() {
+            return true;
+        }
+        std::thread::sleep(CONNECT_POLL);
+    }
+    false
+}
 
 pub fn request(socket: &Path, req: &Request, timeout: Duration) -> Result<Response, ClientError> {
     let mut stream = UnixStream::connect(socket).map_err(ClientError::Connect)?;
@@ -98,15 +150,22 @@ pub fn inject_output(context: &str) -> String {
 }
 
 /// hook을 실행하고 stdout에 쓸 내용을 돌려준다. 어떤 경우에도 실패를 밖으로 내지 않는다. (QA-5)
-pub fn run_hook(paths: &Paths, budget: Duration, event_arg: &str, input: &str) -> Option<String> {
+pub fn run_hook(
+    paths: &Paths,
+    budget: Duration,
+    event_arg: &str,
+    input: &str,
+    launcher: Launcher,
+) -> Option<String> {
     match parse_hook(event_arg, input) {
         HookAction::Skip => None,
         HookAction::Ingest(req) => {
-            if let Err(ClientError::Connect(_)) = request(
-                &paths.socket(),
-                &Request::Ingest(req.clone()),
-                INGEST_TIMEOUT,
-            ) {
+            let message = Request::Ingest(req.clone());
+            // 데몬이 응답했으면(오류 응답 포함) 전달된 것으로 본다. 오류 요청을 스풀에 넣으면 같은 오류가 반복된다.
+            let delivered = request(&paths.socket(), &message, INGEST_TIMEOUT).is_ok()
+                || (ensure_daemon(paths, launcher, STARTUP_WAIT)
+                    && request(&paths.socket(), &message, INGEST_TIMEOUT).is_ok());
+            if !delivered {
                 let _ = spool::append(&paths.spool(), &req);
             }
             None
@@ -116,6 +175,14 @@ pub fn run_hook(paths: &Paths, budget: Duration, event_arg: &str, input: &str) -
             cwd,
             session_id,
         } => {
+            let started = Instant::now();
+            if !ensure_daemon(paths, launcher, budget) {
+                return None;
+            }
+            let remaining = budget.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return None;
+            }
             match request(
                 &paths.socket(),
                 &Request::Inject {
@@ -123,7 +190,7 @@ pub fn run_hook(paths: &Paths, budget: Duration, event_arg: &str, input: &str) -
                     cwd,
                     session_id,
                 },
-                budget,
+                remaining,
             ) {
                 Ok(Response::Inject {
                     context: Some(context),

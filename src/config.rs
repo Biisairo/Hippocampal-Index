@@ -28,6 +28,9 @@ pub struct EmbedderConfig {
     pub url: String,
     /// Ollama가 모델을 메모리에 유지하는 시간. 첫 호출의 모델 로딩 지연을 피한다.
     pub keep_alive: String,
+    /// 서버에 연결할 수 없으면 `ollama_command serve`를 띄운다. (FR-EMB-1)
+    pub autostart: bool,
+    pub ollama_command: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -68,6 +71,15 @@ pub struct IndexConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DaemonSection {
+    /// 연결할 수 없으면 hook과 CLI가 데몬을 띄운다. (FR-DMN-7)
+    pub autostart: bool,
+    /// 마지막 요청 후 이 시간(초) 동안 요청이 없으면 종료한다. 0이면 종료하지 않는다. (FR-DMN-8)
+    pub idle_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PatternEntry {
     pub kind: String,
@@ -90,6 +102,7 @@ pub struct Config {
     pub inject: InjectSection,
     pub index: IndexConfig,
     pub redact: RedactConfig,
+    pub daemon: DaemonSection,
 }
 
 impl Config {
@@ -197,6 +210,8 @@ impl Default for EmbedderConfig {
             max_input_tokens: 32_000,
             url: "http://127.0.0.1:11434".into(),
             keep_alive: "30m".into(),
+            autostart: true,
+            ollama_command: "ollama".into(),
         }
     }
 }
@@ -234,6 +249,15 @@ impl Default for InjectSection {
         }
     }
 }
+impl Default for DaemonSection {
+    fn default() -> Self {
+        Self {
+            autostart: true,
+            idle_timeout_secs: 1_800,
+        }
+    }
+}
+
 impl Default for IndexConfig {
     fn default() -> Self {
         Self {

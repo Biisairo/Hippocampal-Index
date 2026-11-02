@@ -99,7 +99,19 @@ Claude / you ──▶ hippo search|show|status|reindex ──Unix socket──�
 ```
 
 - One daemon runs per machine (file lock). Only the daemon writes to the stores.
-- If the daemon is down, capture requests go to a spool file and are processed at the next start. Your Claude Code session never fails because of `hippo`.
+- You do not need to start the daemon yourself. Like a local MCP server, it starts on demand: when a hook or a CLI command cannot reach it, it starts `hippo daemon` in the background and then sends the request. After `idle_timeout_secs` (default 30 minutes) with no requests, the daemon stops by itself. The next request starts it again.
+- If the daemon cannot start, capture requests go to a spool file and are processed at the next start. Your Claude Code session never fails because of `hippo`.
+
+### 1.6 Lifecycle: when the database and the model are open
+
+| Component | Opened | Closed |
+|-----------|--------|--------|
+| Daemon | Automatically, by the first hook or CLI command that cannot reach it | After `idle_timeout_secs` with no requests (never during a reindex), or when you stop it |
+| SQLite and LanceDB | By the daemon at start | When the daemon exits |
+| Embedding model | By Ollama, at the first embedding request (about 1 s) | By Ollama, `keep_alive` (30 minutes) after the last request |
+| Ollama server | Automatically, by the daemon when an embedding request cannot reach it (`ollama serve`, logs in `logs/ollama.log`). Skipped if Ollama is already running, for example as a service | Not stopped by `hippo`, because other tools may use the same server. The model memory is freed after `keep_alive` |
+
+Hooks and CLI commands never open the database. They only talk to the daemon through the socket. Data is safe when the daemon stops: every change is one SQLite transaction (WAL mode), and pending embedding jobs stay in the queue.
 
 ---
 
@@ -126,28 +138,38 @@ git clone git@github.com:Biisairo/Hippocampal-Index.git hippo && cd hippo
 cargo build --release
 ```
 
-### 3.2 Put the binary in a fixed location
+### 3.2 Where the binary lives
 
-The hook commands contain the **absolute path** of the `hippo` binary that ran `hippo install`. Put the binary in a stable place first.
+`hippo install` writes the **absolute path of the binary that runs it** into the hook commands, and the daemon is started from the same binary. So you can install straight from the build directory:
 
 ```bash
-mkdir -p ~/.local/bin
-cp target/release/hippo ~/.local/bin/hippo
+./target/release/hippo install --scope user --dry-run
 ```
 
-Use `~/.local/bin/hippo` for all later steps.
+Keep in mind that the hooks then depend on that path. `cargo clean` or moving the repository breaks them until you rebuild or run `install` again. Rebuilding in place is fine. If you want a stable location, use one of these and run `install` from there:
+
+```bash
+cargo install --path .            # → ~/.cargo/bin/hippo
+# or
+mkdir -p ~/.local/bin && cp target/release/hippo ~/.local/bin/hippo
+```
+
+The examples below use `~/.local/bin/hippo`. Replace it with your binary path.
 
 ### 3.3 Ollama and the embedding model
 
 ```bash
 brew install ollama
-brew services start ollama       # starts now and at every login
-ollama pull qwen3-embedding:0.6b
+ollama pull qwen3-embedding:0.6b   # needs a running server once: ollama serve (or brew services start ollama)
 ```
+
+You do not need to keep Ollama running. When `hippo` cannot reach it, the daemon starts `ollama serve` by itself (`[embedder] autostart = true`). If you prefer, run it as a service: `brew services start ollama`. `hippo` never downloads models for you.
 
 Ollama listens on `127.0.0.1:11434` by default. `hippo` refuses any embedder URL that is not localhost.
 
-### 3.4 Run the daemon
+### 3.4 Run the daemon (optional)
+
+You can skip this step. Hooks and CLI commands start the daemon automatically when it is not running (`[daemon] autostart = true`), and it stops after 30 minutes without requests. Start it yourself only if you want to watch it or keep it running all the time.
 
 Option A: run it in a terminal (good for a first test).
 
@@ -163,7 +185,7 @@ mkdir -p ~/.hippo/logs && chmod 700 ~/.hippo ~/.hippo/logs
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hippo.daemon.plist
 ```
 
-To stop it: `launchctl bootout gui/$(id -u)/com.hippo.daemon`.
+launchd restarts the daemon only after a crash, not after an idle exit. To stop it: `launchctl bootout gui/$(id -u)/com.hippo.daemon`.
 
 Check the daemon:
 
@@ -279,6 +301,8 @@ dimension = 1024                   # Qwen3-Embedding supports 32–4096
 max_input_tokens = 32000
 url = "http://127.0.0.1:11434"     # must be localhost, 127.0.0.1, or ::1
 keep_alive = "30m"                 # keeps the model loaded to avoid a ~1 s cold start
+autostart = true                   # start `ollama serve` when the server is not reachable
+ollama_command = "ollama"          # path of the ollama executable
 
 [vector]
 backend = "lancedb"                # lancedb | memory (test only)
@@ -301,6 +325,10 @@ budget_ms = 800                    # time budget for the UserPromptSubmit hook
 [index]
 vector_index_threshold = 100000    # build an ANN index when the vector count reaches this
 job_batch = 64
+
+[daemon]
+autostart = true                   # hooks and CLI start the daemon when it is not running
+idle_timeout_secs = 1800           # stop after this many seconds without requests (0 = never)
 
 [[redact.patterns]]                # extra secret patterns (regex)
 kind = "internal"
@@ -340,6 +368,7 @@ To add a completely new backend, see [9.4](#94-adding-a-new-backend).
 ├─ vectors/<name>/<generation>/   LanceDB files
 ├─ spool/                     requests captured while the daemon was down
 ├─ logs/hippo.log             daemon errors
+├─ logs/daemon.err            startup errors of an auto-started daemon
 ├─ hippo.sock                  (0600) daemon socket
 └─ hippo.lock                  single-instance lock
 ```
@@ -358,8 +387,9 @@ Security measures:
 
 | Symptom | Check |
 |---------|-------|
-| `hippo: daemon not reachable` | Is the daemon running? `hippo daemon` or the launchd steps |
-| `embed_jobs` does not go down | Is Ollama running (`curl http://127.0.0.1:11434/api/version`)? Is the model pulled? See `~/.hippo/logs/hippo.log`. |
+| `hippo: daemon not reachable` | The daemon could not start. See `~/.hippo/logs/daemon.err` (for example, a config error). With `autostart = false`, start it yourself. |
+| `embed_jobs` does not go down | Is the model pulled (`ollama list`)? Could `hippo` start Ollama (see `~/.hippo/logs/ollama.log` and `hippo.log`)? Jobs are retried every 5 s. |
+| Search says "벡터 검색을 쓰지 못해 키워드 검색 결과만 표시합니다" | Embedding failed (Ollama could not start, or the model is missing). Results are keyword-only until it works again. |
 | `compatibility: mismatch` | The model or dimension changed. Run `hippo reindex`. |
 | Nothing is injected | Lower `[inject] threshold`. Injection uses only the same project and other sessions. |
 | Build fails in `lance-*` / `protoc` | `brew reinstall protobuf` and check `protoc --version` |

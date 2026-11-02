@@ -19,7 +19,8 @@ use crate::ingest::{IngestOptions, IngestRequest, ingest};
 use crate::protocol::{COMPAT_MISMATCH, REINDEX_RUNNING, Request, Response, StatusInfo};
 use crate::redact::Redactor;
 use crate::search::{
-    InjectConfig, VectorBackends, build_injection, render_hits, render_turn, search,
+    InjectConfig, SearchError, SearchRequest, VectorBackends, build_injection, render_hits,
+    render_turn, search,
 };
 use crate::spool;
 use crate::store::RecordStore;
@@ -64,6 +65,7 @@ struct Shared {
     notify_tx: Sender<()>,
     reindexing: AtomicBool,
     reindex_state: Mutex<String>,
+    last_activity: Mutex<Instant>,
     stop: AtomicBool,
 }
 
@@ -115,6 +117,23 @@ impl Shared {
         if let Ok(mut s) = self.reindex_state.lock() {
             *s = state.to_string();
         }
+    }
+
+    fn touch(&self) {
+        if let Ok(mut last) = self.last_activity.lock() {
+            *last = Instant::now();
+        }
+    }
+
+    /// 마지막 요청 후 유휴 시간이 지났고 재색인 중이 아니면 true. (FR-DMN-8)
+    fn idle_expired(&self) -> bool {
+        let timeout = self.config.daemon.idle_timeout_secs;
+        if timeout == 0 || self.reindexing.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.last_activity
+            .lock()
+            .is_ok_and(|last| last.elapsed() >= Duration::from_secs(timeout))
     }
 
     fn log(&self, message: &str) {
@@ -199,6 +218,7 @@ pub fn start(
         notify_tx,
         reindexing: AtomicBool::new(false),
         reindex_state: Mutex::new(REINDEX_IDLE.to_string()),
+        last_activity: Mutex::new(Instant::now()),
         stop: AtomicBool::new(false),
     });
     for dir in removed {
@@ -385,7 +405,15 @@ fn spawn_accept(shared: Arc<Shared>, listener: UnixListener) -> JoinHandle<()> {
                     let shared = Arc::clone(&shared);
                     thread::spawn(move || handle_connection(&shared, stream));
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(POLL),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if shared.idle_expired() {
+                        shared.log("idle timeout, shutting down");
+                        shared.stop.store(true, Ordering::SeqCst);
+                        let _ = fs::remove_file(shared.paths.socket());
+                        break;
+                    }
+                    thread::sleep(POLL);
+                }
                 Err(e) => {
                     shared.log(&format!("accept failed: {e}"));
                     thread::sleep(POLL);
@@ -396,6 +424,7 @@ fn spawn_accept(shared: Arc<Shared>, listener: UnixListener) -> JoinHandle<()> {
 }
 
 fn handle_connection(shared: &Arc<Shared>, stream: UnixStream) {
+    shared.touch();
     if stream.set_nonblocking(false).is_err()
         || stream.set_read_timeout(Some(CONNECTION_TIMEOUT)).is_err()
     {
@@ -419,6 +448,7 @@ fn handle_connection(shared: &Arc<Shared>, stream: UnixStream) {
         let mut stream = stream;
         let _ = stream.write_all(out.as_bytes());
     }
+    shared.touch();
 }
 
 fn handle_request(shared: &Arc<Shared>, req: Request) -> Response {
@@ -479,10 +509,10 @@ fn handle_request(shared: &Arc<Shared>, req: Request) -> Response {
             .map(|context| Response::Inject { context })
             .map_err(|e| e.to_string())
         }
-        Request::Search(search_req) => search(&records, backends, &search_req, None)
-            .map_err(|e| e.to_string())
-            .and_then(|hits| render_hits(&records, &hits).map_err(|e| e.to_string()))
-            .map(|text| Response::Text { text }),
+        Request::Search(search_req) => {
+            search_with_fallback(shared, &records, backends, &search_req)
+                .map(|text| Response::Text { text })
+        }
         Request::Show {
             prompt_id,
             with_results,
@@ -496,6 +526,29 @@ fn handle_request(shared: &Arc<Shared>, req: Request) -> Response {
         shared.log(&format!("request failed: {message}"));
         Response::Error { message }
     })
+}
+
+/// 임베딩이나 벡터 검색이 실패하면 FTS 결과만으로 응답하고 첫 줄에 안내한다. (FR-RET-8)
+fn search_with_fallback(
+    shared: &Shared,
+    records: &RecordStore,
+    backends: Option<VectorBackends>,
+    req: &SearchRequest,
+) -> Result<String, String> {
+    match search(records, backends, req, None) {
+        Ok(hits) => render_hits(records, &hits).map_err(|e| e.to_string()),
+        Err(e @ (SearchError::Embed(_) | SearchError::Vector(_))) => {
+            shared.log(&format!(
+                "vector search failed, falling back to keyword search: {e}"
+            ));
+            let hits = search(records, None, req, None).map_err(|e| e.to_string())?;
+            let body = render_hits(records, &hits).map_err(|e| e.to_string())?;
+            Ok(format!(
+                "(벡터 검색을 쓰지 못해 키워드 검색 결과만 표시합니다: {e})\n{body}"
+            ))
+        }
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 fn status(

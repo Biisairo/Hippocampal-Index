@@ -93,6 +93,11 @@ fn launchd_plist_prints_xml() {
 #[test]
 fn hook_never_fails_and_spools_without_daemon() {
     let dir = tempfile::tempdir_in("/tmp").unwrap();
+    fs::write(
+        dir.path().join("config.toml"),
+        "[daemon]\nautostart = false\n",
+    )
+    .unwrap();
     let input = r#"{"session_id":"s","transcript_path":"/t/s.jsonl","cwd":"/w"}"#;
     let out = hippo(dir.path(), &["hook", "stop"], input);
     assert!(out.status.success());
@@ -106,6 +111,11 @@ fn hook_never_fails_and_spools_without_daemon() {
 #[test]
 fn query_commands_fail_without_daemon() {
     let dir = tempfile::tempdir_in("/tmp").unwrap();
+    fs::write(
+        dir.path().join("config.toml"),
+        "[daemon]\nautostart = false\n",
+    )
+    .unwrap();
     for args in [&["search", "q"][..], &["show", "p"], &["status"]] {
         let out = hippo(dir.path(), args, "");
         assert_eq!(out.status.code(), Some(1), "{args:?}");
@@ -280,5 +290,58 @@ fn install_refuses_invalid_settings() {
     assert_eq!(
         fs::read_to_string(project.join("settings.local.json")).unwrap(),
         "{ broken"
+    );
+}
+
+// ---- FR-DMN-7, FR-DMN-8 (실제 프로세스) ----
+
+fn wait_for(cond: impl Fn() -> bool, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+#[test]
+fn cli_autostarts_daemon_which_exits_when_idle() {
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let root = dir.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("config.toml"), "[embedder]\nbackend = \"hash\"\ndimension = 64\n[vector]\nbackend = \"memory\"\n[daemon]\nidle_timeout_secs = 2\n").unwrap();
+
+    let transcript = dir.path().join("s.jsonl");
+    fs::write(
+        &transcript,
+        fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/s2_tools.jsonl"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let input = serde_json::json!({"session_id": "afd070e6-4625-4b31-8c43-f1f553949222", "transcript_path": transcript, "cwd": "/w"}).to_string();
+    let hook = hippo(&root, &["hook", "stop"], &input);
+    assert!(hook.status.success());
+    assert!(
+        !root.join("spool/pending.jsonl").exists(),
+        "데몬을 띄워 바로 처리"
+    );
+
+    let status = hippo(&root, &["status"], "");
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(String::from_utf8_lossy(&status.stdout).contains("iterations: 2"));
+    assert!(
+        wait_for(
+            || !root.join("hippo.sock").exists(),
+            Duration::from_secs(15)
+        ),
+        "유휴 종료"
     );
 }

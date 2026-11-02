@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use hippo::backends::{build_embedder, vector_source};
-use hippo::client::{request, run_hook};
+use hippo::client::{
+    Launcher, STARTUP_WAIT, ensure_daemon, launch_disabled, request, run_hook, spawn_daemon_process,
+};
 use hippo::config::{Config, Paths};
 use hippo::daemon;
 use hippo::install::{Action, Scope, apply, target_file};
@@ -103,9 +105,9 @@ fn main() -> ExitCode {
         Command::Hook { event } => {
             let mut input = String::new();
             let _ = std::io::stdin().read_to_string(&mut input);
-            let budget_ms = Config::load(&paths.config())
-                .map_or(Config::default().inject.budget_ms, |c| c.inject.budget_ms);
-            if let Some(out) = run_hook(&paths, Duration::from_millis(budget_ms), &event, &input) {
+            let config = Config::load(&paths.config()).unwrap_or_default();
+            let budget = Duration::from_millis(config.inject.budget_ms);
+            if let Some(out) = run_hook(&paths, budget, &event, &input, launcher(&config)) {
                 println!("{out}");
             }
             ExitCode::SUCCESS
@@ -220,7 +222,21 @@ fn run_install(args: &InstallArgs, action: Action) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// 설정에 따라 데몬을 띄우는 방법을 고른다. (FR-DMN-7)
+fn launcher(config: &Config) -> Launcher<'static> {
+    if config.daemon.autostart {
+        &spawn_daemon_process
+    } else {
+        &launch_disabled
+    }
+}
+
 fn query_daemon(paths: &Paths, req: &Request) -> ExitCode {
+    let config = match Config::load(&paths.config()) {
+        Ok(c) => c,
+        Err(e) => return fail(&e.to_string()),
+    };
+    ensure_daemon(paths, launcher(&config), STARTUP_WAIT);
     match request(&paths.socket(), req, QUERY_TIMEOUT) {
         Ok(Response::Text { text }) => {
             print!("{text}");
@@ -245,7 +261,7 @@ fn run_daemon(paths: Paths) -> ExitCode {
         Ok(c) => c,
         Err(e) => return fail(&e.to_string()),
     };
-    let embedder = match build_embedder(&config) {
+    let embedder = match build_embedder(&config, &paths) {
         Ok(e) => e,
         Err(e) => return fail(&e.to_string()),
     };

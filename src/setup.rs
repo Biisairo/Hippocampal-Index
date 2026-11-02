@@ -47,7 +47,10 @@ pub fn launchd_plist(exe: &Path, paths: &Paths) -> String {
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <true/>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
   <key>StandardOutPath</key>
   <string>{out}</string>
   <key>StandardErrorPath</key>

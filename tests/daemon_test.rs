@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use common::*;
 use hippo::backends::{VectorSource, vector_source};
-use hippo::client::{request, run_hook};
+use hippo::client::{Launcher, ensure_daemon, launch_disabled, request, run_hook};
 use hippo::config::{Config, Paths};
 use hippo::daemon::{DaemonError, DaemonHandle, start};
 use hippo::embedder::Embedder;
@@ -25,6 +25,10 @@ fn s2_cwd() -> String {
     fixture_cwd("s2_tools.jsonl")
 }
 const TIMEOUT: Duration = Duration::from_secs(10);
+
+fn hook_no_autostart(paths: &Paths, budget: Duration, event: &str, input: &str) -> Option<String> {
+    run_hook(paths, budget, event, input, &launch_disabled)
+}
 
 struct Env {
     _dir: tempfile::TempDir,
@@ -159,7 +163,7 @@ fn inject_returns_context_for_other_session() {
         .clone();
 
     let input = json!({"session_id": "other", "transcript_path": "/t", "cwd": s2_cwd(), "prompt": embed_text}).to_string();
-    let out = run_hook(
+    let out = hook_no_autostart(
         &e.paths,
         Duration::from_secs(5),
         "user-prompt-submit",
@@ -178,7 +182,7 @@ fn inject_returns_context_for_other_session() {
         json!({"session_id": S2, "transcript_path": "/t", "cwd": s2_cwd(), "prompt": embed_text})
             .to_string();
     assert_eq!(
-        run_hook(
+        hook_no_autostart(
             &e.paths,
             Duration::from_secs(5),
             "user-prompt-submit",
@@ -196,7 +200,7 @@ fn hook_ingest_through_daemon() {
     let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
     let input = json!({"session_id": S2, "transcript_path": e.transcript, "cwd": s2_cwd(), "hook_event_name": "Stop"}).to_string();
     assert_eq!(
-        run_hook(&e.paths, Duration::from_millis(800), "stop", &input),
+        hook_no_autostart(&e.paths, Duration::from_millis(800), "stop", &input),
         None
     );
     assert_eq!(status(&e.paths).iterations, 2);
@@ -294,7 +298,7 @@ fn incompatible_vector_store_falls_back_to_fts() {
     assert!(out.contains("sim=-"), "FTS 전용: {out}");
     let input = json!({"session_id": "other", "transcript_path": "/t", "cwd": s2_cwd(), "prompt": "두 파일은 병렬로 다 읽었지만"}).to_string();
     assert_eq!(
-        run_hook(
+        hook_no_autostart(
             &e.paths,
             Duration::from_secs(2),
             "user-prompt-submit",
@@ -380,7 +384,7 @@ fn reindex_recovers_from_mismatch() {
         .clone();
     let input = json!({"session_id": "other", "transcript_path": "/t", "cwd": s2_cwd(), "prompt": embed_text}).to_string();
     assert!(
-        run_hook(
+        hook_no_autostart(
             &e.paths,
             Duration::from_secs(5),
             "user-prompt-submit",
@@ -474,5 +478,237 @@ fn lancedb_reindex_switches_generation_and_survives_restart() {
         .filter(|d| d.path().is_dir())
         .count();
     assert_eq!(generations, 1, "시작할 때 이전 세대 정리");
+    handle.shutdown();
+}
+
+// ---- FR-DMN-7, FR-DMN-8 ----
+
+fn config_with(extra: &str) -> Config {
+    Config::parse(&format!(
+        "[embedder]\nbackend = \"hash\"\ndimension = 256\n[vector]\nbackend = \"memory\"\n{extra}"
+    ))
+    .unwrap()
+}
+
+/// 데몬을 같은 프로세스 안에서 시작하는 launcher. 이미 실행 중이면 성공으로 본다.
+fn in_process_launcher(
+    slot: &Mutex<Option<DaemonHandle>>,
+) -> impl Fn(&Paths) -> std::io::Result<()> + '_ {
+    move |paths: &Paths| match launch(paths, Arc::new(MemoryVectorStore::default())) {
+        Ok(handle) => {
+            *slot.lock().unwrap() = Some(handle);
+            Ok(())
+        }
+        Err(DaemonError::AlreadyRunning) => Ok(()),
+        Err(e) => Err(std::io::Error::other(e.to_string())),
+    }
+}
+
+#[test]
+fn hook_autostarts_daemon_and_ingests() {
+    let e = env();
+    let slot = Mutex::new(None);
+    let launcher = in_process_launcher(&slot);
+    let input =
+        json!({"session_id": S2, "transcript_path": e.transcript, "cwd": s2_cwd()}).to_string();
+    assert_eq!(
+        run_hook(
+            &e.paths,
+            Duration::from_millis(800),
+            "stop",
+            &input,
+            &launcher
+        ),
+        None
+    );
+    assert!(slot.lock().unwrap().is_some(), "데몬을 띄움");
+    assert_eq!(status(&e.paths).iterations, 2);
+    assert_eq!(spool::pending_count(&e.paths.spool()), 0);
+    assert!(
+        ensure_daemon(&e.paths, &launch_disabled, Duration::from_millis(100)),
+        "이미 실행 중이면 바로 true"
+    );
+    slot.lock().unwrap().take().unwrap().shutdown();
+}
+
+#[test]
+fn autostart_failure_falls_back_to_spool() {
+    let e = env();
+    let failing: Launcher = &|_: &Paths| Err(std::io::Error::other("cannot start"));
+    let input =
+        json!({"session_id": S2, "transcript_path": e.transcript, "cwd": s2_cwd()}).to_string();
+    assert_eq!(
+        run_hook(
+            &e.paths,
+            Duration::from_millis(800),
+            "stop",
+            &input,
+            failing
+        ),
+        None
+    );
+    assert_eq!(spool::pending_count(&e.paths.spool()), 1);
+}
+
+fn exits_within(handle: DaemonHandle, limit: Duration) -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        handle.wait();
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(limit).is_ok()
+}
+
+#[test]
+fn idle_daemon_exits_and_removes_socket() {
+    let e = env();
+    let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(256, 8_000));
+    let handle = start(
+        e.paths.clone(),
+        config_with("[daemon]\nidle_timeout_secs = 1\n"),
+        embedder,
+        memory_source(&e.paths, Arc::new(MemoryVectorStore::default())),
+    )
+    .unwrap();
+    assert!(exits_within(handle, Duration::from_secs(6)));
+    assert!(!e.paths.socket().exists());
+}
+
+#[test]
+fn requests_postpone_idle_exit() {
+    let e = env();
+    let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(256, 8_000));
+    let handle = start(
+        e.paths.clone(),
+        config_with("[daemon]\nidle_timeout_secs = 1\n"),
+        embedder,
+        memory_source(&e.paths, Arc::new(MemoryVectorStore::default())),
+    )
+    .unwrap();
+    for _ in 0..8 {
+        std::thread::sleep(Duration::from_millis(250));
+        status(&e.paths);
+    }
+    assert!(exits_within(handle, Duration::from_secs(6)));
+}
+
+#[test]
+fn zero_idle_timeout_never_exits() {
+    let e = env();
+    let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(256, 8_000));
+    let handle = start(
+        e.paths.clone(),
+        config_with("[daemon]\nidle_timeout_secs = 0\n"),
+        embedder,
+        memory_source(&e.paths, Arc::new(MemoryVectorStore::default())),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(1_500));
+    assert_eq!(status(&e.paths).iterations, 0);
+    handle.shutdown();
+}
+
+struct VerySlowEmbedder(HashEmbedder);
+
+impl Embedder for VerySlowEmbedder {
+    fn model_id(&self) -> &str {
+        self.0.model_id()
+    }
+    fn dimension(&self) -> usize {
+        self.0.dimension()
+    }
+    fn max_input_tokens(&self) -> usize {
+        self.0.max_input_tokens()
+    }
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, hippo::embedder::EmbedError> {
+        std::thread::sleep(Duration::from_millis(600));
+        self.0.embed(texts)
+    }
+}
+
+#[test]
+fn reindex_blocks_idle_exit() {
+    let e = env();
+    let embedder: Arc<dyn Embedder> = Arc::new(VerySlowEmbedder(HashEmbedder::new(256, 8_000)));
+    let handle = start(
+        e.paths.clone(),
+        config_with("[daemon]\nidle_timeout_secs = 1\n"),
+        embedder,
+        memory_source(&e.paths, Arc::new(MemoryVectorStore::default())),
+    )
+    .unwrap();
+    ingest(&e.paths, &e.transcript, HookEvent::Stop);
+    assert_eq!(
+        request(&e.paths.socket(), &Request::Reindex, TIMEOUT).unwrap(),
+        Response::Done
+    );
+    std::thread::sleep(Duration::from_millis(1_500));
+    assert_eq!(
+        status(&e.paths).reindex,
+        "running",
+        "재색인 중에는 유휴 종료하지 않음"
+    );
+    assert!(exits_within(handle, Duration::from_secs(20)));
+}
+
+// ---- FR-RET-8 ----
+
+struct DownEmbedder;
+
+impl Embedder for DownEmbedder {
+    fn model_id(&self) -> &str {
+        "down"
+    }
+    fn dimension(&self) -> usize {
+        8
+    }
+    fn max_input_tokens(&self) -> usize {
+        8_000
+    }
+    fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, hippo::embedder::EmbedError> {
+        Err(hippo::embedder::EmbedError::Unavailable(
+            "ollama down".into(),
+        ))
+    }
+}
+
+#[test]
+fn search_falls_back_to_fts_when_embedding_fails() {
+    let e = env();
+    let handle = start(
+        e.paths.clone(),
+        config(),
+        Arc::new(DownEmbedder),
+        memory_source(&e.paths, Arc::new(MemoryVectorStore::default())),
+    )
+    .unwrap();
+    ingest(&e.paths, &e.transcript, HookEvent::Stop);
+    let search = Request::Search(SearchRequest {
+        query: "두 파일은 병렬로".into(),
+        kind: SearchKind::Iteration,
+        cwd: None,
+        exclude_session: None,
+        limit: 5,
+    });
+    let out = text(request(&e.paths.socket(), &search, TIMEOUT).unwrap());
+    let first = out.lines().next().unwrap();
+    assert!(
+        first.contains("키워드 검색") && first.contains("ollama down"),
+        "{out}"
+    );
+    assert!(
+        out.contains("[iteration]") && out.contains("sim=-"),
+        "{out}"
+    );
+    let input = json!({"session_id": "other", "transcript_path": "/t", "cwd": s2_cwd(), "prompt": "두 파일은 병렬로"}).to_string();
+    assert_eq!(
+        hook_no_autostart(
+            &e.paths,
+            Duration::from_secs(2),
+            "user-prompt-submit",
+            &input
+        ),
+        None
+    );
     handle.shutdown();
 }

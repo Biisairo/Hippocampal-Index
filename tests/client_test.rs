@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use hippo::backends::{BackendError, build_embedder, vector_source};
-use hippo::client::{HookAction, inject_output, parse_hook, run_hook};
+use hippo::client::{HookAction, inject_output, launch_disabled, parse_hook, run_hook};
 use hippo::config::{Config, Paths};
 use hippo::generations::active_dir;
 use hippo::ingest::{HookEvent, IngestRequest};
@@ -33,6 +33,10 @@ fn ingest_req(event: HookEvent) -> IngestRequest {
 }
 
 // ---- IF-HK-1, FR-CAP-1 ----
+
+fn hook_no_autostart(paths: &Paths, budget: Duration, event: &str, input: &str) -> Option<String> {
+    run_hook(paths, budget, event, input, &launch_disabled)
+}
 
 #[test]
 fn parses_real_capture_hook_inputs() {
@@ -235,7 +239,7 @@ fn hook_without_daemon_spools_ingest_and_skips_inject() {
     let paths = Paths::new(dir.path().to_path_buf());
     let stop = probe("r_s2_tools/1793582122364771000_Stop.json");
     assert_eq!(
-        run_hook(&paths, Duration::from_millis(800), "stop", &stop),
+        hook_no_autostart(&paths, Duration::from_millis(800), "stop", &stop),
         None
     );
     assert_eq!(spool::pending_count(&paths.spool()), 1);
@@ -244,7 +248,7 @@ fn hook_without_daemon_spools_ingest_and_skips_inject() {
         json!({"session_id": "s", "transcript_path": "/t", "cwd": "/w", "prompt": "q"}).to_string();
     let started = Instant::now();
     assert_eq!(
-        run_hook(
+        hook_no_autostart(
             &paths,
             Duration::from_millis(800),
             "user-prompt-submit",
@@ -254,7 +258,7 @@ fn hook_without_daemon_spools_ingest_and_skips_inject() {
     );
     assert!(started.elapsed() < Duration::from_secs(2));
     assert_eq!(
-        run_hook(
+        hook_no_autostart(
             &paths,
             Duration::from_millis(800),
             "post-tool-batch",
@@ -300,6 +304,10 @@ fn launchd_plist_runs_daemon() {
     assert!(plist.contains("<string>daemon</string>"));
     assert!(plist.contains("/r/logs/"));
     assert!(plist.contains("<key>KeepAlive</key>"));
+    assert!(
+        plist.contains("<key>SuccessfulExit</key>\n    <false/>"),
+        "유휴 종료(정상 종료) 뒤에는 재시작하지 않음"
+    );
 }
 
 // ---- FR-SWP-3 ----
@@ -312,14 +320,14 @@ fn backend_selection() {
         "[embedder]\nbackend = \"hash\"\ndimension = 16\n[vector]\nbackend = \"memory\"\n",
     )
     .unwrap();
-    assert_eq!(build_embedder(&config).unwrap().dimension(), 16);
+    assert_eq!(build_embedder(&config, &paths).unwrap().dimension(), 16);
     let memory = vector_source(&config, &paths).unwrap();
     let store = (memory.open)(&active_dir(&memory.base).unwrap()).unwrap();
     assert_eq!(store.count().unwrap(), 0);
 
     let real = Config::default();
     assert_eq!(
-        build_embedder(&real).unwrap().model_id(),
+        build_embedder(&real, &paths).unwrap().model_id(),
         "qwen3-embedding:0.6b"
     );
     let lance = vector_source(&real, &paths).unwrap();
@@ -330,7 +338,7 @@ fn backend_selection() {
 
     config.embedder.backend = "nope".into();
     assert!(matches!(
-        build_embedder(&config),
+        build_embedder(&config, &paths),
         Err(BackendError::Unknown(_))
     ));
     config.vector.backend = "nope".into();
@@ -381,5 +389,37 @@ fn status_render_shows_fields_and_reindex_hints() {
         !status_info(0, 0, "empty", "idle")
             .render()
             .contains("hippo reindex")
+    );
+}
+
+// ---- FR-DMN-7 ----
+
+#[test]
+fn ensure_daemon_with_disabled_launcher_fails_fast() {
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let paths = Paths::new(dir.path().to_path_buf());
+    let started = Instant::now();
+    assert!(!hippo::client::ensure_daemon(
+        &paths,
+        &launch_disabled,
+        Duration::from_secs(2)
+    ));
+    assert!(started.elapsed() < Duration::from_millis(200));
+}
+
+#[test]
+fn ensure_daemon_gives_up_after_wait() {
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let paths = Paths::new(dir.path().to_path_buf());
+    let started = Instant::now();
+    assert!(!hippo::client::ensure_daemon(
+        &paths,
+        &|_: &Paths| Ok(()),
+        Duration::from_millis(300)
+    ));
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(300) && elapsed < Duration::from_secs(2),
+        "{elapsed:?}"
     );
 }

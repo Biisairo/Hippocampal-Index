@@ -25,6 +25,15 @@ fn defaults_match_srs() {
     );
     assert_eq!(c.index.vector_index_threshold, 100_000);
     assert!(c.redact.patterns.is_empty());
+    assert!(c.daemon.autostart);
+    assert_eq!(c.daemon.idle_timeout_secs, 1_800);
+}
+
+#[test]
+fn daemon_section_override() {
+    let c = Config::parse("[daemon]\nautostart = false\nidle_timeout_secs = 0\n").unwrap();
+    assert!(!c.daemon.autostart);
+    assert_eq!(c.daemon.idle_timeout_secs, 0);
 }
 
 #[test]

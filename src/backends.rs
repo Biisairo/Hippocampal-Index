@@ -6,7 +6,9 @@ use std::sync::Arc;
 use crate::config::{Config, Paths};
 use crate::embedder::{EmbedError, Embedder};
 use crate::lance::LanceVectorStore;
-use crate::ollama::OllamaEmbedder;
+use crate::ollama::{OllamaEmbedder, ServerLauncher, spawn_ollama};
+
+const OLLAMA_LOG: &str = "ollama.log";
 use crate::testing::{HashEmbedder, MemoryVectorStore};
 use crate::vector::{VectorError, VectorStore};
 
@@ -18,10 +20,21 @@ pub enum BackendError {
     Embedder(#[from] EmbedError),
 }
 
-pub fn build_embedder(config: &Config) -> Result<Arc<dyn Embedder>, BackendError> {
+/// 설정에 따라 임베더를 만든다. Ollama는 `autostart`가 켜져 있으면 서버를 띄우는 방법을 함께 넘긴다. (FR-EMB-1)
+pub fn build_embedder(config: &Config, paths: &Paths) -> Result<Arc<dyn Embedder>, BackendError> {
     let c = &config.embedder;
     match c.backend.as_str() {
-        "ollama" => Ok(Arc::new(OllamaEmbedder::try_new(c)?)),
+        "ollama" => {
+            let launcher = c.autostart.then(|| {
+                let command = c.ollama_command.clone();
+                let url = c.url.clone();
+                let log = paths.logs().join(OLLAMA_LOG);
+                Box::new(move || spawn_ollama(&command, &url, &log).map(|_| ())) as ServerLauncher
+            });
+            Ok(Arc::new(OllamaEmbedder::try_new_with_launcher(
+                c, launcher,
+            )?))
+        }
         "hash" => Ok(Arc::new(HashEmbedder::new(c.dimension, c.max_input_tokens))),
         other => Err(BackendError::Unknown(other.to_string())),
     }

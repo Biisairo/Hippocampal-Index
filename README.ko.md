@@ -99,7 +99,19 @@ Claude / 사용자 ──▶ hippo search|show|status|reindex ──Unix socket�
 ```
 
 - 데몬은 컴퓨터마다 하나만 실행됩니다(파일 잠금). 저장소에는 데몬만 씁니다.
-- 데몬이 꺼져 있으면 수집 요청은 스풀 파일에 쌓였다가, 다음에 데몬이 시작될 때 처리됩니다. `hippo` 때문에 Claude Code 세션이 실패하는 일은 없습니다.
+- 데몬을 직접 띄울 필요는 없습니다. 로컬 MCP 서버처럼 필요할 때 올라옵니다. hook이나 CLI 명령이 데몬에 연결하지 못하면 `hippo daemon`을 백그라운드로 띄운 뒤 요청을 보냅니다. 요청이 없는 상태로 `idle_timeout_secs`(기본 30분)가 지나면 데몬이 스스로 내려가고, 다음 요청이 오면 다시 올라옵니다.
+- 데몬을 띄우지 못하면 수집 요청은 스풀 파일에 쌓였다가, 다음에 데몬이 시작될 때 처리됩니다. `hippo` 때문에 Claude Code 세션이 실패하는 일은 없습니다.
+
+### 1.6 생명주기: DB와 모델이 열리고 닫히는 시점
+
+| 구성 요소 | 여는 시점 | 닫는 시점 |
+|-----------|-----------|-----------|
+| 데몬 | 데몬에 연결하지 못한 첫 hook이나 CLI 명령이 자동으로 띄움 | 요청 없이 `idle_timeout_secs`가 지났을 때(재색인 중에는 내려가지 않음), 또는 직접 멈출 때 |
+| SQLite, LanceDB | 데몬이 시작할 때 | 데몬이 종료할 때 |
+| 임베딩 모델 | 첫 임베딩 요청 때 Ollama가 올림(약 1초) | 마지막 요청 후 `keep_alive`(30분)가 지나면 Ollama가 내림 |
+| Ollama 서버 | 임베딩 요청이 서버에 닿지 않으면 데몬이 자동으로 띄움(`ollama serve`, 로그는 `logs/ollama.log`). 서비스 등으로 이미 떠 있으면 띄우지 않음 | `hippo`가 끄지 않습니다. 다른 도구도 같은 서버를 쓸 수 있기 때문입니다. 모델 메모리는 `keep_alive`가 지나면 해제됩니다 |
+
+hook과 CLI 명령은 DB를 직접 열지 않고, 소켓으로 데몬에 요청만 보냅니다. 데몬이 멈춰도 데이터는 안전합니다. 모든 변경은 SQLite 트랜잭션 하나로 반영되고(WAL 모드), 남은 임베딩 작업은 큐에 그대로 남습니다.
 
 ---
 
@@ -126,28 +138,38 @@ git clone git@github.com:Biisairo/Hippocampal-Index.git hippo && cd hippo
 cargo build --release
 ```
 
-### 3.2 바이너리를 고정된 위치에 두기
+### 3.2 바이너리 위치
 
-hook 명령에는 `hippo install`을 실행한 `hippo` 바이너리의 **절대 경로**가 들어갑니다. 그래서 바이너리를 먼저 바뀌지 않을 위치에 둡니다.
+`hippo install`은 **자신을 실행한 바이너리의 절대 경로**를 hook 명령에 넣고, 데몬도 같은 바이너리로 띄웁니다. 그래서 빌드한 자리에서 바로 설치해도 됩니다.
 
 ```bash
-mkdir -p ~/.local/bin
-cp target/release/hippo ~/.local/bin/hippo
+./target/release/hippo install --scope user --dry-run
 ```
 
-이후 단계에서는 모두 `~/.local/bin/hippo`를 씁니다.
+다만 hook이 그 경로에 묶입니다. `cargo clean`을 하거나 저장소를 옮기면, 다시 빌드하거나 `install`을 다시 실행할 때까지 hook이 동작하지 않습니다. 같은 자리에서 다시 빌드하는 것은 괜찮습니다. 고정된 위치를 원하면 아래 중 하나로 설치한 뒤 그 위치에서 `install`을 실행하십시오.
+
+```bash
+cargo install --path .            # → ~/.cargo/bin/hippo
+# 또는
+mkdir -p ~/.local/bin && cp target/release/hippo ~/.local/bin/hippo
+```
+
+아래 예시는 `~/.local/bin/hippo`를 씁니다. 실제 바이너리 경로로 바꿔서 쓰십시오.
 
 ### 3.3 Ollama와 임베딩 모델
 
 ```bash
 brew install ollama
-brew services start ollama       # 지금 시작하고, 로그인할 때마다 자동 시작
-ollama pull qwen3-embedding:0.6b
+ollama pull qwen3-embedding:0.6b   # 처음 한 번은 서버가 떠 있어야 합니다: ollama serve (또는 brew services start ollama)
 ```
+
+Ollama를 계속 띄워 둘 필요는 없습니다. `hippo`가 서버에 연결하지 못하면 데몬이 `ollama serve`를 직접 띄웁니다(`[embedder] autostart = true`). 원하면 서비스로 실행해도 됩니다: `brew services start ollama`. 모델은 `hippo`가 대신 내려받지 않습니다.
 
 Ollama는 기본으로 `127.0.0.1:11434`에서만 요청을 받습니다. `hippo`는 localhost가 아닌 임베더 URL을 거부합니다.
 
-### 3.4 데몬 실행
+### 3.4 데몬 실행 (선택)
+
+이 단계는 건너뛰어도 됩니다. 데몬이 없으면 hook과 CLI 명령이 자동으로 띄우고(`[daemon] autostart = true`), 30분 동안 요청이 없으면 데몬이 스스로 내려갑니다. 동작을 지켜보고 싶거나 항상 띄워 두고 싶을 때만 직접 실행하십시오.
 
 방법 A: 터미널에서 실행합니다. 처음 시험해 볼 때 적합합니다.
 
@@ -163,7 +185,7 @@ mkdir -p ~/.hippo/logs && chmod 700 ~/.hippo ~/.hippo/logs
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hippo.daemon.plist
 ```
 
-멈출 때는 `launchctl bootout gui/$(id -u)/com.hippo.daemon`을 실행합니다.
+launchd는 데몬이 비정상 종료했을 때만 다시 띄우고, 유휴 종료 뒤에는 다시 띄우지 않습니다. 멈출 때는 `launchctl bootout gui/$(id -u)/com.hippo.daemon`을 실행합니다.
 
 데몬 상태 확인:
 
@@ -279,6 +301,8 @@ dimension = 1024                   # Qwen3-Embedding은 32~4096 지원
 max_input_tokens = 32000
 url = "http://127.0.0.1:11434"     # localhost, 127.0.0.1, ::1만 허용
 keep_alive = "30m"                 # 모델을 메모리에 유지해 첫 호출의 약 1초 지연을 피함
+autostart = true                   # 서버에 연결할 수 없으면 `ollama serve`를 띄움
+ollama_command = "ollama"          # ollama 실행 파일 경로
 
 [vector]
 backend = "lancedb"                # lancedb | memory (테스트용)
@@ -301,6 +325,10 @@ budget_ms = 800                    # UserPromptSubmit hook의 시간 예산
 [index]
 vector_index_threshold = 100000    # 벡터 수가 이 값에 이르면 ANN 인덱스를 만듦
 job_batch = 64
+
+[daemon]
+autostart = true                   # 데몬이 없으면 hook과 CLI가 띄움
+idle_timeout_secs = 1800           # 요청 없이 이 시간(초)이 지나면 종료 (0이면 종료하지 않음)
 
 [[redact.patterns]]                # 추가 비밀값 패턴 (정규식)
 kind = "internal"
@@ -340,6 +368,7 @@ pattern = 'HCI-\d{6}'
 ├─ vectors/<이름>/<세대>/      LanceDB 파일
 ├─ spool/                     데몬이 꺼져 있을 때 쌓인 요청
 ├─ logs/hippo.log             데몬 오류 로그
+├─ logs/daemon.err            자동으로 띄운 데몬의 시작 오류
 ├─ hippo.sock                  (0600) 데몬 소켓
 └─ hippo.lock                  단일 실행 잠금
 ```
@@ -358,8 +387,9 @@ pattern = 'HCI-\d{6}'
 
 | 증상 | 확인할 것 |
 |------|-----------|
-| `hippo: daemon not reachable` | 데몬이 실행 중인지 확인합니다. `hippo daemon` 또는 launchd 등록 |
-| `embed_jobs`가 줄지 않음 | Ollama 실행 여부(`curl http://127.0.0.1:11434/api/version`)와 모델 다운로드 여부. `~/.hippo/logs/hippo.log` 확인 |
+| `hippo: daemon not reachable` | 데몬을 띄우지 못했습니다. `~/.hippo/logs/daemon.err`를 확인하십시오(예: 설정 오류). `autostart = false`이면 직접 띄워야 합니다 |
+| `embed_jobs`가 줄지 않음 | 모델을 받았는지(`ollama list`), `hippo`가 Ollama를 띄울 수 있었는지(`~/.hippo/logs/ollama.log`, `hippo.log`) 확인합니다. 작업은 5초마다 다시 시도합니다 |
+| 검색 결과에 "벡터 검색을 쓰지 못해 키워드 검색 결과만 표시합니다"가 나옴 | 임베딩에 실패했습니다(Ollama를 띄우지 못했거나 모델이 없음). 복구될 때까지 키워드 검색 결과만 나옵니다 |
 | `compatibility: mismatch` | 모델이나 차원이 바뀌었습니다. `hippo reindex` 실행 |
 | 자동 주입이 되지 않음 | `[inject] threshold`를 낮춥니다. 주입은 같은 프로젝트의 다른 세션만 대상입니다 |
 | `lance-*`나 `protoc`에서 빌드 실패 | `brew reinstall protobuf` 후 `protoc --version` 확인 |
