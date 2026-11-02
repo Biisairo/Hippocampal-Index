@@ -6,14 +6,19 @@ use crate::transcript::{Iteration, IterationInput};
 
 const TRUNCATION_MARK: char = '…';
 
+/// 반복 입력의 표시 텍스트. 완료 알림은 `<status>: <summary>`.
+pub fn input_text(input: &IterationInput) -> String {
+    match input {
+        IterationInput::Prompt { text } | IterationInput::AgentMessage { text } => text.clone(),
+        IterationInput::TaskNotification(n) => format!("{}: {}", n.status, n.summary),
+    }
+}
+
 pub fn build_embed_text(it: &Iteration, max_tool_input_chars: usize) -> String {
-    let inputs = it.inputs.iter().map(|input| {
-        let text = match input {
-            IterationInput::Prompt { text } | IterationInput::AgentMessage { text } => text.clone(),
-            IterationInput::TaskNotification(n) => format!("{}: {}", n.status, n.summary),
-        };
-        format!("[입력] {text}")
-    });
+    let inputs = it
+        .inputs
+        .iter()
+        .map(|input| format!("[입력] {}", input_text(input)));
     let tools = it.tool_calls.iter().map(|call| {
         let json = call.input.to_string();
         let shown = if json.chars().count() > max_tool_input_chars {

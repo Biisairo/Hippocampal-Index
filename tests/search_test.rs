@@ -1,0 +1,579 @@
+mod common;
+
+use std::time::{Duration, Instant};
+
+use common::*;
+use serde_json::json;
+use smem::bg::TaskNotification;
+use smem::embed_text::build_embed_text;
+use smem::indexer::{ChunkConfig, process_embed_jobs};
+use smem::search::{
+    InjectConfig, SearchError, SearchKind, SearchRequest, VectorBackends, build_injection, fuse,
+    render_hits, render_turn, search,
+};
+use smem::store::{Batch, FtsFilter, NewCompletion, NewIteration, RecordKind, RecordStore};
+use smem::testing::{HashEmbedder, MemoryVectorStore};
+use smem::transcript::{ExtractorState, Iteration, IterationInput, ToolCall, ToolResultData};
+
+const CHUNKING: ChunkConfig = ChunkConfig {
+    max_tokens: 8_000,
+    chars_per_token: 1.0,
+};
+const RELEVANT: &str = "토큰 만료 비교가 반대여서 validateToken 수정";
+const CONFIG: InjectConfig = InjectConfig {
+    threshold: 0.55,
+    top_k: 3,
+    per_item_chars: 800,
+    total_chars: 4_000,
+};
+
+fn it(session: &str, mid: &str, cwd: &str, response: &str, result: Option<&str>) -> NewIteration {
+    let iteration = Iteration {
+        session_id: session.into(),
+        prompt_id: Some(format!("p-{mid}")),
+        message_id: mid.into(),
+        iteration_index: 0,
+        cwd: cwd.into(),
+        ts: "2026-11-02T00:00:00Z".into(),
+        inputs: vec![IterationInput::Prompt {
+            text: "질문".into(),
+        }],
+        texts: vec![response.into()],
+        tool_calls: result
+            .map(|r| ToolCall {
+                id: format!("c-{mid}"),
+                name: "Read".into(),
+                input: json!({"file_path": "auth.rs"}),
+                result: Some(ToolResultData {
+                    text: r.into(),
+                    is_error: false,
+                    structured: None,
+                }),
+            })
+            .into_iter()
+            .collect(),
+    };
+    let embed_text = build_embed_text(&iteration, 500);
+    NewIteration {
+        iteration,
+        embed_text,
+    }
+}
+
+struct Env {
+    records: RecordStore,
+    embedder: HashEmbedder,
+    vectors: MemoryVectorStore,
+}
+
+impl Env {
+    fn new(items: Vec<NewIteration>, embedder: HashEmbedder) -> Self {
+        let mut records = RecordStore::open_in_memory().unwrap();
+        for item in items {
+            let session_id = item.iteration.session_id.clone();
+            records
+                .apply(&Batch {
+                    session_id,
+                    transcript_path: "/t".into(),
+                    iterations: vec![item],
+                    completions: vec![],
+                    state: ExtractorState::default(),
+                })
+                .unwrap();
+        }
+        let vectors = MemoryVectorStore::default();
+        process_embed_jobs(&mut records, &embedder, &vectors, CHUNKING, 1_000).unwrap();
+        Self {
+            records,
+            embedder,
+            vectors,
+        }
+    }
+
+    fn standard() -> Self {
+        Self::new(
+            vec![
+                it(
+                    "s-old",
+                    "m1",
+                    "/proj/a",
+                    RELEVANT,
+                    Some("fn validateToken(exp) { exp < now }"),
+                ),
+                it("s-old", "m2", "/proj/a", "날씨 이야기 산책 커피", None),
+                it("s-other", "m3", "/proj/b", RELEVANT, None),
+                it("s-cur", "m4", "/proj/a", RELEVANT, None),
+            ],
+            HashEmbedder::new(256, 8_000),
+        )
+    }
+
+    fn backends(&self) -> Option<VectorBackends<'_>> {
+        Some(VectorBackends {
+            embedder: &self.embedder,
+            vectors: &self.vectors,
+        })
+    }
+}
+
+fn req(
+    query: &str,
+    kind: SearchKind,
+    cwd: Option<&str>,
+    exclude: Option<&str>,
+    limit: usize,
+) -> SearchRequest {
+    SearchRequest {
+        query: query.into(),
+        kind,
+        cwd: cwd.map(str::to_string),
+        exclude_session: exclude.map(str::to_string),
+        limit,
+    }
+}
+
+fn hit_ids(hits: &[smem::search::SearchHit]) -> Vec<String> {
+    hits.iter().map(|h| h.id.clone()).collect()
+}
+
+fn far_deadline() -> Instant {
+    Instant::now() + Duration::from_secs(60)
+}
+
+// ---- FR-RET-2 ----
+
+#[test]
+fn fuse_ranks_items_in_both_lists_first() {
+    let fused = fuse(&[vec!["a".into(), "b".into()], vec!["b".into(), "c".into()]]);
+    let ids: Vec<&str> = fused.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, ["b", "a", "c"]);
+    assert!((fused[0].1 - (1.0 / 62.0 + 1.0 / 61.0)).abs() < 1e-12);
+    assert!((fused[1].1 - 1.0 / 61.0).abs() < 1e-12);
+    assert!(fuse(&[]).is_empty());
+}
+
+#[test]
+fn hybrid_search_respects_scope_and_session() {
+    let env = Env::standard();
+    let hits = search(
+        &env.records,
+        env.backends(),
+        &req(
+            RELEVANT,
+            SearchKind::Iteration,
+            Some("/proj/a"),
+            Some("s-cur"),
+            10,
+        ),
+        None,
+    )
+    .unwrap();
+    assert_eq!(hits[0].id, "s-old:m1");
+    assert!(hits[0].similarity.unwrap() > 0.55);
+    let ids = hit_ids(&hits);
+    assert!(!ids.contains(&"s-other:m3".to_string()));
+    assert!(!ids.contains(&"s-cur:m4".to_string()));
+    assert!(hits.windows(2).all(|w| w[0].score >= w[1].score));
+}
+
+#[test]
+fn fts_only_mode_without_backends() {
+    let env = Env::standard();
+    let hits = search(
+        &env.records,
+        None,
+        &req(
+            "validateToken",
+            SearchKind::Iteration,
+            Some("/proj/a"),
+            Some("s-cur"),
+            10,
+        ),
+        None,
+    )
+    .unwrap();
+    assert_eq!(hit_ids(&hits), ["s-old:m1"]);
+    assert_eq!(hits[0].similarity, None);
+}
+
+#[test]
+fn result_search_is_filtered_through_links() {
+    let env = Env::standard();
+    let in_a = search(
+        &env.records,
+        env.backends(),
+        &req(
+            "fn validateToken(exp) { exp < now }",
+            SearchKind::Result,
+            Some("/proj/a"),
+            None,
+            10,
+        ),
+        None,
+    )
+    .unwrap();
+    assert_eq!(in_a.len(), 1);
+    assert_eq!(in_a[0].kind, RecordKind::Result);
+    let in_b = search(
+        &env.records,
+        env.backends(),
+        &req(
+            "fn validateToken(exp) { exp < now }",
+            SearchKind::Result,
+            Some("/proj/b"),
+            None,
+            10,
+        ),
+        None,
+    )
+    .unwrap();
+    assert!(in_b.is_empty());
+}
+
+#[test]
+fn both_kinds_and_limit() {
+    let env = Env::standard();
+    let both = search(
+        &env.records,
+        env.backends(),
+        &req(RELEVANT, SearchKind::Both, None, None, 10),
+        None,
+    )
+    .unwrap();
+    assert!(both.iter().any(|h| h.kind == RecordKind::Iteration));
+    assert!(both.iter().any(|h| h.kind == RecordKind::Result));
+    assert_eq!(
+        search(
+            &env.records,
+            env.backends(),
+            &req(RELEVANT, SearchKind::Both, None, None, 2),
+            None
+        )
+        .unwrap()
+        .len(),
+        2
+    );
+}
+
+#[test]
+fn chunked_record_appears_once() {
+    let long = (0..40)
+        .map(|i| format!("청크 단어 {i}\n"))
+        .collect::<String>();
+    let env = Env::new(
+        vec![it("s", "m1", "/w", "응답", Some(&long))],
+        HashEmbedder::new(64, 30),
+    );
+    let hits = search(
+        &env.records,
+        env.backends(),
+        &req("청크 단어", SearchKind::Result, None, None, 10),
+        None,
+    )
+    .unwrap();
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn past_deadline_is_reported() {
+    let env = Env::standard();
+    let err = search(
+        &env.records,
+        env.backends(),
+        &req(RELEVANT, SearchKind::Iteration, None, None, 10),
+        Some(Instant::now() - Duration::from_millis(1)),
+    )
+    .unwrap_err();
+    assert!(matches!(err, SearchError::DeadlineExceeded));
+}
+
+#[test]
+fn result_in_scope_checks_links() {
+    let env = Env::standard();
+    let rid = env
+        .records
+        .iteration("s-old:m1")
+        .unwrap()
+        .unwrap()
+        .tool_calls[0]
+        .result_id
+        .clone()
+        .unwrap();
+    assert!(
+        env.records
+            .result_in_scope(&rid, &FtsFilter::default())
+            .unwrap()
+    );
+    assert!(
+        env.records
+            .result_in_scope(
+                &rid,
+                &FtsFilter {
+                    cwd: Some("/proj/a".into()),
+                    exclude_session: None
+                }
+            )
+            .unwrap()
+    );
+    assert!(
+        !env.records
+            .result_in_scope(
+                &rid,
+                &FtsFilter {
+                    cwd: Some("/proj/a".into()),
+                    exclude_session: Some("s-old".into())
+                }
+            )
+            .unwrap()
+    );
+}
+
+// ---- FR-RET-1, 3, 4, 5 ----
+
+#[test]
+fn injection_includes_only_relevant_items_from_this_project_and_other_sessions() {
+    let env = Env::standard();
+    let text = build_injection(
+        &env.records,
+        env.backends(),
+        RELEVANT,
+        "/proj/a",
+        "s-cur",
+        CONFIG,
+        far_deadline(),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(text.contains("p-m1"));
+    assert!(text.contains("smem show"));
+    assert!(!text.contains("p-m3"), "다른 프로젝트");
+    assert!(!text.contains("p-m4"), "현재 세션");
+    assert!(!text.contains("p-m2"), "임계값 미만");
+    assert!(text.chars().count() <= CONFIG.total_chars);
+}
+
+#[test]
+fn injection_none_when_nothing_passes_threshold() {
+    let env = Env::standard();
+    assert_eq!(
+        build_injection(
+            &env.records,
+            env.backends(),
+            "전혀 무관한 질의 문장",
+            "/proj/a",
+            "s-cur",
+            CONFIG,
+            far_deadline()
+        )
+        .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn injection_respects_top_k_and_lengths() {
+    let env = Env::new(
+        vec![
+            it("s-old", "m1", "/proj/a", RELEVANT, None),
+            it("s-old", "m2", "/proj/a", &format!("{RELEVANT} 추가"), None),
+        ],
+        HashEmbedder::new(256, 8_000),
+    );
+    let one = build_injection(
+        &env.records,
+        env.backends(),
+        RELEVANT,
+        "/proj/a",
+        "s-cur",
+        InjectConfig { top_k: 1, ..CONFIG },
+        far_deadline(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(one.matches("\n- (").count(), 1);
+
+    let short = build_injection(
+        &env.records,
+        env.backends(),
+        RELEVANT,
+        "/proj/a",
+        "s-cur",
+        InjectConfig {
+            per_item_chars: 10,
+            ..CONFIG
+        },
+        far_deadline(),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(short.contains('…'));
+    assert!(!short.contains("validateToken"));
+
+    let tight = InjectConfig {
+        total_chars: 200,
+        ..CONFIG
+    };
+    let limited = build_injection(
+        &env.records,
+        env.backends(),
+        RELEVANT,
+        "/proj/a",
+        "s-cur",
+        tight,
+        far_deadline(),
+    )
+    .unwrap();
+    assert!(limited.is_none_or(|t| t.chars().count() <= 200));
+}
+
+#[test]
+fn injection_skipped_without_backends_empty_prompt_or_deadline() {
+    let env = Env::standard();
+    assert_eq!(
+        build_injection(
+            &env.records,
+            None,
+            RELEVANT,
+            "/proj/a",
+            "s-cur",
+            CONFIG,
+            far_deadline()
+        )
+        .unwrap(),
+        None
+    );
+    assert_eq!(
+        build_injection(
+            &env.records,
+            env.backends(),
+            "   ",
+            "/proj/a",
+            "s-cur",
+            CONFIG,
+            far_deadline()
+        )
+        .unwrap(),
+        None
+    );
+    let past = Instant::now() - Duration::from_millis(1);
+    assert_eq!(
+        build_injection(
+            &env.records,
+            env.backends(),
+            RELEVANT,
+            "/proj/a",
+            "s-cur",
+            CONFIG,
+            past
+        )
+        .unwrap(),
+        None
+    );
+}
+
+// ---- FR-RET-6, 7 ----
+
+#[test]
+fn render_turn_lists_iterations_and_results() {
+    let (mut ex, events) = run_fixture("s2_tools.jsonl");
+    let mut its = iterations(&events);
+    its.extend(iterations(&ex.finish_turn()));
+    let prompt_id = its[0].prompt_id.clone().unwrap();
+    let mut records = RecordStore::open_in_memory().unwrap();
+    records
+        .apply(&Batch {
+            session_id: its[0].session_id.clone(),
+            transcript_path: "/t".into(),
+            iterations: its
+                .into_iter()
+                .map(|i| {
+                    let e = build_embed_text(&i, 500);
+                    NewIteration {
+                        iteration: i,
+                        embed_text: e,
+                    }
+                })
+                .collect(),
+            completions: vec![],
+            state: ExtractorState::default(),
+        })
+        .unwrap();
+    let plain = render_turn(&records, &prompt_id, false).unwrap();
+    assert!(plain.contains(&prompt_id));
+    assert!(plain.contains("[0]") && plain.contains("[1]"));
+    assert!(plain.contains("Read"));
+    assert!(!plain.contains("import json"));
+    let full = render_turn(&records, &prompt_id, true).unwrap();
+    assert!(full.contains("import json"));
+    assert!(
+        render_turn(&records, "nope", false)
+            .unwrap()
+            .contains("없음")
+    );
+}
+
+#[test]
+fn render_turn_shows_background_completions() {
+    let (mut ex, events) = run_fixture("s5_bg_bash.jsonl");
+    let mut its = iterations(&events);
+    its.extend(iterations(&ex.finish_turn()));
+    let prompt_id = its[0].prompt_id.clone().unwrap();
+    let session_id = its[0].session_id.clone();
+    let mut records = RecordStore::open_in_memory().unwrap();
+    records
+        .apply(&Batch {
+            session_id: session_id.clone(),
+            transcript_path: "/t".into(),
+            iterations: its
+                .into_iter()
+                .map(|i| {
+                    let e = build_embed_text(&i, 500);
+                    NewIteration {
+                        iteration: i,
+                        embed_text: e,
+                    }
+                })
+                .collect(),
+            completions: vec![NewCompletion {
+                session_id,
+                line_uuid: "n1".into(),
+                notification: TaskNotification {
+                    task_id: "bm0rqrvzr".into(),
+                    tool_use_id: "toolu_01D9M8zTeQeTTXW1FhAmqgRV".into(),
+                    output_file: None,
+                    status: "completed".into(),
+                    summary: "Background command completed (exit code 0)".into(),
+                },
+                result_text: Some("bg-done".into()),
+                ts: "t".into(),
+            }],
+            state: ExtractorState::default(),
+        })
+        .unwrap();
+    let out = render_turn(&records, &prompt_id, true).unwrap();
+    assert!(out.contains("exit code 0"));
+    assert!(out.contains("bg-done"));
+}
+
+#[test]
+fn render_hits_shows_prompt_ids_for_results() {
+    let env = Env::standard();
+    let hits = search(
+        &env.records,
+        env.backends(),
+        &req(
+            "fn validateToken(exp) { exp < now }",
+            SearchKind::Both,
+            Some("/proj/a"),
+            None,
+            10,
+        ),
+        None,
+    )
+    .unwrap();
+    let out = render_hits(&env.records, &hits).unwrap();
+    assert!(out.contains("[result]"));
+    assert!(out.contains("[iteration]"));
+    assert!(out.contains("p-m1"));
+    assert_eq!(render_hits(&env.records, &[]).unwrap().trim(), "결과 없음");
+}

@@ -395,6 +395,21 @@ impl RecordStore {
         )
     }
 
+    /// 결과를 참조하는 반복 중 필터를 만족하는 것이 있는지. 필터가 비어 있으면 항상 참. (FR-RET-2)
+    pub fn result_in_scope(&self, result_id: &str, filter: &FtsFilter) -> Result<bool> {
+        if filter.cwd.is_none() && filter.exclude_session.is_none() {
+            return Ok(true);
+        }
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM iteration_results ir JOIN iterations i ON i.id = ir.iteration_id
+                 WHERE ir.result_id = ?1 AND (?2 IS NULL OR i.cwd = ?2) AND (?3 IS NULL OR i.session_id <> ?3))",
+                params![result_id, filter.cwd, filter.exclude_session],
+                |r| r.get(0),
+            )?)
+    }
+
     /// `rowid > after`인 반복 id를 rowid 순으로 최대 `limit`개 돌려준다. (재색인용)
     pub fn iteration_page(&self, after: i64, limit: usize) -> Result<Vec<(i64, String)>> {
         self.page("iterations", after, limit)

@@ -3,6 +3,7 @@ pub mod embed_text;
 pub mod embedder;
 pub mod indexer;
 pub mod redact;
+pub mod search;
 pub mod store;
 pub mod testing;
 pub mod transcript;
