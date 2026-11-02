@@ -144,35 +144,36 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 | ID | 요구사항 | 우선순위 |
 |----|----------|----------|
 | FR-CAP-1 | `PostToolBatch`, `Stop`, `StopFailure` 입력에 `agent_id` 필드가 있으면 아무 처리 없이 종료해야 한다. (서브에이전트 내부 루프 제외) | M |
-| FR-CAP-2 | `PostToolBatch`(메인 루프)를 받으면 해당 세션에 대해 transcript 처리를 요청해야 한다. | M |
+| FR-CAP-2 | `PostToolBatch`(메인 루프)를 받으면 해당 세션에 대해 transcript 처리와 batch 완료 판정(FR-EXT-7 b)을 요청해야 한다. | M |
 | FR-CAP-3 | `Stop`과 `StopFailure`(메인 루프)를 받으면 해당 세션에 대해 transcript 처리를 요청하고, 마지막 반복을 완료로 확정해야 한다. | M |
-| FR-CAP-4 | `SessionEnd`를 받으면 해당 세션의 미처리 transcript 라인과 미처리 완료 알림을 모두 처리해야 한다. | M |
+| FR-CAP-4 | `SessionEnd`를 받으면 해당 세션의 미처리 transcript 라인을 모두 처리하고, 처리 후에도 반복에 붙지 않은 반복 입력은 버려야 한다. 완료 알림은 FR-BG-2에 따라 이미 처리된 상태다. | M |
 | FR-CAP-5 | hook 클라이언트는 데몬에 연결할 수 없으면 요청을 스풀 파일에 추가하고 종료해야 한다. | M |
 | FR-CAP-6 | 데몬은 시작할 때 스풀에 쌓인 요청을 기록 순서대로 처리해야 한다. | M |
 
 #### 3.2.2 transcript 해석 (EXT)
 | ID | 요구사항 | 우선순위 |
 |----|----------|----------|
-| FR-EXT-1 | 데몬은 세션마다 처리 완료한 transcript 바이트 offset을 저장하고, 그 뒤의 라인만 읽어야 한다. offset은 해당 라인의 DB 반영이 끝난 뒤에만 갱신한다. | M |
+| FR-EXT-1 | 데몬은 세션마다 안전 offset과 해석기 상태(턴별 다음 `iteration_index` 등)를 저장하고, 안전 offset 뒤의 라인만 읽어야 한다. 안전 offset은 아직 완료되지 않은 반복이나 아직 반복에 붙지 않은 반복 입력이 시작되는 라인 앞이며, 그런 것이 없으면 마지막으로 읽은 라인 끝이다. offset은 완료된 반복의 DB 반영이 끝난 뒤에만 갱신한다. | M |
 | FR-EXT-2 | `type == "assistant"` 라인을 `message.id`로 묶어 반복 1개로 만들어야 한다. | M |
 | FR-EXT-3 | 반복에서 `text` 블록은 저장하고, `thinking` 블록은 저장하지 않아야 한다. | M |
 | FR-EXT-4 | 반복의 `tool_use` 블록마다 `name`, `input`, `id`를 저장해야 한다. | M |
-| FR-EXT-5 | `type == "user"` 라인의 `tool_result` 블록은 `tool_use_id`로 해당 `tool_use`가 속한 반복에 연결해야 한다. | M |
-| FR-EXT-6 | `type == "user"`이고 content가 문자열인 라인 중 다음은 반복 입력으로 다뤄야 한다: (a) 사용자 프롬프트, (b) `<task-notification>`을 포함한 메시지, (c) `<agent-message>`를 포함한 메시지. 내용이 `<system-reminder>` 블록만으로 이루어진 메시지는 제외한다. 반복 입력은 그 뒤에 처음 나오는 반복에 붙인다. | M |
-| FR-EXT-7 | 중간 반복은 모든 `tool_use`에 대응하는 `tool_result`가 transcript에 나타난 뒤에 완료로 판단해야 한다. 미완료 반복은 다음 처리 때까지 보류한다. | M |
-| FR-EXT-8 | 마지막 반복은 같은 `prompt_id`에 대한 `Stop`, `StopFailure`, `SessionEnd` 중 하나를 받은 뒤에 완료로 판단해야 한다. | M |
+| FR-EXT-5 | `type == "user"` 라인의 `tool_result` 블록은 `tool_use_id`로 해당 `tool_use`가 속한 반복에 연결해야 한다. 라인의 `toolUseResult`에 `handbackReport.text`가 있으면 tool_result 본문 대신 그 값을 결과 텍스트로 쓴다. 이 경우 tool_result 본문에는 보고 대신 안내 문구만 들어 있다(부록 A, s3). | M |
+| FR-EXT-6 | `type == "user"`이고 `tool_result` 블록이 없는 라인은 반복 입력으로 다뤄야 한다. content가 문자열이면 그 문자열을, 블록 배열이면 `text` 블록을 이어 붙인 텍스트를 쓴다. 종류는 (a) `<task-notification>`을 포함하면 완료 알림, (b) `<agent-message`를 포함하면 서브에이전트 보고, (c) 그 밖에는 사용자 프롬프트이다. 다음은 제외한다: `isMeta == true`인 라인(단 `<agent-message`를 포함한 라인은 제외하지 않는다), 내용이 `<system-reminder>` 블록만으로 이루어진 라인, 텍스트가 빈 라인. 반복 입력은 그 뒤에 처음 나오는 반복에 붙인다. | M |
+| FR-EXT-7 | 반복은 다음 중 하나가 일어나면 완료로 판단해야 한다: (a) 다른 `message.id`를 가진 assistant 라인이 뒤에 나타남, (b) `PostToolBatch` 처리 요청을 받았고 반복의 모든 `tool_use`에 `tool_result`가 있음, (c) `Stop`, `StopFailure`, `SessionEnd` 처리 요청을 받음. 병렬 호출의 `tool_use`와 `tool_result`는 transcript에 교차로 기록될 수 있으므로(부록 A, s2) 결과가 모두 모인 것만으로 완료로 판단하지 않는다. (a)나 (c)로 완료될 때 결과가 없는 `tool_use`는 결과 없음으로 저장한다. | M |
+| FR-EXT-8 | 완료되지 않은 반복은 다음 처리 때까지 보류해야 한다. | M |
 | FR-EXT-9 | `user`, `assistant`가 아닌 라인 타입(`attachment`, `system`, `queue-operation` 등)은 무시해야 한다. | M |
+| FR-EXT-11 | 반복의 `prompt_id`는 그 반복보다 앞에 있는 가장 최근 user 라인의 `promptId`로 정해야 한다. `ts`와 `cwd`는 반복의 첫 assistant 라인 값으로 정한다. | M |
 | FR-EXT-10 | 반복 id는 `session_id`와 `message.id`의 조합으로 만들어야 하며, 같은 반복을 다시 처리해도 DB에 중복 행이 생기지 않아야 한다. | M |
 
 #### 3.2.3 백그라운드 작업 (BG)
 | ID | 요구사항 | 우선순위 |
 |----|----------|----------|
-| FR-BG-1 | `tool_input.run_in_background == true`인 `Bash` 또는 `Agent` 호출은 `tool_use_id`를 키로 하는 대기(pending) 기록을 만들어야 한다. 작업 id는 Bash의 경우 `tool_response.backgroundTaskId`, Agent의 경우 tool_result 텍스트의 `agentId: <id>`에서 얻는다. | M |
-| FR-BG-2 | 반복 입력에서 `<task-notification>`을 찾으면 `task-id`, `tool-use-id`, `output-file`, `status`, `summary`를 파싱해야 한다. | M |
+| FR-BG-1 | `tool_input.run_in_background == true`인 `Bash` 또는 `Agent` 호출은 `tool_use_id`를 키로 하는 대기(pending) 기록을 만들어야 한다. 작업 id는 해당 tool_result 라인의 `toolUseResult` 객체에서 얻는다(Bash: `backgroundTaskId`, Agent: `agentId`). | M |
+| FR-BG-2 | 반복 입력에서 `<task-notification>`을 찾으면 반복 완료를 기다리지 않고 즉시 `task-id`, `tool-use-id`, `output-file`, `status`, `summary`를 파싱해 처리해야 한다. 알림은 transcript 라인의 `uuid`로 식별하며, 같은 `uuid`의 알림을 다시 처리해도 결과가 바뀌지 않아야 한다. | M |
 | FR-BG-3 | 파싱한 `tool-use-id`로 대기 기록을 찾아 완료 결과를 연결해야 한다. 대기 기록이 없으면 알림만 반복 입력으로 저장한다. | M |
 | FR-BG-4 | Bash 작업은 알림을 감지한 즉시 `output-file` 내용을 읽어 결과로 저장해야 한다. 파일이 없으면 `status`와 `summary`만 저장한다. | M |
 | FR-BG-5 | Agent 작업은 `output-file`(서브에이전트 transcript)에서 마지막 `SubagentHandback` 호출의 `tool_input.message`를 결과로 저장해야 한다. 이 호출이 없으면 마지막 assistant `text`를 저장한다. | M |
-| FR-BG-6 | 같은 `task-id`로 알림이 여러 번 오면 기존 결과를 덮어쓰지 않고 순번을 붙여 추가해야 한다. | M |
+| FR-BG-6 | 같은 `task-id`로 `uuid`가 다른 알림이 여러 번 오면 기존 결과를 덮어쓰지 않고 순번을 붙여 추가해야 한다. | M |
 
 #### 3.2.4 저장 (STO)
 | ID | 요구사항 | 우선순위 |
@@ -277,6 +278,11 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 - `PostToolBatch.tool_calls[]`에는 `tool_name`, `tool_input`, `tool_use_id`, `tool_response`가 있고, 모델의 `text`와 `thinking`은 없다.
 - `Stop`에는 `last_assistant_message`, `stop_hook_active`, `background_tasks`가 있다.
 - 서브에이전트 내부 hook에는 `agent_id`, `agent_type`이 있고, 메인 루프 hook에는 없다.
+- 병렬 호출은 transcript에 `tool_use → tool_result → tool_use → tool_result`처럼 교차로 기록될 수 있다(s2).
+- assistant 라인에는 `promptId`가 없고 user 라인에만 있다.
+- 백그라운드 서브에이전트 보고(`<agent-message>`)와 하네스 안내 메시지는 `isMeta: true`로 기록된다. `<task-notification>`은 `isMeta`가 아니다(s4).
+- tool_result 라인의 `toolUseResult`에 백그라운드 작업 id가 있다(Bash: `backgroundTaskId`, Agent: `agentId`).
+- 포그라운드 Agent의 tool_result 본문은 안내 문구이고, 서브에이전트 보고는 `toolUseResult.handbackReport.text`에 있다(s3).
 - `SubagentStop`에는 `last_assistant_message`가 없다.
 - `TaskCreated`, `TaskCompleted`, `Notification`은 s5에서 실행되지 않았다.
 - 백그라운드 완료 알림은 메인 transcript에 `type: user`, 문자열 content의 `<task-notification>`으로 기록되며 `<tool-use-id>`가 시작 호출의 `tool_use_id`와 같다.
