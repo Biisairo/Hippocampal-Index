@@ -1,6 +1,7 @@
 [package]
 name = "hippo"
 version = "0.1.0"
+description = "Hippocampal Index: long-term memory for Claude Code sessions"
 edition = "2024"
 
 [dependencies]

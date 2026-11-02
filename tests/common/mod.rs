@@ -14,6 +14,15 @@ pub fn fixture_path(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// fixture에 기록된 첫 `cwd` 값. 테스트에 특정 컴퓨터의 경로를 하드코딩하지 않기 위해 쓴다.
+pub fn fixture_cwd(name: &str) -> String {
+    read_fixture(name)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find_map(|v| v.get("cwd").and_then(Value::as_str).map(str::to_string))
+        .expect("fixture has cwd")
+}
+
 pub fn read_fixture(name: &str) -> String {
     fs::read_to_string(fixture_path(name)).expect("fixture")
 }

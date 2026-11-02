@@ -18,7 +18,10 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 const INJECT_TIMEOUT_MARGIN_SECS: u64 = 2;
 
 #[derive(Parser)]
-#[command(name = "hippo", about = "Claude Code 세션 기억 저장소")]
+#[command(
+    name = "hippo",
+    about = "Hippocampal Index: Claude Code 세션을 위한 장기 기억"
+)]
 struct Cli {
     /// 데이터 루트 (기본: ~/.hippo)
     #[arg(long, global = true)]

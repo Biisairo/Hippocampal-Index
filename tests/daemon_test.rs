@@ -21,7 +21,9 @@ use hippo::vector::{VectorRecord, VectorStore};
 use serde_json::json;
 
 const S2: &str = "afd070e6-4625-4b31-8c43-f1f553949222";
-const S2_CWD: &str = "/Users/user/personal/session_db/probe";
+fn s2_cwd() -> String {
+    fixture_cwd("s2_tools.jsonl")
+}
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Env {
@@ -120,7 +122,7 @@ fn ingest_embed_search_show_end_to_end() {
     let search = Request::Search(SearchRequest {
         query: "두 파일은 병렬로".into(),
         kind: SearchKind::Iteration,
-        cwd: Some(S2_CWD.into()),
+        cwd: Some(s2_cwd()),
         exclude_session: None,
         limit: 5,
     });
@@ -156,7 +158,7 @@ fn inject_returns_context_for_other_session() {
         .embed_text
         .clone();
 
-    let input = json!({"session_id": "other", "transcript_path": "/t", "cwd": S2_CWD, "prompt": embed_text}).to_string();
+    let input = json!({"session_id": "other", "transcript_path": "/t", "cwd": s2_cwd(), "prompt": embed_text}).to_string();
     let out = run_hook(
         &e.paths,
         Duration::from_secs(5),
@@ -173,7 +175,7 @@ fn inject_returns_context_for_other_session() {
     );
 
     let same =
-        json!({"session_id": S2, "transcript_path": "/t", "cwd": S2_CWD, "prompt": embed_text})
+        json!({"session_id": S2, "transcript_path": "/t", "cwd": s2_cwd(), "prompt": embed_text})
             .to_string();
     assert_eq!(
         run_hook(
@@ -192,7 +194,7 @@ fn inject_returns_context_for_other_session() {
 fn hook_ingest_through_daemon() {
     let e = env();
     let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
-    let input = json!({"session_id": S2, "transcript_path": e.transcript, "cwd": S2_CWD, "hook_event_name": "Stop"}).to_string();
+    let input = json!({"session_id": S2, "transcript_path": e.transcript, "cwd": s2_cwd(), "hook_event_name": "Stop"}).to_string();
     assert_eq!(
         run_hook(&e.paths, Duration::from_millis(800), "stop", &input),
         None
@@ -290,7 +292,7 @@ fn incompatible_vector_store_falls_back_to_fts() {
     });
     let out = text(request(&e.paths.socket(), &search, TIMEOUT).unwrap());
     assert!(out.contains("sim=-"), "FTS 전용: {out}");
-    let input = json!({"session_id": "other", "transcript_path": "/t", "cwd": S2_CWD, "prompt": "두 파일은 병렬로 다 읽었지만"}).to_string();
+    let input = json!({"session_id": "other", "transcript_path": "/t", "cwd": s2_cwd(), "prompt": "두 파일은 병렬로 다 읽었지만"}).to_string();
     assert_eq!(
         run_hook(
             &e.paths,
@@ -376,7 +378,7 @@ fn reindex_recovers_from_mismatch() {
         .unwrap()[1]
         .embed_text
         .clone();
-    let input = json!({"session_id": "other", "transcript_path": "/t", "cwd": S2_CWD, "prompt": embed_text}).to_string();
+    let input = json!({"session_id": "other", "transcript_path": "/t", "cwd": s2_cwd(), "prompt": embed_text}).to_string();
     assert!(
         run_hook(
             &e.paths,

@@ -34,7 +34,8 @@ fn s1_text_only_iteration_completes_on_finish_turn() {
     );
     assert_eq!(it.texts, vec!["2".to_string()], "thinking은 제외");
     assert!(it.tool_calls.is_empty());
-    assert_eq!(it.cwd, "/Users/user/personal/session_db/probe");
+    assert_eq!(it.cwd, fixture_cwd("s1_notool.jsonl"));
+    assert!(!it.cwd.is_empty());
     assert!(!it.ts.is_empty());
 }
 

@@ -1,6 +1,8 @@
-# hippo
+# Hippocampal Index (`hippo`)
 
-Named after the hippocampus, the part of the brain that turns short-term experience into long-term memory.
+**Long-term memory for Claude Code sessions.**
+
+The name comes from the *hippocampal memory indexing theory* (Teyler & DiScenna, 1986). In this theory, the hippocampus does not store whole memories. It stores an **index** that points to memory traces spread across the cortex. When a cue arrives, the index reactivates the original memory. This project works the same way: the full records stay in SQLite (the "cortex"), the vector store is the index, and your prompt is the cue. The short name and the command are `hippo`.
 
 [한국어](README.ko.md)
 
@@ -75,7 +77,7 @@ Vector store (LanceDB, a derived index that can be rebuilt any time)
  └─ one vector per chunk of an iteration or result
 ```
 
-Because the vector store is derived, you can replace the embedding model or the vector database and rebuild the index from SQLite (see [section 6](#6-changing-the-embedding-model-or-vector-database)).
+This is the "index" in the name: the vector store only points to the records, as the hippocampal index points to cortical traces. Because the vector store is derived, you can replace the embedding model or the vector database and rebuild the index from SQLite (see [section 6](#6-changing-the-embedding-model-or-vector-database)).
 
 ### 1.4 How memory is used
 
@@ -120,7 +122,7 @@ Claude / you ──▶ hippo search|show|status|reindex ──Unix socket──�
 
 ```bash
 brew install protobuf            # if protoc is missing or broken: brew reinstall protobuf
-git clone <this repo> session_db && cd session_db
+git clone git@github.com:Biisairo/Hippocampal-Index.git hippo && cd hippo
 cargo build --release
 ```
 

@@ -1,6 +1,8 @@
-# hippo
+# Hippocampal Index (해마 색인, `hippo`)
 
-이름은 단기 경험을 장기 기억으로 옮기는 뇌 부위인 해마(hippocampus)에서 따왔습니다.
+**Claude Code 세션을 위한 장기 기억.**
+
+이름은 *해마 색인 이론*(hippocampal memory indexing theory, Teyler & DiScenna, 1986)에서 따왔습니다. 이 이론에 따르면 해마는 기억 전체를 저장하지 않습니다. 대뇌피질에 흩어진 기억 흔적을 가리키는 **색인**을 저장해 두었다가, 단서가 들어오면 그 색인으로 원래 기억을 다시 활성화합니다. 이 프로젝트도 같은 방식으로 동작합니다. 원문 기록은 SQLite(피질)에 두고, 벡터 저장소가 색인 역할을 하며, 프롬프트가 단서가 됩니다. 줄여서 부르는 이름과 명령어는 `hippo`입니다.
 
 [English](README.md)
 
@@ -75,7 +77,7 @@
  └─ 반복이나 결과의 청크마다 벡터 하나
 ```
 
-벡터 저장소는 원본 저장소에서 파생된 인덱스입니다. 그래서 임베딩 모델이나 벡터 DB를 바꾸더라도 SQLite에서 인덱스를 다시 만들면 됩니다([6장](#6-임베딩-모델이나-벡터-db-바꾸기) 참고).
+이름의 "색인"이 바로 이 부분입니다. 해마 색인이 피질의 기억 흔적을 가리키듯, 벡터 저장소는 원본 기록을 가리키기만 합니다. 벡터 저장소는 원본 저장소에서 파생된 인덱스입니다. 그래서 임베딩 모델이나 벡터 DB를 바꾸더라도 SQLite에서 인덱스를 다시 만들면 됩니다([6장](#6-임베딩-모델이나-벡터-db-바꾸기) 참고).
 
 ### 1.4 기억을 쓰는 방법
 
@@ -120,7 +122,7 @@ Claude / 사용자 ──▶ hippo search|show|status|reindex ──Unix socket�
 
 ```bash
 brew install protobuf            # protoc가 없거나 깨졌으면: brew reinstall protobuf
-git clone <이 저장소> session_db && cd session_db
+git clone git@github.com:Biisairo/Hippocampal-Index.git hippo && cd hippo
 cargo build --release
 ```
 
