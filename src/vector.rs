@@ -68,6 +68,8 @@ pub trait VectorStore: Send + Sync {
     ) -> Result<Vec<VectorHit>, VectorError>;
     fn count(&self) -> Result<u64, VectorError>;
     fn ensure_index(&self) -> Result<(), VectorError>;
+    /// 모든 벡터 레코드를 읽는다. 프로젝트 병합에 쓴다. (FR-PRJ-9)
+    fn scan(&self) -> Result<Vec<VectorRecord>, VectorError>;
 }
 
 /// 길이가 다르거나 영벡터가 있으면 0을 돌려준다.

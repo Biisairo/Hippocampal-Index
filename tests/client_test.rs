@@ -7,8 +7,8 @@ use hippo::client::{HookAction, inject_output, launch_disabled, parse_hook, run_
 use hippo::config::{Config, Paths};
 use hippo::generations::active_dir;
 use hippo::ingest::{HookEvent, IngestRequest};
-use hippo::protocol::{Request, Response, StatusInfo};
-use hippo::search::{SearchKind, SearchRequest};
+use hippo::protocol::{ProjectStatus, Request, Response, Scope, StatusInfo};
+use hippo::search::SearchKind;
 use hippo::setup::{hooks_config, launchd_plist};
 use hippo::spool;
 use serde_json::{Value, json};
@@ -121,34 +121,42 @@ fn protocol_roundtrip() {
             cwd: "/w".into(),
             session_id: "s".into(),
         },
-        Request::Search(SearchRequest {
+        Request::Search {
             query: "q".into(),
             kind: SearchKind::Both,
-            cwd: None,
-            exclude_session: None,
             limit: 5,
-        }),
+            scope: Scope::Path("/w".into()),
+            cwd: "/w".into(),
+        },
         Request::Show {
             prompt_id: "p".into(),
             with_results: true,
+            scope: Some(Scope::Project),
+            cwd: "/w".into(),
+        },
+        Request::Show {
+            prompt_id: "p".into(),
+            with_results: false,
+            scope: None,
+            cwd: "/w".into(),
         },
         Request::Status,
+        Request::Reindex {
+            scope: Scope::All,
+            cwd: "/w".into(),
+        },
+        Request::ProjectList,
+        Request::ProjectAdopt {
+            source: "/old".into(),
+            cwd: "/w".into(),
+        },
     ];
     for r in requests {
         let line = serde_json::to_string(&r).unwrap();
         assert!(!line.contains('\n'));
         assert_eq!(serde_json::from_str::<Request>(&line).unwrap(), r);
     }
-    let status = Response::Status(StatusInfo {
-        iterations: 1,
-        results: 2,
-        embed_jobs: 3,
-        spool_pending: 0,
-        vectors: 4,
-        embed_model: "m".into(),
-        compatibility: "compatible".into(),
-        reindex: "idle".into(),
-    });
+    let status = Response::Status(status_info(1, 4, "compatible", "idle"));
     for r in [
         Response::Done,
         Response::Text { text: "t".into() },
@@ -321,8 +329,9 @@ fn backend_selection() {
     )
     .unwrap();
     assert_eq!(build_embedder(&config, &paths).unwrap().dimension(), 16);
-    let memory = vector_source(&config, &paths).unwrap();
-    let store = (memory.open)(&active_dir(&memory.base).unwrap()).unwrap();
+    let memory = vector_source(&config).unwrap();
+    let base = paths.project_vectors("p", &memory.name);
+    let store = (memory.open)(&active_dir(&base).unwrap()).unwrap();
     assert_eq!(store.count().unwrap(), 0);
 
     let real = Config::default();
@@ -330,11 +339,12 @@ fn backend_selection() {
         build_embedder(&real, &paths).unwrap().model_id(),
         "qwen3-embedding:0.6b"
     );
-    let lance = vector_source(&real, &paths).unwrap();
-    assert_eq!(lance.base, paths.vectors("default"));
-    let generation = active_dir(&lance.base).unwrap();
+    let lance = vector_source(&real).unwrap();
+    assert_eq!(lance.name, "default");
+    let base = paths.project_vectors("p", &lance.name);
+    let generation = active_dir(&base).unwrap();
     assert_eq!((lance.open)(&generation).unwrap().count().unwrap(), 0);
-    assert!(generation.starts_with(paths.vectors("default")));
+    assert!(generation.starts_with(&base));
 
     config.embedder.backend = "nope".into();
     assert!(matches!(
@@ -343,7 +353,7 @@ fn backend_selection() {
     ));
     config.vector.backend = "nope".into();
     assert!(matches!(
-        vector_source(&config, &paths),
+        vector_source(&config),
         Err(BackendError::Unknown(_))
     ));
 }
@@ -352,14 +362,19 @@ fn backend_selection() {
 
 fn status_info(iterations: u64, vectors: u64, compatibility: &str, reindex: &str) -> StatusInfo {
     StatusInfo {
-        iterations,
-        results: 0,
-        embed_jobs: 0,
         spool_pending: 0,
-        vectors,
         embed_model: "m".into(),
-        compatibility: compatibility.into(),
         reindex: reindex.into(),
+        projects: vec![ProjectStatus {
+            id: "p1".into(),
+            location: "/w".into(),
+            exists: true,
+            iterations,
+            results: 0,
+            embed_jobs: 0,
+            vectors,
+            compatibility: compatibility.into(),
+        }],
     }
 }
 
@@ -367,7 +382,11 @@ fn status_info(iterations: u64, vectors: u64, compatibility: &str, reindex: &str
 fn status_render_shows_fields_and_reindex_hints() {
     let ok = status_info(3, 5, "compatible", "idle").render();
     assert!(ok.contains("iterations: 3") && ok.contains("reindex: idle"));
-    assert!(!ok.contains("hippo reindex"));
+    assert!(ok.contains("projects: 1") && ok.contains("[p1] /w"), "{ok}");
+    assert!(!ok.contains("위치 없음") && !ok.contains("hippo reindex"));
+    let mut gone = status_info(3, 5, "compatible", "idle");
+    gone.projects[0].exists = false;
+    assert!(gone.render().contains("위치 없음"));
     assert!(
         status_info(3, 0, "empty", "idle")
             .render()
@@ -422,4 +441,15 @@ fn ensure_daemon_gives_up_after_wait() {
         elapsed >= Duration::from_millis(300) && elapsed < Duration::from_secs(2),
         "{elapsed:?}"
     );
+}
+
+// ---- QA-6 ----
+
+#[test]
+fn status_render_escapes_control_characters_in_location() {
+    let mut st = status_info(1, 1, "compatible", "idle");
+    st.projects[0].location = "/w\u{1b}[31m".into();
+    let out = st.render();
+    assert!(!out.contains('\u{1b}'), "{out:?}");
+    assert!(out.contains("\\u{1b}"), "{out:?}");
 }

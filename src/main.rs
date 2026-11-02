@@ -11,8 +11,9 @@ use hippo::client::{
 use hippo::config::{Config, Paths};
 use hippo::daemon;
 use hippo::install::{Action, Scope, apply, target_file};
-use hippo::protocol::{Request, Response};
-use hippo::search::{SearchKind, SearchRequest};
+use hippo::protocol::{Request, Response, Scope as QueryScope};
+use hippo::registry::is_project_id;
+use hippo::search::SearchKind;
 use hippo::setup::{hooks_config, launchd_plist};
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -39,8 +40,8 @@ enum Command {
     /// 기억 검색
     Search {
         query: String,
-        /// cwd, all, 또는 프로젝트 경로
-        #[arg(long, default_value = "cwd")]
+        /// project(현재 디렉터리의 프로젝트), all, 또는 경로
+        #[arg(long, default_value = SCOPE_PROJECT)]
         scope: String,
         #[arg(long, value_enum, default_value = "iteration")]
         kind: KindArg,
@@ -52,13 +53,23 @@ enum Command {
         prompt_id: String,
         #[arg(long)]
         with_results: bool,
+        /// project 또는 경로. 없으면 현재 프로젝트를 먼저 찾고 나머지 프로젝트를 찾는다.
+        #[arg(long)]
+        scope: Option<String>,
     },
     /// 데몬을 포그라운드로 실행한다.
     Daemon,
     /// 데몬 상태
     Status,
-    /// 현재 설정의 임베더와 벡터 저장소로 전체를 다시 색인한다.
-    Reindex,
+    /// 현재 설정의 임베더와 벡터 저장소로 다시 색인한다.
+    Reindex {
+        /// all, project, 또는 경로
+        #[arg(long, default_value = SCOPE_ALL)]
+        scope: String,
+    },
+    /// 프로젝트 목록과 가져오기
+    #[command(subcommand)]
+    Project(ProjectCommand),
     /// settings.json에 넣을 hook 설정
     HooksConfig,
     /// launchd plist
@@ -68,6 +79,17 @@ enum Command {
     /// Claude Code 설정 파일에서 hippo hook을 제거한다.
     Uninstall(InstallArgs),
 }
+
+#[derive(Subcommand)]
+enum ProjectCommand {
+    /// 프로젝트 목록
+    List,
+    /// 원본 프로젝트(id 또는 이전 경로)의 기록을 현재 디렉터리의 프로젝트로 가져온다.
+    Adopt { source: String },
+}
+
+const SCOPE_PROJECT: &str = "project";
+const SCOPE_ALL: &str = "all";
 
 #[derive(clap::Args)]
 struct InstallArgs {
@@ -118,14 +140,11 @@ fn main() -> ExitCode {
             kind,
             limit,
         } => {
-            let cwd = match scope.as_str() {
-                "all" => None,
-                "cwd" => match std::env::current_dir() {
-                    Ok(dir) => Some(dir.to_string_lossy().into_owned()),
-                    Err(e) => return fail(&e.to_string()),
-                },
-                path => Some(path.to_string()),
+            let cwd = match current_dir() {
+                Ok(cwd) => cwd,
+                Err(e) => return fail(&e),
             };
+            let scope = scope_arg(&cwd, &scope);
             let kind = match kind {
                 KindArg::Iteration => SearchKind::Iteration,
                 KindArg::Result => SearchKind::Result,
@@ -133,27 +152,54 @@ fn main() -> ExitCode {
             };
             query_daemon(
                 &paths,
-                &Request::Search(SearchRequest {
+                &Request::Search {
                     query,
                     kind,
-                    cwd,
-                    exclude_session: None,
                     limit,
-                }),
+                    scope,
+                    cwd,
+                },
             )
         }
         Command::Show {
             prompt_id,
             with_results,
-        } => query_daemon(
-            &paths,
-            &Request::Show {
-                prompt_id,
-                with_results,
-            },
-        ),
+            scope,
+        } => match current_dir() {
+            Ok(cwd) => query_daemon(
+                &paths,
+                &Request::Show {
+                    prompt_id,
+                    with_results,
+                    scope: scope.map(|s| scope_arg(&cwd, &s)),
+                    cwd,
+                },
+            ),
+            Err(e) => fail(&e),
+        },
         Command::Status => query_daemon(&paths, &Request::Status),
-        Command::Reindex => query_daemon(&paths, &Request::Reindex),
+        Command::Reindex { scope } => match current_dir() {
+            Ok(cwd) => query_daemon(
+                &paths,
+                &Request::Reindex {
+                    scope: scope_arg(&cwd, &scope),
+                    cwd,
+                },
+            ),
+            Err(e) => fail(&e),
+        },
+        Command::Project(ProjectCommand::List) => query_daemon(&paths, &Request::ProjectList),
+        Command::Project(ProjectCommand::Adopt { source }) => match current_dir() {
+            Ok(cwd) => {
+                let source = if is_project_id(&source) {
+                    source
+                } else {
+                    absolute(&cwd, &source)
+                };
+                query_daemon(&paths, &Request::ProjectAdopt { source, cwd })
+            }
+            Err(e) => fail(&e),
+        },
         Command::Daemon => run_daemon(paths),
         Command::HooksConfig => match hook_settings(&paths) {
             Ok(hooks) => {
@@ -177,6 +223,25 @@ fn main() -> ExitCode {
             }
             Err(e) => fail(&e.to_string()),
         },
+    }
+}
+
+fn current_dir() -> Result<String, String> {
+    std::env::current_dir()
+        .map(|d| d.to_string_lossy().into_owned())
+        .map_err(|e| e.to_string())
+}
+
+/// 상대 경로는 클라이언트의 현재 디렉터리 기준으로 바꾼다. 데몬의 현재 디렉터리와 다르기 때문이다.
+fn absolute(cwd: &str, path: &str) -> String {
+    PathBuf::from(cwd).join(path).to_string_lossy().into_owned()
+}
+
+fn scope_arg(cwd: &str, scope: &str) -> QueryScope {
+    match scope {
+        SCOPE_PROJECT => QueryScope::Project,
+        SCOPE_ALL => QueryScope::All,
+        path => QueryScope::Path(absolute(cwd, path)),
     }
 }
 
@@ -265,7 +330,7 @@ fn run_daemon(paths: Paths) -> ExitCode {
         Ok(e) => e,
         Err(e) => return fail(&e.to_string()),
     };
-    let source = match vector_source(&config, &paths) {
+    let source = match vector_source(&config) {
         Ok(s) => s,
         Err(e) => return fail(&e.to_string()),
     };

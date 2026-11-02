@@ -535,3 +535,180 @@ fn existing_database_permissions_are_tightened() {
         0o600
     );
 }
+
+// ---- FR-STO-7, FR-DMN-6: 작업 등록 시각 ----
+
+#[test]
+fn pending_jobs_carry_enqueue_time_in_order() {
+    let mut store = RecordStore::open_in_memory().unwrap();
+    store
+        .apply(&batch(
+            "s",
+            vec![synthetic("s", "m1", "/w", "첫째", &[])],
+            vec![],
+        ))
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    store
+        .apply(&batch(
+            "s",
+            vec![synthetic("s", "m2", "/w", "둘째", &[])],
+            vec![],
+        ))
+        .unwrap();
+    let pending = store.pending_jobs().unwrap();
+    let ids: Vec<&str> = pending.iter().map(|p| p.job.ref_id.as_str()).collect();
+    assert_eq!(ids, ["s:m1", "s:m2"]);
+    assert!(pending[0].enqueued_at < pending[1].enqueued_at);
+    assert!(pending[0].enqueued_at > 1_700_000_000_000, "유닉스 밀리초");
+}
+
+// ---- FR-PRJ-9 (1): 병합 ----
+
+fn merge_pair(dir: &std::path::Path) -> (std::path::PathBuf, RecordStore) {
+    let src_path = dir.join("a.sqlite");
+    let mut src = RecordStore::open(&src_path).unwrap();
+    src.apply(&batch(
+        "sa",
+        vec![synthetic(
+            "sa",
+            "m1",
+            "/a",
+            "옮겨올 응답 validateToken",
+            &[("c1", "원본결과 본문"), ("c2", "공통 결과")],
+        )],
+        vec![],
+    ))
+    .unwrap();
+    let mut dst = RecordStore::open(&dir.join("b.sqlite")).unwrap();
+    dst.apply(&batch(
+        "sb",
+        vec![synthetic(
+            "sb",
+            "m9",
+            "/b",
+            "대상 응답",
+            &[("c9", "공통 결과")],
+        )],
+        vec![],
+    ))
+    .unwrap();
+    (src_path, dst)
+}
+
+#[test]
+fn merge_copies_records_fts_and_links_without_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src_path, mut dst) = merge_pair(dir.path());
+    let before = dst.counts().unwrap();
+    let report = dst.merge_from(&src_path, true).unwrap();
+    assert_eq!((report.iterations, report.results), (1, 1));
+    let after = dst.counts().unwrap();
+    assert_eq!(after.iterations, before.iterations + 1);
+    assert_eq!(
+        after.results,
+        before.results + 1,
+        "공통 결과는 중복 저장하지 않음"
+    );
+
+    let it = dst.iteration("sa:m1").unwrap().unwrap();
+    assert!(it.tool_calls.iter().all(|c| c.result_id.is_some()));
+    let hits = dst
+        .search_iterations_fts("validateToken", &FtsFilter::default(), 10)
+        .unwrap();
+    assert_eq!(ids(hits), ["sa:m1"]);
+    let hits = dst
+        .search_results_fts("원본결과", &FtsFilter::default(), 10)
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(
+        dst.session_state("sa").unwrap().is_some(),
+        "세션 해석기 상태도 옮김"
+    );
+
+    let again = dst.merge_from(&src_path, true).unwrap();
+    assert_eq!((again.iterations, again.results), (0, 0));
+    assert_eq!(dst.counts().unwrap(), after);
+    let hits = dst
+        .search_iterations_fts("validateToken", &FtsFilter::default(), 10)
+        .unwrap();
+    assert_eq!(hits.len(), 1, "FTS 행도 중복되지 않음");
+}
+
+#[test]
+fn merge_with_enqueue_registers_jobs_for_merged_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src_path, mut dst) = merge_pair(dir.path());
+    let own = dst.embed_jobs(100).unwrap();
+    dst.complete_embed_jobs(&own).unwrap();
+    {
+        let mut src = RecordStore::open(&src_path).unwrap();
+        let jobs = src.embed_jobs(100).unwrap();
+        src.complete_embed_jobs(&jobs).unwrap();
+    }
+    let report = dst.merge_from(&src_path, true).unwrap();
+    let mut jobs: Vec<String> = dst
+        .embed_jobs(100)
+        .unwrap()
+        .into_iter()
+        .map(|j| format!("{}:{}", j.kind.as_str(), j.ref_id))
+        .collect();
+    jobs.sort();
+    assert_eq!(report.jobs, 2);
+    assert_eq!(jobs.len(), 2);
+    assert!(jobs.contains(&"iteration:sa:m1".to_string()), "{jobs:?}");
+}
+
+#[test]
+fn merge_without_enqueue_copies_only_pending_source_jobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src_path, mut dst) = merge_pair(dir.path());
+    let own = dst.embed_jobs(100).unwrap();
+    dst.complete_embed_jobs(&own).unwrap();
+    {
+        let mut src = RecordStore::open(&src_path).unwrap();
+        let jobs: Vec<EmbedJob> = src
+            .embed_jobs(100)
+            .unwrap()
+            .into_iter()
+            .filter(|j| j.kind == RecordKind::Result)
+            .collect();
+        src.complete_embed_jobs(&jobs).unwrap();
+    }
+    let report = dst.merge_from(&src_path, false).unwrap();
+    let jobs = dst.embed_jobs(100).unwrap();
+    assert_eq!(report.jobs, 1);
+    assert_eq!(
+        jobs,
+        [EmbedJob {
+            kind: RecordKind::Iteration,
+            ref_id: "sa:m1".into()
+        }]
+    );
+}
+
+#[test]
+fn merge_copies_background_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_path = dir.path().join("a.sqlite");
+    let mut src = RecordStore::open(&src_path).unwrap();
+    src.apply(&batch_from_fixture("s5_bg_bash.jsonl")).unwrap();
+    let tool_use_ids: Vec<String> = src
+        .iteration_page(0, 100)
+        .unwrap()
+        .into_iter()
+        .filter_map(|(_, id)| src.iteration(&id).unwrap())
+        .flat_map(|it| it.tool_calls.into_iter().map(|c| c.id))
+        .collect();
+    let bg: Vec<_> = tool_use_ids
+        .iter()
+        .filter_map(|id| src.bg_task(id).unwrap())
+        .collect();
+    assert!(!bg.is_empty(), "fixture에 백그라운드 시작 호출이 있음");
+    drop(src);
+    let mut dst = RecordStore::open(&dir.path().join("b.sqlite")).unwrap();
+    dst.merge_from(&src_path, false).unwrap();
+    for task in bg {
+        assert_eq!(dst.bg_task(&task.tool_use_id).unwrap(), Some(task));
+    }
+}

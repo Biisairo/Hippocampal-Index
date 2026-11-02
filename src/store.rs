@@ -120,6 +120,21 @@ pub struct EmbedJob {
     pub ref_id: String,
 }
 
+/// 작업과 등록 시각(유닉스 밀리초). (FR-DMN-6)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingJob {
+    pub job: EmbedJob,
+    pub enqueued_at: i64,
+}
+
+/// 병합으로 새로 추가한 반복, 결과, 임베딩 작업 수. (FR-PRJ-9)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MergeReport {
+    pub iterations: usize,
+    pub results: usize,
+    pub jobs: usize,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct FtsFilter {
     pub cwd: Option<String>,
@@ -167,7 +182,9 @@ CREATE TABLE IF NOT EXISTS bg_completions (
     status TEXT NOT NULL, summary TEXT NOT NULL, result_id TEXT, ts TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS bg_completions_tool ON bg_completions(tool_use_id, seq);
-CREATE TABLE IF NOT EXISTS embed_jobs (kind TEXT NOT NULL, ref_id TEXT NOT NULL, PRIMARY KEY (kind, ref_id));
+CREATE TABLE IF NOT EXISTS embed_jobs (
+    kind TEXT NOT NULL, ref_id TEXT NOT NULL, enqueued_at INTEGER NOT NULL, PRIMARY KEY (kind, ref_id)
+);
 CREATE TABLE IF NOT EXISTS sessions (session_id TEXT PRIMARY KEY, transcript_path TEXT NOT NULL, state TEXT NOT NULL);
 CREATE VIRTUAL TABLE IF NOT EXISTS iterations_fts USING fts5(embed_text, content='iterations', tokenize='trigram');
 CREATE VIRTUAL TABLE IF NOT EXISTS results_fts USING fts5(text, content='results', tokenize='trigram');
@@ -331,7 +348,7 @@ impl RecordStore {
     pub fn embed_jobs(&self, limit: usize) -> Result<Vec<EmbedJob>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT kind, ref_id FROM embed_jobs ORDER BY rowid LIMIT ?1")?;
+            .prepare("SELECT kind, ref_id FROM embed_jobs ORDER BY enqueued_at, rowid LIMIT ?1")?;
         let rows = stmt.query_map([limit as i64], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?;
@@ -345,6 +362,43 @@ impl RecordStore {
                 })
             })
             .collect())
+    }
+
+    /// 모든 작업을 등록 순서대로 돌려준다. (FR-DMN-6)
+    pub fn pending_jobs(&self) -> Result<Vec<PendingJob>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, ref_id, enqueued_at FROM embed_jobs ORDER BY enqueued_at, rowid",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        let raw = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(raw
+            .into_iter()
+            .filter_map(|(kind, ref_id, enqueued_at)| {
+                Some(PendingJob {
+                    job: EmbedJob {
+                        kind: job_kind_from_str(&kind)?,
+                        ref_id,
+                    },
+                    enqueued_at,
+                })
+            })
+            .collect())
+    }
+
+    /// 다른 원본 저장소의 기록을 가져온다. 같은 키의 기존 행은 바꾸지 않는다.
+    /// `enqueue`면 새로 추가한 반복과 결과마다 임베딩 작업을 등록한다. 원본의 미완료 작업은 항상 옮긴다. (FR-PRJ-9)
+    pub fn merge_from(&mut self, source: &Path, enqueue: bool) -> Result<MergeReport> {
+        self.conn
+            .execute("ATTACH DATABASE ?1 AS src", [source.to_string_lossy()])?;
+        let merged = merge_attached(&mut self.conn, enqueue);
+        self.conn.execute("DETACH DATABASE src", [])?;
+        merged
     }
 
     pub fn complete_embed_jobs(&mut self, jobs: &[EmbedJob]) -> Result<()> {
@@ -730,10 +784,77 @@ fn insert_result(
 
 fn enqueue(tx: &Transaction, kind: RecordKind, ref_id: &str) -> Result<()> {
     tx.execute(
-        "INSERT OR IGNORE INTO embed_jobs (kind, ref_id) VALUES (?1, ?2)",
-        params![job_kind_str(kind), ref_id],
+        "INSERT OR IGNORE INTO embed_jobs (kind, ref_id, enqueued_at) VALUES (?1, ?2, ?3)",
+        params![job_kind_str(kind), ref_id, now_millis()],
     )?;
     Ok(())
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+const ITERATION_COLUMNS: &str = "id, session_id, prompt_id, message_id, iteration_index, cwd, ts, inputs, tool_calls, response_text, embed_text";
+const RESULT_COLUMNS: &str = "id, tool_name, text, first_seen_ts";
+
+/// `src`로 붙인 원본 저장소의 행을 한 트랜잭션으로 가져온다. FTS 행은 새로 추가한 행에만 만든다.
+fn merge_attached(conn: &mut Connection, enqueue: bool) -> Result<MergeReport> {
+    let tx = conn.transaction()?;
+    let now = now_millis();
+    let mut report = MergeReport::default();
+    for (table, fts, text, kind, columns) in [
+        (
+            "iterations",
+            "iterations_fts",
+            "embed_text",
+            RecordKind::Iteration,
+            ITERATION_COLUMNS,
+        ),
+        (
+            "results",
+            "results_fts",
+            "text",
+            RecordKind::Result,
+            RESULT_COLUMNS,
+        ),
+    ] {
+        tx.execute_batch(&format!(
+            "DROP TABLE IF EXISTS temp.merged;
+             CREATE TEMP TABLE merged (id TEXT PRIMARY KEY);
+             INSERT INTO temp.merged SELECT id FROM src.{table} WHERE id NOT IN (SELECT id FROM main.{table});
+             INSERT INTO main.{table} ({columns}) SELECT {columns} FROM src.{table} WHERE id IN (SELECT id FROM temp.merged);
+             INSERT INTO main.{fts} (rowid, {text}) SELECT rowid, {text} FROM main.{table} WHERE id IN (SELECT id FROM temp.merged);"
+        ))?;
+        let added: i64 = tx.query_row("SELECT COUNT(*) FROM temp.merged", [], |r| r.get(0))?;
+        let added = added.unsigned_abs() as usize;
+        match kind {
+            RecordKind::Iteration => report.iterations = added,
+            RecordKind::Result => report.results = added,
+        }
+        if enqueue {
+            report.jobs += tx.execute(
+                "INSERT OR IGNORE INTO main.embed_jobs (kind, ref_id, enqueued_at)
+                 SELECT ?1, id, ?2 FROM temp.merged",
+                params![job_kind_str(kind), now],
+            )?;
+        }
+        tx.execute_batch("DROP TABLE temp.merged;")?;
+    }
+    report.jobs += tx.execute(
+        "INSERT OR IGNORE INTO main.embed_jobs (kind, ref_id, enqueued_at)
+         SELECT kind, ref_id, enqueued_at FROM src.embed_jobs",
+        [],
+    )?;
+    tx.execute_batch(
+        "INSERT OR IGNORE INTO main.iteration_results SELECT iteration_id, tool_use_id, result_id FROM src.iteration_results;
+         INSERT OR IGNORE INTO main.bg_tasks SELECT tool_use_id, session_id, iteration_id, kind, task_id, status FROM src.bg_tasks;
+         INSERT OR IGNORE INTO main.bg_completions SELECT line_uuid, session_id, tool_use_id, seq, status, summary, result_id, ts FROM src.bg_completions;
+         INSERT OR IGNORE INTO main.sessions SELECT session_id, transcript_path, state FROM src.sessions;",
+    )?;
+    tx.commit()?;
+    Ok(report)
 }
 
 /// 3자 이상 토큰을 따옴표로 감싸 OR로 묶는다. (FR-STO-8)

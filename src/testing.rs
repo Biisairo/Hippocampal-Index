@@ -86,6 +86,10 @@ impl VectorStore for MemoryVectorStore {
         Ok(self.lock()?.info.clone())
     }
 
+    fn scan(&self) -> Result<Vec<VectorRecord>, VectorError> {
+        Ok(self.lock()?.records.values().cloned().collect())
+    }
+
     fn upsert(&self, records: &[VectorRecord]) -> Result<(), VectorError> {
         let mut state = self.lock()?;
         let Some(first) = records.first() else {

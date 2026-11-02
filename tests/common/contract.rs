@@ -135,6 +135,30 @@ pub fn vector_store_contract(make: &dyn Fn() -> Box<dyn VectorStore>) {
         ["a#0"]
     );
 
+    // 전체 읽기 (FR-SWP-2 scan)
+    let mut scanned: Vec<String> = s.scan().unwrap().iter().map(VectorRecord::id).collect();
+    scanned.sort();
+    assert_eq!(
+        scanned,
+        ["iteration:a#0", "iteration:b#0", "result:r#0", "result:r#1"]
+    );
+    let a = s
+        .scan()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.ref_id == "a")
+        .unwrap();
+    assert_eq!(a.vector, vec![0.0, 0.0, 1.0]);
+    assert_eq!(
+        (
+            a.cwd.as_deref(),
+            a.session_id.as_deref(),
+            a.embed_model.as_str()
+        ),
+        (Some("/p"), Some("s1"), "m1")
+    );
+    assert!(make().scan().unwrap().is_empty());
+
     // ref_id 단위 삭제
     s.delete(Result, "r").unwrap();
     assert_eq!(s.count().unwrap(), 2);

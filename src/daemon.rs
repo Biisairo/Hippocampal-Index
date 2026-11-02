@@ -1,11 +1,13 @@
-//! 상주 데몬. 수집 스레드, 임베딩 스레드, 연결 처리 스레드로 구성한다. (SRS 3.2.7)
+//! 상주 데몬. 쓰기 스레드, 임베딩 스레드, 연결 처리 스레드로 구성한다. (SRS 3.2.7, 3.2.10)
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -14,17 +16,23 @@ use crate::config::{Config, Paths};
 use crate::embedder::Embedder;
 use crate::fsutil::{ensure_private_dir, open_private_append, set_private_file};
 use crate::generations::{activate, active_dir, cleanup_inactive, new_generation};
-use crate::indexer::{ChunkConfig, Compatibility, compatibility, process_embed_jobs, reindex};
-use crate::ingest::{IngestOptions, IngestRequest, ingest};
-use crate::protocol::{COMPAT_MISMATCH, REINDEX_RUNNING, Request, Response, StatusInfo};
+use crate::indexer::{ChunkConfig, Compatibility, compatibility, process_jobs, reindex};
+use crate::ingest::{IngestOptions, IngestRequest, ingest, session_start_cwd};
+use crate::project::{Location, locate};
+use crate::protocol::{
+    COMPAT_MISMATCH, MISSING_LOCATION, ProjectStatus, REINDEX_RUNNING, Request, Response, Scope,
+    StatusInfo,
+};
 use crate::redact::Redactor;
+use crate::registry::{Registry, RegistryError};
 use crate::search::{
-    InjectConfig, SearchError, SearchRequest, VectorBackends, build_injection, render_hits,
-    render_turn, search,
+    InjectConfig, ProjectSearch, SearchError, SearchKind, SearchRequest, VectorBackends,
+    build_injection, escape_control, missing_turn, render_hits, render_project_hits, render_turn,
+    search, search_projects,
 };
 use crate::spool;
-use crate::store::RecordStore;
-use crate::vector::{VectorError, VectorStore};
+use crate::store::{EmbedJob, RecordStore};
+use crate::vector::VectorStore;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
@@ -35,15 +43,11 @@ pub enum DaemonError {
     #[error("invalid redact pattern {kind}: {message}")]
     Redact { kind: String, message: String },
     #[error(transparent)]
-    Store(#[from] crate::store::StoreError),
-    #[error(transparent)]
-    Index(#[from] crate::indexer::IndexError),
-    #[error(transparent)]
-    Vector(#[from] VectorError),
+    Registry(#[from] RegistryError),
 }
 
 const POLL: Duration = Duration::from_millis(20);
-const INGEST_POLL: Duration = Duration::from_millis(100);
+const WRITE_POLL: Duration = Duration::from_millis(100);
 const EMBED_IDLE: Duration = Duration::from_secs(1);
 const EMBED_RETRY: Duration = Duration::from_secs(5);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -51,29 +55,27 @@ const REINDEX_PAGE: usize = 256;
 const LOG_FILE: &str = "hippo.log";
 const REINDEX_IDLE: &str = "idle";
 const REINDEX_DONE: &str = "done";
+const NO_PROJECT: &str = "프로젝트 없음\n";
 
-type IngestJob = (IngestRequest, Sender<Response>);
+type Reply = Sender<Response>;
 
-struct Shared {
-    paths: Paths,
-    config: Config,
-    embedder: Arc<dyn Embedder>,
-    source: VectorSource,
-    vectors: RwLock<Arc<dyn VectorStore>>,
-    compat: Mutex<Compatibility>,
-    ingest_tx: Sender<IngestJob>,
-    notify_tx: Sender<()>,
-    reindexing: AtomicBool,
-    reindex_state: Mutex<String>,
-    last_activity: Mutex<Instant>,
-    stop: AtomicBool,
+/// 쓰기 스레드가 순서대로 처리하는 작업. (FR-DMN-6)
+enum WriteJob {
+    Ingest(IngestRequest, Reply),
+    Adopt {
+        source: String,
+        cwd: String,
+        reply: Reply,
+    },
 }
 
-impl Shared {
-    fn vectors(&self) -> Option<Arc<dyn VectorStore>> {
-        self.vectors.read().ok().map(|v| Arc::clone(&v))
-    }
+/// 프로젝트 하나의 벡터 저장소와 호환성 상태. (FR-DMN-9, FR-SWP-6)
+struct ProjectHandle {
+    vectors: Arc<dyn VectorStore>,
+    compat: Mutex<Compatibility>,
+}
 
+impl ProjectHandle {
     fn compat(&self) -> Compatibility {
         self.compat.lock().map_or(
             Compatibility::Mismatch {
@@ -84,26 +86,242 @@ impl Shared {
         )
     }
 
-    /// 호환되지 않으면 벡터 검색을 끄고 FTS 전용으로 동작한다. (FR-SWP-6)
-    fn backends<'a>(&'a self, vectors: &'a dyn VectorStore) -> Option<VectorBackends<'a>> {
-        match self.compat() {
-            Compatibility::Mismatch { .. } => None,
-            Compatibility::Empty | Compatibility::Compatible => Some(VectorBackends {
-                embedder: self.embedder.as_ref(),
-                vectors,
-            }),
-        }
+    fn is_mismatch(&self) -> bool {
+        matches!(self.compat(), Compatibility::Mismatch { .. })
     }
 
-    fn refresh_compat(&self) {
-        let Some(vectors) = self.vectors() else {
-            return;
-        };
-        if let Ok(c) = compatibility(self.embedder.as_ref(), vectors.as_ref())
+    /// 호환되지 않으면 벡터 검색을 끄고 FTS 전용으로 동작한다. (FR-SWP-6)
+    fn backends<'a>(&'a self, embedder: &'a dyn Embedder) -> Option<VectorBackends<'a>> {
+        (!self.is_mismatch()).then(|| VectorBackends {
+            embedder,
+            vectors: self.vectors.as_ref(),
+        })
+    }
+
+    fn refresh(&self, embedder: &dyn Embedder) {
+        if let Ok(c) = compatibility(embedder, self.vectors.as_ref())
             && let Ok(mut current) = self.compat.lock()
         {
             *current = c;
         }
+    }
+}
+
+/// 열어 둔 프로젝트. 뒤가 가장 최근에 쓴 것이다. (FR-DMN-9)
+struct OpenProjects {
+    cap: usize,
+    entries: VecDeque<(String, Arc<ProjectHandle>)>,
+}
+
+impl OpenProjects {
+    fn get(&mut self, id: &str) -> Option<Arc<ProjectHandle>> {
+        let pos = self.entries.iter().position(|(k, _)| k == id)?;
+        let entry = self.entries.remove(pos)?;
+        let handle = Arc::clone(&entry.1);
+        self.entries.push_back(entry);
+        Some(handle)
+    }
+
+    fn insert(&mut self, id: &str, handle: Arc<ProjectHandle>) {
+        self.remove(id);
+        self.entries.push_back((id.to_string(), handle));
+        while self.entries.len() > self.cap.max(1) {
+            self.entries.pop_front();
+        }
+    }
+
+    fn remove(&mut self, id: &str) {
+        self.entries.retain(|(k, _)| k != id);
+    }
+}
+
+/// 모든 프로젝트의 임베딩 작업을 도착 순서대로 담는 단일 FIFO. (FR-DMN-6)
+#[derive(Default)]
+struct EmbedQueue {
+    items: VecDeque<(String, EmbedJob)>,
+    queued: HashSet<(String, EmbedJob)>,
+}
+
+impl EmbedQueue {
+    fn push(&mut self, project: &str, job: EmbedJob) {
+        let item = (project.to_string(), job);
+        if self.queued.insert(item.clone()) {
+            self.items.push_back(item);
+        }
+    }
+
+    /// 앞에서부터 같은 프로젝트의 작업을 `limit`개까지.
+    fn front_batch(&self, limit: usize) -> Option<(String, Vec<EmbedJob>)> {
+        let project = self.items.front()?.0.clone();
+        let jobs = self
+            .items
+            .iter()
+            .take_while(|(p, _)| *p == project)
+            .take(limit.max(1))
+            .map(|(_, j)| j.clone())
+            .collect();
+        Some((project, jobs))
+    }
+
+    fn remove(&mut self, project: &str, jobs: &[EmbedJob]) {
+        self.items
+            .retain(|(p, j)| !(p == project && jobs.contains(j)));
+        for job in jobs {
+            self.queued.remove(&(project.to_string(), job.clone()));
+        }
+    }
+
+    fn remove_project(&mut self, project: &str) {
+        self.items.retain(|(p, _)| p != project);
+        self.queued.retain(|(p, _)| p != project);
+    }
+}
+
+struct Shared {
+    paths: Paths,
+    config: Config,
+    embedder: Arc<dyn Embedder>,
+    source: VectorSource,
+    registry: Mutex<Registry>,
+    open: Mutex<OpenProjects>,
+    queue: Mutex<EmbedQueue>,
+    /// 임베딩 처리와 프로젝트 병합을 서로 막는다. 병합이 지운 프로젝트를 임베딩 스레드가 다시 만들지 않게 한다.
+    embed_lock: Mutex<()>,
+    write_tx: Sender<WriteJob>,
+    notify_tx: Sender<()>,
+    reindexing: AtomicBool,
+    /// 재색인 중인 프로젝트. 이 프로젝트를 다시 열 때는 세대를 정리하지 않는다. (FR-SWP-9)
+    reindex_project: Mutex<Option<String>>,
+    reindex_state: Mutex<String>,
+    last_activity: Mutex<Instant>,
+    stop: AtomicBool,
+}
+
+fn lock<T>(m: &Mutex<T>) -> Result<MutexGuard<'_, T>, String> {
+    m.lock().map_err(|e| e.to_string())
+}
+
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+impl Shared {
+    fn locate(&self, path: &str) -> Location {
+        locate(
+            Path::new(path),
+            Duration::from_millis(self.config.project.git_timeout_ms),
+        )
+    }
+
+    /// 조회 전용 판정. (FR-PRJ-5)
+    fn lookup(&self, path: &str) -> Result<Option<String>, String> {
+        let loc = self.locate(path);
+        lock(&self.registry)?
+            .lookup(&loc)
+            .map_err(|e| e.to_string())
+    }
+
+    fn project_ids(&self) -> Result<Vec<String>, String> {
+        Ok(lock(&self.registry)?
+            .projects()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|p| p.id)
+            .collect())
+    }
+
+    /// 범위에 해당하는 프로젝트. `Project`/`Path`는 많아야 하나이다.
+    fn scope_projects(&self, scope: &Scope, cwd: &str) -> Result<Vec<String>, String> {
+        match scope {
+            Scope::All => self.project_ids(),
+            Scope::Project => Ok(self.lookup(cwd)?.into_iter().collect()),
+            Scope::Path(path) => Ok(self.lookup(path)?.into_iter().collect()),
+        }
+    }
+
+    fn records(&self, id: &str) -> Result<RecordStore, String> {
+        RecordStore::open(&self.paths.project_records(id)).map_err(|e| e.to_string())
+    }
+
+    /// 프로젝트의 벡터 저장소를 연다. 열어 둔 수가 상한을 넘으면 가장 오래 쓰지 않은 것을 닫는다. (FR-DMN-9)
+    fn project(&self, id: &str) -> Result<Arc<ProjectHandle>, String> {
+        let mut open = lock(&self.open)?;
+        if let Some(handle) = open.get(id) {
+            return Ok(handle);
+        }
+        let base = self.paths.project_vectors(id, &self.source.name);
+        let active = active_dir(&base).map_err(|e| e.to_string())?;
+        let reindexing = lock(&self.reindex_project)?.as_deref() == Some(id);
+        if !reindexing {
+            for dir in cleanup_inactive(&base).map_err(|e| e.to_string())? {
+                self.log(&format!(
+                    "removed inactive vector generation {}",
+                    dir.display()
+                ));
+            }
+        }
+        let vectors = (self.source.open)(&active).map_err(|e| e.to_string())?;
+        let compat =
+            compatibility(self.embedder.as_ref(), vectors.as_ref()).map_err(|e| e.to_string())?;
+        if let Compatibility::Mismatch { .. } = compat {
+            self.log(&format!(
+                "project {id}: vector store does not match the embedder, keyword search only until `hippo reindex`"
+            ));
+        }
+        let handle = Arc::new(ProjectHandle {
+            vectors,
+            compat: Mutex::new(compat),
+        });
+        open.insert(id, Arc::clone(&handle));
+        Ok(handle)
+    }
+
+    fn install(&self, id: &str, vectors: Arc<dyn VectorStore>) -> Result<(), String> {
+        let handle = Arc::new(ProjectHandle {
+            vectors,
+            compat: Mutex::new(Compatibility::Empty),
+        });
+        handle.refresh(self.embedder.as_ref());
+        lock(&self.open)?.insert(id, handle);
+        Ok(())
+    }
+
+    /// 프로젝트의 미완료 작업을 메모리 큐에 넣고 임베딩 스레드를 깨운다.
+    fn enqueue_pending(&self, id: &str, records: &RecordStore) {
+        match (records.pending_jobs(), self.queue.lock()) {
+            (Ok(jobs), Ok(mut queue)) => {
+                for p in jobs {
+                    queue.push(id, p.job);
+                }
+            }
+            (Err(e), _) => self.log(&format!("project {id}: reading embed jobs failed: {e}")),
+            (_, Err(e)) => self.log(&format!("embed queue unavailable: {e}")),
+        }
+        let _ = self.notify_tx.send(());
+    }
+
+    /// 시작할 때 모든 프로젝트의 작업을 등록 시각 순으로 큐에 채운다. (FR-DMN-6)
+    fn fill_queue(&self) -> Result<(), String> {
+        let mut all = Vec::new();
+        for id in self.project_ids()? {
+            match self
+                .records(&id)
+                .and_then(|r| r.pending_jobs().map_err(|e| e.to_string()))
+            {
+                Ok(jobs) => {
+                    all.extend(jobs.into_iter().map(|p| (p.enqueued_at, id.clone(), p.job)))
+                }
+                Err(e) => self.log(&format!("project {id}: reading embed jobs failed: {e}")),
+            }
+        }
+        all.sort_by_key(|(at, _, _)| *at);
+        let mut queue = lock(&self.queue)?;
+        for (_, id, job) in all {
+            queue.push(&id, job);
+        }
+        Ok(())
     }
 
     fn chunking(&self) -> ChunkConfig {
@@ -176,15 +394,20 @@ pub fn start(
     embedder: Arc<dyn Embedder>,
     source: VectorSource,
 ) -> Result<DaemonHandle, DaemonError> {
-    for dir in [paths.root.clone(), paths.spool(), paths.logs()] {
+    for dir in [
+        paths.root.clone(),
+        paths.spool(),
+        paths.logs(),
+        paths.projects(),
+    ] {
         ensure_private_dir(&dir)?;
     }
-    let lock = File::options()
+    let lock_file = File::options()
         .create(true)
         .truncate(false)
         .write(true)
         .open(paths.lock())?;
-    match lock.try_lock() {
+    match lock_file.try_lock() {
         Ok(()) => {}
         Err(fs::TryLockError::WouldBlock) => return Err(DaemonError::AlreadyRunning),
         Err(fs::TryLockError::Error(e)) => return Err(e.into()),
@@ -193,9 +416,7 @@ pub fn start(
         kind: e.kind,
         message: e.message,
     })?;
-    let active = active_dir(&source.base)?;
-    let removed = cleanup_inactive(&source.base)?;
-    let vectors = (source.open)(&active)?;
+    let registry = Registry::open(&paths.registry())?;
     let socket = paths.socket();
     if fs::symlink_metadata(&socket).is_ok() {
         fs::remove_file(&socket)?;
@@ -204,67 +425,59 @@ pub fn start(
     set_private_file(&socket)?;
     listener.set_nonblocking(true)?;
 
-    let compat = compatibility(embedder.as_ref(), vectors.as_ref())?;
-    let (ingest_tx, ingest_rx) = mpsc::channel();
+    let (write_tx, write_rx) = mpsc::channel();
     let (notify_tx, notify_rx) = mpsc::channel();
+    let cap = config.daemon.max_open_projects;
     let shared = Arc::new(Shared {
         paths,
         config,
         embedder,
         source,
-        vectors: RwLock::new(vectors),
-        compat: Mutex::new(compat),
-        ingest_tx,
+        registry: Mutex::new(registry),
+        open: Mutex::new(OpenProjects {
+            cap,
+            entries: VecDeque::new(),
+        }),
+        queue: Mutex::new(EmbedQueue::default()),
+        embed_lock: Mutex::new(()),
+        write_tx,
         notify_tx,
         reindexing: AtomicBool::new(false),
+        reindex_project: Mutex::new(None),
         reindex_state: Mutex::new(REINDEX_IDLE.to_string()),
         last_activity: Mutex::new(Instant::now()),
         stop: AtomicBool::new(false),
     });
-    for dir in removed {
-        shared.log(&format!(
-            "removed inactive vector generation {}",
-            dir.display()
-        ));
+    if let Err(e) = shared.fill_queue() {
+        shared.log(&format!("filling embed queue failed: {e}"));
     }
-    let ingest_store = RecordStore::open(&shared.paths.records())?;
-    let embed_store = RecordStore::open(&shared.paths.records())?;
 
     let threads = vec![
-        spawn_ingest(Arc::clone(&shared), ingest_store, redactor, ingest_rx),
-        spawn_embed(Arc::clone(&shared), embed_store, notify_rx),
+        spawn_writer(Arc::clone(&shared), redactor, write_rx),
+        spawn_embed(Arc::clone(&shared), notify_rx),
         spawn_accept(Arc::clone(&shared), listener),
     ];
     Ok(DaemonHandle {
         shared,
         threads,
-        _lock: lock,
+        _lock: lock_file,
     })
 }
 
-/// 수집은 이 스레드 하나가 요청 순서대로 처리한다. 시작할 때 스풀을 먼저 비운다. (FR-DMN-6, FR-CAP-6)
-fn spawn_ingest(
-    shared: Arc<Shared>,
-    mut store: RecordStore,
-    redactor: Redactor,
-    rx: Receiver<IngestJob>,
-) -> JoinHandle<()> {
+/// 수집과 프로젝트 가져오기는 이 스레드 하나가 요청 순서대로 처리한다. 시작할 때 스풀을 먼저 비운다. (FR-DMN-6, FR-CAP-6)
+fn spawn_writer(shared: Arc<Shared>, redactor: Redactor, rx: Receiver<WriteJob>) -> JoinHandle<()> {
     thread::spawn(move || {
         let options = IngestOptions {
             max_tool_input_chars: shared.config.embed_text.max_tool_input_chars,
         };
-        let mut run = |req: &IngestRequest| -> Response {
-            let resp = match ingest(&mut store, &redactor, options, req) {
-                Ok(_) => Response::Done,
-                Err(e) => {
-                    shared.log(&format!("ingest {} failed: {e}", req.session_id));
-                    Response::Error {
-                        message: e.to_string(),
-                    }
+        let run = |req: &IngestRequest| -> Response {
+            match ingest_session(&shared, &redactor, options, req) {
+                Ok(()) => Response::Done,
+                Err(message) => {
+                    shared.log(&format!("ingest {} failed: {message}", req.session_id));
+                    Response::Error { message }
                 }
-            };
-            let _ = shared.notify_tx.send(());
-            resp
+            }
         };
         match spool::take_all(&shared.paths.spool()) {
             Ok(files) => {
@@ -280,9 +493,16 @@ fn spawn_ingest(
             Err(e) => shared.log(&format!("spool read failed: {e}")),
         }
         while !shared.stop.load(Ordering::SeqCst) {
-            match rx.recv_timeout(INGEST_POLL) {
-                Ok((req, reply)) => {
+            match rx.recv_timeout(WRITE_POLL) {
+                Ok(WriteJob::Ingest(req, reply)) => {
                     let _ = reply.send(run(&req));
+                }
+                Ok(WriteJob::Adopt { source, cwd, reply }) => {
+                    let resp = adopt(&shared, &source, &cwd).unwrap_or_else(|message| {
+                        shared.log(&format!("adopt {source} failed: {message}"));
+                        Response::Error { message }
+                    });
+                    let _ = reply.send(resp);
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -291,57 +511,163 @@ fn spawn_ingest(
     })
 }
 
-/// 임베딩 작업 스레드. 수집이 끝날 때마다 깨어나고, 실패하면 일정 시간 뒤 재시도한다.
-/// 호환되지 않거나 재색인 중이면 작업을 처리하지 않는다. (FR-STO-7, FR-DMN-6, FR-SWP-5)
-fn spawn_embed(
-    shared: Arc<Shared>,
-    mut store: RecordStore,
-    notify: Receiver<()>,
-) -> JoinHandle<()> {
+/// 세션이 고정된 프로젝트. 고정값이 없으면 세션 시작 경로로 정해 기록한다.
+/// 시작 경로를 아직 알 수 없으면 `None`. (FR-PRJ-1, FR-PRJ-4)
+fn session_project(shared: &Shared, req: &IngestRequest) -> Result<Option<String>, String> {
+    if let Some(id) = lock(&shared.registry)?
+        .session_project(&req.session_id)
+        .map_err(|e| e.to_string())?
+    {
+        return Ok(Some(id));
+    }
+    let bytes = fs::read(&req.transcript_path).map_err(|e| {
+        format!(
+            "transcript read failed ({}): {e}",
+            req.transcript_path.display()
+        )
+    })?;
+    let Some(cwd) = session_start_cwd(&bytes) else {
+        return Ok(None);
+    };
+    let loc = shared.locate(&cwd);
+    let mut registry = lock(&shared.registry)?;
+    let id = registry
+        .resolve(&loc, now_secs())
+        .map_err(|e| e.to_string())?;
+    registry
+        .bind_session(&req.session_id, &id)
+        .map_err(|e| e.to_string())?;
+    Ok(Some(id))
+}
+
+fn ingest_session(
+    shared: &Shared,
+    redactor: &Redactor,
+    options: IngestOptions,
+    req: &IngestRequest,
+) -> Result<(), String> {
+    let Some(id) = session_project(shared, req)? else {
+        return Ok(());
+    };
+    let mut records = shared.records(&id)?;
+    ingest(&mut records, redactor, options, req).map_err(|e| e.to_string())?;
+    lock(&shared.registry)?
+        .touch(&id, now_secs())
+        .map_err(|e| e.to_string())?;
+    shared.enqueue_pending(&id, &records);
+    Ok(())
+}
+
+/// 원본 프로젝트의 기록을 현재 디렉터리의 프로젝트로 가져온다. 이전 위치는 남기지 않는다. (FR-PRJ-7)
+fn adopt(shared: &Shared, source: &str, cwd: &str) -> Result<Response, String> {
+    let source_id = lock(&shared.registry)?
+        .find_source(source)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("원본 프로젝트를 찾을 수 없습니다: {source}"))?;
+    if shared.reindexing.load(Ordering::SeqCst) {
+        return Err("재색인 중에는 프로젝트를 가져올 수 없습니다".into());
+    }
+    let loc = shared.locate(cwd);
+    let target = lock(&shared.registry)?
+        .lookup(&loc)
+        .map_err(|e| e.to_string())?;
+    let text = match target {
+        None => {
+            lock(&shared.registry)?
+                .relocate(&source_id, &loc)
+                .map_err(|e| e.to_string())?;
+            format!(
+                "프로젝트 {source_id}의 위치를 {}(으)로 바꿨습니다.\n",
+                loc.path
+            )
+        }
+        Some(target) if target == source_id => "변경 없음\n".to_string(),
+        Some(target) => merge(shared, &source_id, &target)?,
+    };
+    Ok(Response::Text { text })
+}
+
+/// 원본의 기록을 대상으로 병합하고 원본을 지운다. (FR-PRJ-9)
+fn merge(shared: &Shared, source: &str, target: &str) -> Result<String, String> {
+    let _embedding = lock(&shared.embed_lock)?;
+    let src = shared.project(source)?;
+    let dst = shared.project(target)?;
+    shared.records(source)?;
+    let copy = !src.is_mismatch() && !dst.is_mismatch();
+    let mut records = shared.records(target)?;
+    let report = records
+        .merge_from(&shared.paths.project_records(source), !copy)
+        .map_err(|e| e.to_string())?;
+    let copied = if copy {
+        let vectors = src.vectors.scan().map_err(|e| e.to_string())?;
+        dst.vectors.upsert(&vectors).map_err(|e| e.to_string())?;
+        dst.refresh(shared.embedder.as_ref());
+        vectors.len()
+    } else {
+        0
+    };
+    lock(&shared.registry)?
+        .absorb(source, target)
+        .map_err(|e| e.to_string())?;
+    lock(&shared.queue)?.remove_project(source);
+    lock(&shared.open)?.remove(source);
+    drop(src);
+    fs::remove_dir_all(shared.paths.project_dir(source)).map_err(|e| e.to_string())?;
+    shared.enqueue_pending(target, &records);
+    let vectors = if copy {
+        format!("벡터 {copied}개를 복사했습니다.")
+    } else {
+        format!("모델이 달라 임베딩 작업 {}개를 등록했습니다.", report.jobs)
+    };
+    Ok(format!(
+        "프로젝트 {source}의 기록을 {target}(으)로 가져왔습니다. 반복 {}개, 결과 {}개. {vectors}\n",
+        report.iterations, report.results
+    ))
+}
+
+enum EmbedFailure {
+    Incompatible,
+    Failed(String),
+}
+
+/// 임베딩 스레드. 메모리 큐 앞에서부터 같은 프로젝트의 작업을 묶어 처리한다.
+/// 재색인 중이면 처리하지 않는다. (FR-STO-7, FR-DMN-6, FR-SWP-5)
+fn spawn_embed(shared: Arc<Shared>, notify: Receiver<()>) -> JoinHandle<()> {
     thread::spawn(move || {
-        let chunking = shared.chunking();
         let batch = shared.config.index.job_batch;
-        let threshold = shared.config.index.vector_index_threshold;
-        let mut next_index_at = threshold;
+        let mut next_index_at: HashMap<String, u64> = HashMap::new();
         while !shared.stop.load(Ordering::SeqCst) {
             let mut wait = EMBED_IDLE;
-            let paused = shared.reindexing.load(Ordering::SeqCst)
-                || matches!(shared.compat(), Compatibility::Mismatch { .. });
-            if let (false, Some(vectors)) = (paused, shared.vectors()) {
-                loop {
-                    if shared.stop.load(Ordering::SeqCst)
-                        || shared.reindexing.load(Ordering::SeqCst)
-                    {
-                        break;
-                    }
-                    match process_embed_jobs(
-                        &mut store,
-                        shared.embedder.as_ref(),
-                        vectors.as_ref(),
-                        chunking,
-                        batch,
-                    ) {
-                        Ok(0) => break,
-                        Ok(_) => shared.refresh_compat(),
-                        Err(e) => {
-                            shared.log(&format!("embedding failed: {e}"));
-                            wait = EMBED_RETRY;
-                            break;
+            loop {
+                if shared.stop.load(Ordering::SeqCst) || shared.reindexing.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Some((project, jobs)) =
+                    shared.queue.lock().ok().and_then(|q| q.front_batch(batch))
+                else {
+                    break;
+                };
+                match embed_batch(&shared, &project, &jobs, &mut next_index_at) {
+                    Ok(()) => {
+                        if let Ok(mut q) = shared.queue.lock() {
+                            q.remove(&project, &jobs);
                         }
                     }
-                }
-                if let Ok(count) = vectors.count()
-                    && count >= next_index_at
-                {
-                    match vectors.ensure_index() {
-                        Ok(()) => next_index_at = count.saturating_mul(2),
-                        Err(e) => shared.log(&format!("vector index failed: {e}")),
+                    Err(EmbedFailure::Incompatible) => {
+                        if let Ok(mut q) = shared.queue.lock() {
+                            q.remove_project(&project);
+                        }
+                    }
+                    Err(EmbedFailure::Failed(message)) => {
+                        shared.log(&format!("embedding failed: {message}"));
+                        wait = EMBED_RETRY;
+                        break;
                     }
                 }
             }
             let deadline = Instant::now() + wait;
             while Instant::now() < deadline && !shared.stop.load(Ordering::SeqCst) {
-                match notify.recv_timeout(INGEST_POLL) {
+                match notify.recv_timeout(WRITE_POLL) {
                     Ok(()) => break,
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => return,
@@ -352,8 +678,54 @@ fn spawn_embed(
     })
 }
 
-/// 새 세대에 전체를 다시 색인하고 ACTIVE를 바꿔 전환한다. (FR-SWP-5)
-fn start_reindex(shared: &Arc<Shared>) -> Response {
+fn embed_batch(
+    shared: &Shared,
+    project: &str,
+    jobs: &[EmbedJob],
+    next_index_at: &mut HashMap<String, u64>,
+) -> Result<(), EmbedFailure> {
+    let failed = EmbedFailure::Failed;
+    let _embedding = lock(&shared.embed_lock).map_err(failed)?;
+    let handle = shared.project(project).map_err(failed)?;
+    if handle.is_mismatch() {
+        return Err(EmbedFailure::Incompatible);
+    }
+    let mut records = shared.records(project).map_err(failed)?;
+    process_jobs(
+        &mut records,
+        shared.embedder.as_ref(),
+        handle.vectors.as_ref(),
+        shared.chunking(),
+        jobs,
+    )
+    .map_err(|e| failed(e.to_string()))?;
+    handle.refresh(shared.embedder.as_ref());
+    let threshold = shared.config.index.vector_index_threshold;
+    let next = next_index_at
+        .entry(project.to_string())
+        .or_insert(threshold);
+    if let Ok(count) = handle.vectors.count()
+        && count >= *next
+    {
+        match handle.vectors.ensure_index() {
+            Ok(()) => *next = count.saturating_mul(2),
+            Err(e) => shared.log(&format!("project {project}: vector index failed: {e}")),
+        }
+    }
+    Ok(())
+}
+
+/// 범위의 프로젝트마다 새 세대에 전체를 다시 색인하고 ACTIVE를 바꿔 전환한다. (FR-SWP-5)
+fn start_reindex(shared: &Arc<Shared>, scope: &Scope, cwd: &str) -> Response {
+    let targets = match shared.scope_projects(scope, cwd) {
+        Ok(t) if t.is_empty() => {
+            return Response::Error {
+                message: NO_PROJECT.trim_end().into(),
+            };
+        }
+        Ok(t) => t,
+        Err(message) => return Response::Error { message },
+    };
     if shared.reindexing.swap(true, Ordering::SeqCst) {
         return Response::Error {
             message: "reindex already running".into(),
@@ -362,39 +734,51 @@ fn start_reindex(shared: &Arc<Shared>) -> Response {
     shared.set_reindex_state(REINDEX_RUNNING);
     let shared = Arc::clone(shared);
     thread::spawn(move || {
-        let outcome = (|| -> Result<Arc<dyn VectorStore>, String> {
-            let generation = new_generation(&shared.source.base).map_err(|e| e.to_string())?;
-            let target = (shared.source.open)(&generation).map_err(|e| e.to_string())?;
-            let records = RecordStore::open(&shared.paths.records()).map_err(|e| e.to_string())?;
-            reindex(
-                &records,
-                shared.embedder.as_ref(),
-                target.as_ref(),
-                shared.chunking(),
-                REINDEX_PAGE,
-            )
-            .map_err(|e| e.to_string())?;
-            activate(&shared.source.base, &generation).map_err(|e| e.to_string())?;
-            Ok(target)
-        })();
-        match outcome {
-            Ok(target) => {
-                if let Ok(mut current) = shared.vectors.write() {
-                    *current = target;
-                }
-                shared.refresh_compat();
-                shared.set_reindex_state(REINDEX_DONE);
-                shared.log("reindex done");
+        let mut failures = Vec::new();
+        for id in &targets {
+            if let Ok(mut current) = shared.reindex_project.lock() {
+                *current = Some(id.clone());
             }
-            Err(message) => {
-                shared.log(&format!("reindex failed: {message}"));
-                shared.set_reindex_state(&format!("failed: {message}"));
+            if let Err(message) = reindex_project(&shared, id) {
+                shared.log(&format!("reindex {id} failed: {message}"));
+                failures.push(format!("{id}: {message}"));
             }
         }
+        if let Ok(mut current) = shared.reindex_project.lock() {
+            *current = None;
+        }
+        if failures.is_empty() {
+            shared.set_reindex_state(REINDEX_DONE);
+            shared.log("reindex done");
+        } else {
+            shared.set_reindex_state(&format!("failed: {}", failures.join("; ")));
+        }
         shared.reindexing.store(false, Ordering::SeqCst);
-        let _ = shared.notify_tx.send(());
+        for id in &targets {
+            match shared.records(id) {
+                Ok(records) => shared.enqueue_pending(id, &records),
+                Err(e) => shared.log(&format!("project {id}: {e}")),
+            }
+        }
     });
     Response::Done
+}
+
+fn reindex_project(shared: &Shared, id: &str) -> Result<(), String> {
+    let base = shared.paths.project_vectors(id, &shared.source.name);
+    let generation = new_generation(&base).map_err(|e| e.to_string())?;
+    let target = (shared.source.open)(&generation).map_err(|e| e.to_string())?;
+    let records = shared.records(id)?;
+    reindex(
+        &records,
+        shared.embedder.as_ref(),
+        target.as_ref(),
+        shared.chunking(),
+        REINDEX_PAGE,
+    )
+    .map_err(|e| e.to_string())?;
+    activate(&base, &generation).map_err(|e| e.to_string())?;
+    shared.install(id, target)
 }
 
 fn spawn_accept(shared: Arc<Shared>, listener: UnixListener) -> JoinHandle<()> {
@@ -451,81 +835,146 @@ fn handle_connection(shared: &Arc<Shared>, stream: UnixStream) {
     shared.touch();
 }
 
-fn handle_request(shared: &Arc<Shared>, req: Request) -> Response {
-    match req {
-        Request::Ingest(ingest_req) => {
-            let (tx, rx) = mpsc::channel();
-            if shared.ingest_tx.send((ingest_req, tx)).is_err() {
-                return Response::Error {
-                    message: "ingest worker stopped".into(),
-                };
-            }
-            return rx
-                .recv_timeout(CONNECTION_TIMEOUT)
-                .unwrap_or_else(|_| Response::Error {
-                    message: "ingest timed out".into(),
-                });
-        }
-        Request::Reindex => return start_reindex(shared),
-        Request::Inject { .. } | Request::Search(_) | Request::Show { .. } | Request::Status => {}
+/// 쓰기 스레드에 작업을 넘기고 응답을 기다린다.
+fn send_write(shared: &Shared, make: impl FnOnce(Reply) -> WriteJob, what: &str) -> Response {
+    let (tx, rx) = mpsc::channel();
+    if shared.write_tx.send(make(tx)).is_err() {
+        return Response::Error {
+            message: "write worker stopped".into(),
+        };
     }
-    let (records, vectors) = match (RecordStore::open(&shared.paths.records()), shared.vectors()) {
-        (Ok(r), Some(v)) => (r, v),
-        (Err(e), _) => {
-            return Response::Error {
-                message: e.to_string(),
-            };
-        }
-        (_, None) => {
-            return Response::Error {
-                message: "vector store unavailable".into(),
-            };
-        }
-    };
-    let backends = shared.backends(vectors.as_ref());
+    rx.recv_timeout(CONNECTION_TIMEOUT)
+        .unwrap_or_else(|_| Response::Error {
+            message: format!("{what} timed out"),
+        })
+}
+
+fn handle_request(shared: &Arc<Shared>, req: Request) -> Response {
     let result: Result<Response, String> = match req {
+        Request::Ingest(ingest_req) => {
+            return send_write(shared, |tx| WriteJob::Ingest(ingest_req, tx), "ingest");
+        }
+        Request::ProjectAdopt { source, cwd } => {
+            return send_write(
+                shared,
+                |reply| WriteJob::Adopt { source, cwd, reply },
+                "adopt",
+            );
+        }
+        Request::Reindex { scope, cwd } => return start_reindex(shared, &scope, &cwd),
         Request::Inject {
             prompt,
             cwd,
             session_id,
-        } => {
-            let c = &shared.config.inject;
-            let config = InjectConfig {
-                threshold: c.threshold,
-                top_k: c.top_k,
-                per_item_chars: c.per_item_chars,
-                total_chars: c.total_chars,
-            };
-            let deadline = Instant::now() + Duration::from_millis(c.budget_ms);
-            build_injection(
-                &records,
-                backends,
-                &prompt,
-                &cwd,
-                &session_id,
-                config,
-                deadline,
-            )
-            .map(|context| Response::Inject { context })
-            .map_err(|e| e.to_string())
-        }
-        Request::Search(search_req) => {
-            search_with_fallback(shared, &records, backends, &search_req)
-                .map(|text| Response::Text { text })
-        }
+        } => inject(shared, &prompt, &cwd, &session_id).map(|context| Response::Inject { context }),
+        Request::Search {
+            query,
+            kind,
+            limit,
+            scope,
+            cwd,
+        } => search_scope(shared, query, kind, limit, &scope, &cwd)
+            .map(|text| Response::Text { text }),
         Request::Show {
             prompt_id,
             with_results,
-        } => render_turn(&records, &prompt_id, with_results)
-            .map(|text| Response::Text { text })
-            .map_err(|e| e.to_string()),
-        Request::Status => status(shared, &records, vectors.as_ref()).map(Response::Status),
-        Request::Ingest(_) | Request::Reindex => Ok(Response::Done),
+            scope,
+            cwd,
+        } => show(shared, &prompt_id, with_results, scope.as_ref(), &cwd)
+            .map(|text| Response::Text { text }),
+        Request::Status => status(shared).map(Response::Status),
+        Request::ProjectList => project_list(shared).map(|text| Response::Text { text }),
     };
     result.unwrap_or_else(|message| {
         shared.log(&format!("request failed: {message}"));
         Response::Error { message }
     })
+}
+
+/// 현재 세션의 프로젝트에서만 찾는다. 프로젝트가 없으면 주입하지 않는다. (FR-RET-1)
+fn inject(
+    shared: &Shared,
+    prompt: &str,
+    cwd: &str,
+    session_id: &str,
+) -> Result<Option<String>, String> {
+    let bound = lock(&shared.registry)?
+        .session_project(session_id)
+        .map_err(|e| e.to_string())?;
+    let Some(id) = bound.map_or_else(|| shared.lookup(cwd), |id| Ok(Some(id)))? else {
+        return Ok(None);
+    };
+    let handle = shared.project(&id)?;
+    let records = shared.records(&id)?;
+    let c = &shared.config.inject;
+    let config = InjectConfig {
+        threshold: c.threshold,
+        top_k: c.top_k,
+        per_item_chars: c.per_item_chars,
+        total_chars: c.total_chars,
+    };
+    let deadline = Instant::now() + Duration::from_millis(c.budget_ms);
+    build_injection(
+        &records,
+        handle.backends(shared.embedder.as_ref()),
+        prompt,
+        session_id,
+        config,
+        deadline,
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn search_scope(
+    shared: &Shared,
+    query: String,
+    kind: SearchKind,
+    limit: usize,
+    scope: &Scope,
+    cwd: &str,
+) -> Result<String, String> {
+    let req = SearchRequest {
+        query,
+        kind,
+        cwd: None,
+        exclude_session: None,
+        limit,
+    };
+    let ids = shared.scope_projects(scope, cwd)?;
+    if *scope != Scope::All {
+        let Some(id) = ids.first() else {
+            return Ok(NO_PROJECT.to_string());
+        };
+        let handle = shared.project(id)?;
+        let records = shared.records(id)?;
+        return search_with_fallback(
+            shared,
+            &records,
+            handle.backends(shared.embedder.as_ref()),
+            &req,
+        );
+    }
+    let mut opened = Vec::new();
+    for id in ids {
+        let handle = shared.project(&id)?;
+        let records = shared.records(&id)?;
+        opened.push((id, records, handle));
+    }
+    let projects: Vec<ProjectSearch> = opened
+        .iter()
+        .map(|(id, records, handle)| ProjectSearch {
+            id,
+            records,
+            backends: handle.backends(shared.embedder.as_ref()),
+        })
+        .collect();
+    let result = search_projects(&projects, &req).map_err(|e| e.to_string())?;
+    for (id, reason) in &result.fallbacks {
+        shared.log(&format!(
+            "project {id}: vector search failed, falling back to keyword search: {reason}"
+        ));
+    }
+    render_project_hits(&projects, &result).map_err(|e| e.to_string())
 }
 
 /// 임베딩이나 벡터 검색이 실패하면 FTS 결과만으로 응답하고 첫 줄에 안내한다. (FR-RET-8)
@@ -551,28 +1000,104 @@ fn search_with_fallback(
     }
 }
 
-fn status(
+/// `scope`가 없으면 현재 프로젝트를 먼저, 그다음 나머지를 최근 활동 순으로 찾는다. (FR-RET-7)
+fn show(
     shared: &Shared,
-    records: &RecordStore,
-    vectors: &dyn VectorStore,
-) -> Result<StatusInfo, String> {
-    let counts = records.counts().map_err(|e| e.to_string())?;
-    let compatibility = match shared.compat() {
-        Compatibility::Empty => "empty",
-        Compatibility::Compatible => "compatible",
-        Compatibility::Mismatch { .. } => COMPAT_MISMATCH,
+    prompt_id: &str,
+    with_results: bool,
+    scope: Option<&Scope>,
+    cwd: &str,
+) -> Result<String, String> {
+    let candidates = match scope {
+        Some(scope @ (Scope::Project | Scope::Path(_))) => shared.scope_projects(scope, cwd)?,
+        None | Some(Scope::All) => {
+            let mut ids: Vec<String> = shared.lookup(cwd)?.into_iter().collect();
+            for id in shared.project_ids()? {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+            ids
+        }
     };
+    for id in candidates {
+        let records = shared.records(&id)?;
+        let found = !records
+            .iterations_for_prompt(prompt_id)
+            .map_err(|e| e.to_string())?
+            .is_empty();
+        if found {
+            return render_turn(&records, prompt_id, with_results).map_err(|e| e.to_string());
+        }
+    }
+    Ok(missing_turn(prompt_id))
+}
+
+fn status(shared: &Shared) -> Result<StatusInfo, String> {
+    let rows = lock(&shared.registry)?
+        .projects()
+        .map_err(|e| e.to_string())?;
+    let mut projects = Vec::new();
+    for row in rows {
+        let handle = shared.project(&row.id)?;
+        let counts = shared
+            .records(&row.id)?
+            .counts()
+            .map_err(|e| e.to_string())?;
+        let compatibility = match handle.compat() {
+            Compatibility::Empty => "empty",
+            Compatibility::Compatible => "compatible",
+            Compatibility::Mismatch { .. } => COMPAT_MISMATCH,
+        };
+        projects.push(ProjectStatus {
+            exists: Path::new(&row.location).exists(),
+            id: row.id,
+            location: row.location,
+            iterations: counts.iterations,
+            results: counts.results,
+            embed_jobs: counts.embed_jobs,
+            vectors: handle.vectors.count().map_err(|e| e.to_string())?,
+            compatibility: compatibility.to_string(),
+        });
+    }
     Ok(StatusInfo {
-        iterations: counts.iterations,
-        results: counts.results,
-        embed_jobs: counts.embed_jobs,
         spool_pending: spool::pending_count(&shared.paths.spool()),
-        vectors: vectors.count().map_err(|e| e.to_string())?,
         embed_model: shared.embedder.model_id().to_string(),
-        compatibility: compatibility.to_string(),
         reindex: shared
             .reindex_state
             .lock()
             .map_or_else(|_| REINDEX_IDLE.to_string(), |s| s.clone()),
+        projects,
     })
+}
+
+/// `hippo project list` 출력. (FR-PRJ-6)
+fn project_list(shared: &Shared) -> Result<String, String> {
+    let rows = lock(&shared.registry)?
+        .projects()
+        .map_err(|e| e.to_string())?;
+    if rows.is_empty() {
+        return Ok(NO_PROJECT.to_string());
+    }
+    let mut out = String::new();
+    for row in rows {
+        let iterations = shared
+            .records(&row.id)?
+            .counts()
+            .map_err(|e| e.to_string())?
+            .iterations;
+        let missing = if Path::new(&row.location).exists() {
+            ""
+        } else {
+            MISSING_LOCATION
+        };
+        out.push_str(&format!(
+            "{}  {}  {}{missing}  iterations={iterations}  last_active={}\n",
+            row.id,
+            row.kind.as_str(),
+            row.location,
+            row.last_active_at
+        ));
+    }
+    Ok(escape_control(&out))
 }

@@ -77,6 +77,15 @@ pub struct DaemonSection {
     pub autostart: bool,
     /// 마지막 요청 후 이 시간(초) 동안 요청이 없으면 종료한다. 0이면 종료하지 않는다. (FR-DMN-8)
     pub idle_timeout_secs: u64,
+    /// 열어 둘 프로젝트 저장소 수. (FR-DMN-9)
+    pub max_open_projects: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProjectSection {
+    /// git 실행 시간 제한(밀리초). 넘으면 git이 아닌 경로로 본다. (A-5)
+    pub git_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -103,6 +112,7 @@ pub struct Config {
     pub index: IndexConfig,
     pub redact: RedactConfig,
     pub daemon: DaemonSection,
+    pub project: ProjectSection,
 }
 
 impl Config {
@@ -151,11 +161,20 @@ impl Paths {
         Ok(PathBuf::from(home).join(DATA_DIR))
     }
 
-    pub fn records(&self) -> PathBuf {
-        self.root.join("records.sqlite")
+    pub fn registry(&self) -> PathBuf {
+        self.root.join("registry.sqlite")
     }
-    pub fn vectors(&self, name: &str) -> PathBuf {
-        self.root.join("vectors").join(name)
+    pub fn projects(&self) -> PathBuf {
+        self.root.join("projects")
+    }
+    pub fn project_dir(&self, id: &str) -> PathBuf {
+        self.projects().join(id)
+    }
+    pub fn project_records(&self, id: &str) -> PathBuf {
+        self.project_dir(id).join("records.sqlite")
+    }
+    pub fn project_vectors(&self, id: &str, name: &str) -> PathBuf {
+        self.project_dir(id).join("vectors").join(name)
     }
     pub fn spool(&self) -> PathBuf {
         self.root.join("spool")
@@ -254,6 +273,15 @@ impl Default for DaemonSection {
         Self {
             autostart: true,
             idle_timeout_secs: 1_800,
+            max_open_projects: 8,
+        }
+    }
+}
+
+impl Default for ProjectSection {
+    fn default() -> Self {
+        Self {
+            git_timeout_ms: 1_000,
         }
     }
 }

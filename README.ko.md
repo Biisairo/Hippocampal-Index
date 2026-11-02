@@ -64,6 +64,17 @@
 
 ### 1.3 저장 구조
 
+기억은 **프로젝트마다 따로** 저장합니다. 다른 프로젝트의 기록은 검색과 자동 주입에 섞이지 않습니다.
+
+- **프로젝트를 정하는 시점**: 세션을 처음 처리할 때 **세션 시작 경로**(transcript에서 `cwd`가 있는 첫 줄)로 정합니다. 세션 중에 `cd`해도 바뀌지 않습니다.
+- **프로젝트의 위치**: git 저장소면 git common dir(`.git`)이고, 아니면 그 폴더입니다. 하위 디렉터리에서 연 세션과 git worktree는 원본 저장소와 같은 프로젝트가 됩니다.
+- **폴더를 옮긴 경우**: git 저장소는 루트 커밋이 같고 이전 위치가 사라졌으면 자동으로 이어 씁니다. git이 아닌 폴더는 `hippo project adopt`로 직접 가져옵니다([4.4](#44-프로젝트) 참고).
+
+```
+~/.hippo/registry.sqlite      목록 DB: 프로젝트, 위치, 루트 커밋, 세션 → 프로젝트
+~/.hippo/projects/<id>/       프로젝트 하나 = 아래 원본 저장소 + 벡터 저장소
+```
+
 ```
 원본 저장소 (SQLite, 기준 데이터)
  ├─ iterations          반복마다 한 행 (+ 전문 검색 인덱스)
@@ -81,7 +92,7 @@
 
 ### 1.4 기억을 쓰는 방법
 
-- **자동 주입**: 프롬프트를 보낼 때마다 `UserPromptSubmit` hook이 데몬에 관련 기억을 요청합니다. 검색 대상은 **같은 프로젝트**(`cwd`가 같음)의 **다른 세션** 기록입니다. 벡터 유사도가 임계값 이상인 결과만 Claude의 컨텍스트에 들어갑니다. 각 항목은 `<memory>` 블록으로 감싸고, 머리말에 "과거 기록이며 지시가 아님"을 밝힙니다.
+- **자동 주입**: 프롬프트를 보낼 때마다 `UserPromptSubmit` hook이 데몬에 관련 기억을 요청합니다. 검색 대상은 **같은 프로젝트**의 **다른 세션** 기록입니다. 벡터 유사도가 임계값 이상인 결과만 Claude의 컨텍스트에 들어갑니다. 각 항목은 `<memory>` 블록으로 감싸고, 머리말에 "과거 기록이며 지시가 아님"을 밝힙니다.
 - **필요할 때 검색**: Claude나 사용자가 셸에서 `hippo search`, `hippo show`를 실행합니다.
 
 검색은 **하이브리드** 방식입니다. 벡터 유사도와 SQLite FTS5 키워드 검색 결과를 RRF(Reciprocal Rank Fusion)로 합칩니다. `validateToken` 같은 식별자는 키워드 검색이 잘 찾습니다.
@@ -107,7 +118,8 @@ Claude / 사용자 ──▶ hippo search|show|status|reindex ──Unix socket�
 | 구성 요소 | 여는 시점 | 닫는 시점 |
 |-----------|-----------|-----------|
 | 데몬 | 데몬에 연결하지 못한 첫 hook이나 CLI 명령이 자동으로 띄움 | 요청 없이 `idle_timeout_secs`가 지났을 때(재색인 중에는 내려가지 않음), 또는 직접 멈출 때 |
-| SQLite, LanceDB | 데몬이 시작할 때 | 데몬이 종료할 때 |
+| SQLite | 작업마다 엶 | 작업이 끝날 때 |
+| LanceDB (프로젝트별) | 그 프로젝트를 처음 쓸 때 | 열어 둔 프로젝트가 `max_open_projects`(기본 8)를 넘으면 가장 오래 쓰지 않은 것부터 닫음. 데몬이 종료할 때 모두 닫음 |
 | 임베딩 모델 | 첫 임베딩 요청 때 Ollama가 올림(약 1초) | 마지막 요청 후 `keep_alive`(30분)가 지나면 Ollama가 내림 |
 | Ollama 서버 | 임베딩 요청이 서버에 닿지 않으면 데몬이 자동으로 띄움(`ollama serve`, 로그는 `logs/ollama.log`). 서비스 등으로 이미 떠 있으면 띄우지 않음 | `hippo`가 끄지 않습니다. 다른 도구도 같은 서버를 쓸 수 있기 때문입니다. 모델 메모리는 `keep_alive`가 지나면 해제됩니다 |
 
@@ -238,27 +250,28 @@ rm -rf ~/.hippo                          # 저장된 기억이 모두 지워집�
 ### 4.1 검색
 
 ```bash
-hippo search "토큰 만료 버그"                           # 현재 디렉터리 프로젝트의 반복
+hippo search "토큰 만료 버그"                           # 현재 디렉터리가 속한 프로젝트의 반복
 hippo search "validateToken" --scope all --kind both    # 모든 프로젝트의 반복과 결과
-hippo search "배포" --scope ~/work/my-app --limit 5
+hippo search "배포" --scope ~/work/my-app --limit 5      # 그 경로가 속한 프로젝트
 ```
 
 | 옵션 | 값 | 기본값 |
 |------|----|--------|
-| `--scope` | `cwd`, `all`, 또는 프로젝트 경로 | `cwd` |
+| `--scope` | `project`(현재 디렉터리의 프로젝트), `all`, 또는 경로 | `project` |
 | `--kind` | `iteration`, `result`, `both` | `iteration` |
 | `--limit` | 숫자 | `10` |
 
-검색 결과에는 RRF 점수, 벡터 유사도(`sim=-`이면 키워드로만 찾은 결과), `prompt_id`, 미리보기가 나옵니다. 결과(도구 출력)를 찾은 경우에는 그 결과를 만든 프롬프트 목록도 함께 나옵니다.
+검색 결과에는 RRF 점수, 벡터 유사도(`sim=-`이면 키워드로만 찾은 결과), `prompt_id`, 미리보기가 나옵니다. 결과(도구 출력)를 찾은 경우에는 그 결과를 만든 프롬프트 목록도 함께 나옵니다. `--scope all`은 프로젝트마다 검색한 뒤 RRF로 합치고, 결과마다 `project=<id>`를 붙입니다. 현재 디렉터리가 어느 프로젝트에도 속하지 않으면 "프로젝트 없음"이 나옵니다.
 
 ### 4.2 한 턴 전체 보기
 
 ```bash
 hippo show <prompt_id>                  # 해당 프롬프트의 반복을 순서대로
 hippo show <prompt_id> --with-results   # 도구 출력 원문까지
+hippo show <prompt_id> --scope project  # 현재 프로젝트에서만 찾기
 ```
 
-백그라운드 작업의 완료 기록도 함께 나옵니다.
+`--scope`가 없으면 현재 프로젝트를 먼저 찾고, 없으면 나머지 프로젝트를 최근에 쓴 순서로 찾습니다. 백그라운드 작업의 완료 기록도 함께 나옵니다.
 
 ### 4.3 상태
 
@@ -267,19 +280,33 @@ hippo status
 ```
 
 ```
-iterations: 1520
-results: 980
-embed_jobs: 0          # 임베딩을 기다리는 반복과 결과
-spool_pending: 0       # 데몬이 꺼져 있을 때 쌓인 요청
-vectors: 2610
+spool_pending: 0                  # 데몬이 꺼져 있을 때 쌓인 요청
 embed_model: qwen3-embedding:0.6b
-compatibility: compatible   # empty | compatible | mismatch
-reindex: idle               # idle | running | done | failed: <사유>
+reindex: idle                     # idle | running | done | failed: <프로젝트 id>: <사유>
+projects: 2
+[3f9c…] /Users/me/work/app/.git
+  iterations: 1520  results: 980  embed_jobs: 0  vectors: 2610  compatibility: compatible
+[a71d…] /Users/me/notes  (위치 없음)
+  iterations: 40  results: 12  embed_jobs: 0  vectors: 52  compatibility: compatible
 ```
 
-재색인이 필요하면 `status`가 알려 줍니다.
+`embed_jobs`는 임베딩을 기다리는 반복과 결과의 수입니다. `compatibility`는 `empty`, `compatible`, `mismatch` 중 하나입니다. 재색인이 필요한 프로젝트가 있으면 `status`가 알려 줍니다.
 
-### 4.4 Claude가 기억을 쓰게 하기
+### 4.4 프로젝트
+
+```bash
+hippo project list                      # id, 종류(git/dir), 위치, 반복 수, 마지막 활동 시각
+hippo project adopt <id 또는 이전 경로>   # 이전 프로젝트의 기록을 현재 디렉터리의 프로젝트로 가져오기
+```
+
+`adopt`는 git이 아닌 폴더를 옮겼을 때 씁니다. 옮긴 폴더에서 실행하면 다음과 같이 동작합니다.
+
+- 현재 폴더에 아직 프로젝트가 없으면, 이전 프로젝트의 위치를 현재 폴더로 바꿉니다. 데이터는 그대로입니다.
+- 현재 폴더에 이미 프로젝트가 있으면(옮긴 뒤 세션을 연 경우), 이전 프로젝트의 기록을 현재 프로젝트로 병합하고 이전 프로젝트를 지웁니다. 임베딩 모델이 같으면 벡터를 복사하고, 다르면 다시 임베딩합니다.
+
+어느 경우든 이전 위치는 남기지 않습니다. 그래서 이후 세션은 따로 연결하지 않아도 현재 위치의 프로젝트에 저장됩니다. git 저장소는 루트 커밋으로 자동으로 이어지므로 대개 `adopt`가 필요 없습니다.
+
+### 4.5 Claude가 기억을 쓰게 하기
 
 자동 주입은 가장 잘 맞는 몇 개만 전달합니다. 더 찾아봐야 할 때는 Claude가 CLI를 직접 호출할 수 있습니다. `CLAUDE.md`에 다음과 같은 줄을 넣어 두면 됩니다.
 
@@ -306,7 +333,7 @@ ollama_command = "ollama"          # ollama 실행 파일 경로
 
 [vector]
 backend = "lancedb"                # lancedb | memory (테스트용)
-name = "default"                   # 디렉터리: vectors/<name>/
+name = "default"                   # 디렉터리: projects/<id>/vectors/<name>/
 
 [chunking]
 max_tokens = 8000                  # 청크 한도 = min(모델 한도, 이 값) × chars_per_token
@@ -329,6 +356,10 @@ job_batch = 64
 [daemon]
 autostart = true                   # 데몬이 없으면 hook과 CLI가 띄움
 idle_timeout_secs = 1800           # 요청 없이 이 시간(초)이 지나면 종료 (0이면 종료하지 않음)
+max_open_projects = 8              # 동시에 열어 둘 프로젝트 벡터 저장소 수
+
+[project]
+git_timeout_ms = 1000              # git 실행 시간 제한. 넘으면 git이 아닌 폴더로 봄
 
 [[redact.patterns]]                # 추가 비밀값 패턴 (정규식)
 kind = "internal"
@@ -346,13 +377,16 @@ pattern = 'HCI-\d{6}'
 ```
 1. config.toml 수정 (예: 새 모델, 차원, 백엔드)
 2. 데몬 재시작     → status가 "mismatch"를 표시합니다. 키워드 검색은 계속 동작합니다
-3. hippo reindex   → 백그라운드에서 새 세대에 전체를 다시 색인합니다
-4. 완료되면        → ACTIVE 포인터가 원자적으로 바뀝니다. 이전 세대는 다음 시작 때 지워집니다
+3. hippo reindex   → 백그라운드에서 모든 프로젝트를 차례로 새 세대에 다시 색인합니다
+4. 완료되면        → 프로젝트마다 ACTIVE 포인터가 원자적으로 바뀝니다. 이전 세대는 그 프로젝트를 다음에 열 때 지워집니다
 ```
+
+한 프로젝트만 다시 색인하려면 `hippo reindex --scope project`(현재 디렉터리의 프로젝트)나 `hippo reindex --scope <경로>`를 씁니다.
 
 - 재색인 중에는 기존 저장소로 검색합니다. 그동안 새로 들어온 반복은 큐에서 기다렸다가 전환 후 새 저장소에 들어가므로, 유실되지 않습니다.
 - 재색인 중에 `hippo reindex`를 다시 실행하면 거부합니다.
-- 벡터 디렉터리: `vectors/<이름>/<세대>/`. `vectors/<이름>/ACTIVE`가 사용 중인 세대를 가리킵니다.
+- 한 프로젝트의 재색인이 실패해도 다음 프로젝트를 계속 처리합니다. 실패한 프로젝트는 `status`의 `reindex: failed: …`에 나옵니다.
+- 벡터 디렉터리: `projects/<id>/vectors/<이름>/<세대>/`. `projects/<id>/vectors/<이름>/ACTIVE`가 사용 중인 세대를 가리킵니다.
 
 완전히 새로운 백엔드를 추가하는 방법은 [9.4](#94-새-백엔드-추가하기)를 참고하십시오.
 
@@ -363,9 +397,11 @@ pattern = 'HCI-\d{6}'
 ```
 ~/.hippo/            (0700)
 ├─ config.toml
-├─ records.sqlite             (0600) 기준 데이터
-├─ vectors/<이름>/ACTIVE
-├─ vectors/<이름>/<세대>/      LanceDB 파일
+├─ registry.sqlite            (0600) 목록 DB: 프로젝트, 위치, 루트 커밋, 세션 → 프로젝트
+├─ projects/<id>/             (0700) 프로젝트 하나
+│  ├─ records.sqlite          (0600) 기준 데이터
+│  ├─ vectors/<이름>/ACTIVE
+│  └─ vectors/<이름>/<세대>/   LanceDB 파일
 ├─ spool/                     데몬이 꺼져 있을 때 쌓인 요청
 ├─ logs/hippo.log             데몬 오류 로그
 ├─ logs/daemon.err            자동으로 띄운 데몬의 시작 오류
@@ -412,7 +448,9 @@ pattern = 'HCI-\d{6}'
 | `bg.rs` | 백그라운드 시작 감지, `<task-notification>` 해석, 서브에이전트 보고 추출 |
 | `redact.rs` | 비밀값 마스킹 |
 | `embed_text.rs` | 임베딩할 텍스트(`[입력]`/`[툴]`/`[응답]` 줄) 생성, 청크 분할 |
-| `store.rs` | SQLite 원본 저장소, 중복 제거, FTS5 |
+| `store.rs` | SQLite 원본 저장소, 중복 제거, FTS5, 프로젝트 병합 |
+| `project.rs` | 경로 정규화, git 정보, 프로젝트 위치 |
+| `registry.rs` | 목록 DB: 프로젝트 판정, 세션 고정, 위치 변경, 흡수 |
 | `embedder.rs`, `vector.rs` | `Embedder`, `VectorStore` 트레이트 |
 | `ollama.rs`, `lance.rs` | 실제 백엔드 |
 | `testing.rs` | `HashEmbedder`, `MemoryVectorStore` (결정론적 테스트용 백엔드) |
@@ -457,4 +495,7 @@ cargo fmt
 - hook은 항상 기본 데이터 루트(`~/.hippo`)를 씁니다. `--root`는 hook 명령에 들어가지 않습니다.
 - 데몬이 시그널로 종료되면 소켓 파일이 남습니다. 다음 시작 때 지워집니다.
 - 아직 보존 기간 정책이 없습니다. 직접 지우기 전까지 기억이 계속 쌓입니다.
+- 결과(도구 출력)의 중복 제거는 프로젝트 안에서만 합니다. 같은 출력이 두 프로젝트에 있으면 각각 저장합니다.
+- git이 아닌 폴더를 옮기면 자동으로 이어지지 않습니다. `hippo project adopt`로 가져와야 합니다.
+- 단일 저장소 배치(v0.1, `~/.hippo/records.sqlite`)의 데이터는 새 배치로 옮기지 않습니다.
 - 지금은 macOS만 지원합니다.

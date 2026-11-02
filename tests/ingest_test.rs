@@ -5,7 +5,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use common::*;
-use hippo::ingest::{HookEvent, IngestError, IngestOptions, IngestRequest, ingest};
+use hippo::ingest::{
+    HookEvent, IngestError, IngestOptions, IngestRequest, ingest, session_start_cwd,
+};
 use hippo::redact::Redactor;
 use hippo::store::RecordStore;
 use serde_json::{Value, json};
@@ -465,4 +467,39 @@ fn bash_output_with_parent_or_relative_components_reads_nothing() {
         run(&mut store, HookEvent::Stop, "S", &path);
         assert_eq!(completion_result(&store), None, "{}", candidate.display());
     }
+}
+
+// ---- FR-PRJ-1: 세션 시작 경로 ----
+
+#[test]
+fn session_start_cwd_is_first_complete_line_with_cwd() {
+    let text = [
+        r#"{"type":"queue-operation"}"#,
+        r#"{"type":"user","cwd":"/start","message":{"content":"a"}}"#,
+        r#"{"type":"assistant","cwd":"/later"}"#,
+    ]
+    .join("\n")
+        + "\n";
+    assert_eq!(
+        session_start_cwd(text.as_bytes()).as_deref(),
+        Some("/start")
+    );
+}
+
+#[test]
+fn session_start_cwd_ignores_unterminated_and_missing_lines() {
+    assert_eq!(session_start_cwd(b""), None);
+    assert_eq!(
+        session_start_cwd(br#"{"type":"user","cwd":"/partial"}"#),
+        None,
+        "개행으로 끝나지 않은 라인은 기록 중"
+    );
+    assert_eq!(
+        session_start_cwd(b"not json\n{\"type\":\"system\"}\n"),
+        None
+    );
+    assert_eq!(
+        session_start_cwd(b"not json\n{\"cwd\":\"/x\"}\n").as_deref(),
+        Some("/x")
+    );
 }

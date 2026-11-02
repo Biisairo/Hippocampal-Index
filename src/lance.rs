@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use arrow_array::{
-    ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
-    UInt32Array,
+    Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator,
+    StringArray, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::TryStreamExt;
@@ -342,6 +342,52 @@ impl VectorStore for LanceVectorStore {
             .block_on(table.count_rows(None))
             .map_err(backend)?;
         Ok(n as u64)
+    }
+
+    fn scan(&self) -> Result<Vec<VectorRecord>, VectorError> {
+        let table = self.table()?;
+        let Some(table) = table.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let query = table.query();
+        let batches: Vec<RecordBatch> = self
+            .runtime
+            .block_on(async { query.execute().await?.try_collect().await })
+            .map_err(backend)?;
+        let mut records = Vec::new();
+        for batch in &batches {
+            let kinds = column::<StringArray>(batch, "kind")?;
+            let refs = column::<StringArray>(batch, "ref_id")?;
+            let chunks = column::<UInt32Array>(batch, "chunk_index")?;
+            let models = column::<StringArray>(batch, "embed_model")?;
+            let cwds = column::<StringArray>(batch, "cwd")?;
+            let sessions = column::<StringArray>(batch, "session_id")?;
+            let tss = column::<StringArray>(batch, "ts")?;
+            let vectors = column::<FixedSizeListArray>(batch, "vector")?;
+            let optional =
+                |a: &StringArray, i: usize| (!a.is_null(i)).then(|| a.value(i).to_string());
+            for i in 0..batch.num_rows() {
+                let Some(kind) = kind_from_str(kinds.value(i)) else {
+                    continue;
+                };
+                let values = vectors.value(i);
+                let values = values
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .ok_or_else(|| VectorError::Backend("vector column is not f32".into()))?;
+                records.push(VectorRecord {
+                    kind,
+                    ref_id: refs.value(i).to_string(),
+                    chunk_index: chunks.value(i),
+                    vector: values.values().to_vec(),
+                    embed_model: models.value(i).to_string(),
+                    cwd: optional(cwds, i),
+                    session_id: optional(sessions, i),
+                    ts: tss.value(i).to_string(),
+                });
+            }
+        }
+        Ok(records)
     }
 
     fn ensure_index(&self) -> Result<(), VectorError> {

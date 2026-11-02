@@ -12,8 +12,8 @@ use hippo::config::{Config, Paths};
 use hippo::daemon::{DaemonError, DaemonHandle, start};
 use hippo::embedder::Embedder;
 use hippo::ingest::{HookEvent, IngestRequest};
-use hippo::protocol::{Request, Response, StatusInfo};
-use hippo::search::{SearchKind, SearchRequest};
+use hippo::protocol::{Request, Response, Scope, StatusInfo};
+use hippo::search::SearchKind;
 use hippo::spool;
 use hippo::store::{RecordKind, RecordStore};
 use hippo::testing::{HashEmbedder, MemoryVectorStore};
@@ -58,8 +58,9 @@ fn config() -> Config {
 /// 첫 번째 열기에는 주어진 저장소를, 이후(재색인 세대)에는 새 메모리 저장소를 돌려준다.
 fn memory_source(paths: &Paths, initial: Arc<dyn VectorStore>) -> VectorSource {
     let first = Mutex::new(Some(initial));
+    let _ = paths;
     VectorSource {
-        base: paths.vectors("default"),
+        name: "default".into(),
         open: Arc::new(move |_dir: &Path| {
             let initial = first.lock().unwrap().take();
             Ok(initial.unwrap_or_else(|| Arc::new(MemoryVectorStore::default())))
@@ -81,6 +82,41 @@ fn status(paths: &Paths) -> StatusInfo {
     match request(&paths.socket(), &Request::Status, TIMEOUT).unwrap() {
         Response::Status(s) => s,
         other => panic!("{other:?}"),
+    }
+}
+
+/// 모든 프로젝트를 합친 (반복 수, 임베딩 대기 수, 벡터 수).
+fn totals(st: &StatusInfo) -> (u64, u64, u64) {
+    st.projects.iter().fold((0, 0, 0), |(i, j, v), p| {
+        (i + p.iterations, j + p.embed_jobs, v + p.vectors)
+    })
+}
+
+/// 프로젝트가 하나뿐일 때 그 id.
+fn only_project(paths: &Paths) -> String {
+    let st = status(paths);
+    assert_eq!(st.projects.len(), 1, "{st:?}");
+    st.projects[0].id.clone()
+}
+
+fn project_records(paths: &Paths) -> RecordStore {
+    RecordStore::open(&paths.project_records(&only_project(paths))).unwrap()
+}
+
+fn search_req(query: &str, scope: Scope, cwd: &str) -> Request {
+    Request::Search {
+        query: query.into(),
+        kind: SearchKind::Iteration,
+        limit: 5,
+        scope,
+        cwd: cwd.into(),
+    }
+}
+
+fn reindex_all() -> Request {
+    Request::Reindex {
+        scope: Scope::All,
+        cwd: String::new(),
     }
 }
 
@@ -116,20 +152,20 @@ fn ingest_embed_search_show_end_to_end() {
         ingest(&e.paths, &e.transcript, HookEvent::Stop),
         Response::Done
     );
-    assert_eq!(status(&e.paths).iterations, 2);
-    wait_until(|| status(&e.paths).embed_jobs == 0);
+    assert_eq!(totals(&status(&e.paths)).0, 2);
+    wait_until(|| totals(&status(&e.paths)).1 == 0);
     let st = status(&e.paths);
-    assert_eq!(st.compatibility, "compatible");
+    assert_eq!(st.projects.len(), 1);
+    assert_eq!(st.projects[0].compatibility, "compatible");
+    assert_eq!(
+        st.projects[0].location,
+        s2_cwd(),
+        "존재하지 않는 경로는 그대로 위치"
+    );
     assert_eq!(st.embed_model, "test-hash-256");
-    assert!(st.vectors >= 4);
+    assert!(totals(&st).2 >= 4);
 
-    let search = Request::Search(SearchRequest {
-        query: "두 파일은 병렬로".into(),
-        kind: SearchKind::Iteration,
-        cwd: Some(s2_cwd()),
-        exclude_session: None,
-        limit: 5,
-    });
+    let search = search_req("두 파일은 병렬로", Scope::Project, &s2_cwd());
     let out = text(request(&e.paths.socket(), &search, TIMEOUT).unwrap());
     assert!(out.contains("[iteration]"), "{out}");
 
@@ -140,6 +176,8 @@ fn ingest_embed_search_show_end_to_end() {
             &Request::Show {
                 prompt_id: prompt_id.into(),
                 with_results: false,
+                scope: None,
+                cwd: s2_cwd(),
             },
             TIMEOUT,
         )
@@ -154,9 +192,8 @@ fn inject_returns_context_for_other_session() {
     let e = env();
     let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
     ingest(&e.paths, &e.transcript, HookEvent::Stop);
-    wait_until(|| status(&e.paths).embed_jobs == 0);
-    let embed_text = RecordStore::open(&e.paths.records())
-        .unwrap()
+    wait_until(|| totals(&status(&e.paths)).1 == 0);
+    let embed_text = project_records(&e.paths)
         .iterations_for_prompt("8f64252a-0037-484d-a451-35aa2c0076ed")
         .unwrap()[1]
         .embed_text
@@ -203,7 +240,7 @@ fn hook_ingest_through_daemon() {
         hook_no_autostart(&e.paths, Duration::from_millis(800), "stop", &input),
         None
     );
-    assert_eq!(status(&e.paths).iterations, 2);
+    assert_eq!(totals(&status(&e.paths)).0, 2);
     assert_eq!(spool::pending_count(&e.paths.spool()), 0);
     handle.shutdown();
 }
@@ -218,7 +255,7 @@ fn second_instance_is_rejected_and_lock_released_on_shutdown() {
     ));
     first.shutdown();
     let again = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
-    assert_eq!(status(&e.paths).iterations, 0);
+    assert!(status(&e.paths).projects.is_empty());
     again.shutdown();
 }
 
@@ -232,7 +269,7 @@ fn spool_is_drained_on_start() {
     };
     spool::append(&e.paths.spool(), &req).unwrap();
     let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
-    wait_until(|| status(&e.paths).iterations == 2);
+    wait_until(|| totals(&status(&e.paths)).0 == 2);
     assert_eq!(spool::pending_count(&e.paths.spool()), 0);
     handle.shutdown();
 }
@@ -243,7 +280,7 @@ fn stale_socket_file_is_replaced() {
     fs::create_dir_all(&e.paths.root).unwrap();
     fs::write(e.paths.socket(), "stale").unwrap();
     let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
-    assert_eq!(status(&e.paths).iterations, 0);
+    assert!(status(&e.paths).projects.is_empty());
     handle.shutdown();
 }
 
@@ -283,17 +320,15 @@ fn incompatible_vector_store_falls_back_to_fts() {
     ingest(&e.paths, &e.transcript, HookEvent::Stop);
     std::thread::sleep(Duration::from_millis(300));
     let st = status(&e.paths);
-    assert_eq!(st.compatibility, "mismatch");
-    assert_eq!(st.embed_jobs, 4, "임베딩 작업은 처리하지 않고 남김");
-    assert_eq!(st.vectors, 1);
+    assert_eq!(st.projects[0].compatibility, "mismatch");
+    assert_eq!(
+        st.projects[0].embed_jobs, 4,
+        "임베딩 작업은 처리하지 않고 남김"
+    );
+    assert_eq!(st.projects[0].vectors, 1);
+    assert!(st.render().contains("hippo reindex"), "{}", st.render());
 
-    let search = Request::Search(SearchRequest {
-        query: "두 파일은 병렬로".into(),
-        kind: SearchKind::Iteration,
-        cwd: None,
-        exclude_session: None,
-        limit: 5,
-    });
+    let search = search_req("두 파일은 병렬로", Scope::All, "/");
     let out = text(request(&e.paths.socket(), &search, TIMEOUT).unwrap());
     assert!(out.contains("sim=-"), "FTS 전용: {out}");
     let input = json!({"session_id": "other", "transcript_path": "/t", "cwd": s2_cwd(), "prompt": "두 파일은 병렬로 다 읽었지만"}).to_string();
@@ -361,23 +396,22 @@ fn reindex_recovers_from_mismatch() {
     let e = env();
     let handle = launch(&e.paths, Arc::new(mismatched_store())).unwrap();
     ingest(&e.paths, &e.transcript, HookEvent::Stop);
-    assert_eq!(status(&e.paths).compatibility, "mismatch");
+    assert_eq!(status(&e.paths).projects[0].compatibility, "mismatch");
     assert_eq!(
-        request(&e.paths.socket(), &Request::Reindex, TIMEOUT).unwrap(),
+        request(&e.paths.socket(), &reindex_all(), TIMEOUT).unwrap(),
         Response::Done
     );
     let done = wait_reindex(&e.paths);
     assert_eq!(done.reindex, "done");
-    assert_eq!(done.compatibility, "compatible");
-    wait_until(|| status(&e.paths).embed_jobs == 0);
+    assert_eq!(done.projects[0].compatibility, "compatible");
+    wait_until(|| totals(&status(&e.paths)).1 == 0);
     assert_eq!(
-        status(&e.paths).vectors,
+        totals(&status(&e.paths)).2,
         4,
         "반복 2 + 결과 2, 이전 모델 벡터 없음"
     );
 
-    let embed_text = RecordStore::open(&e.paths.records())
-        .unwrap()
+    let embed_text = project_records(&e.paths)
         .iterations_for_prompt("8f64252a-0037-484d-a451-35aa2c0076ed")
         .unwrap()[1]
         .embed_text
@@ -426,11 +460,11 @@ fn concurrent_reindex_is_rejected() {
     .unwrap();
     ingest(&e.paths, &e.transcript, HookEvent::Stop);
     assert_eq!(
-        request(&e.paths.socket(), &Request::Reindex, TIMEOUT).unwrap(),
+        request(&e.paths.socket(), &reindex_all(), TIMEOUT).unwrap(),
         Response::Done
     );
     assert!(matches!(
-        request(&e.paths.socket(), &Request::Reindex, TIMEOUT).unwrap(),
+        request(&e.paths.socket(), &reindex_all(), TIMEOUT).unwrap(),
         Response::Error { .. }
     ));
     assert_eq!(wait_reindex(&e.paths).reindex, "done");
@@ -449,29 +483,35 @@ fn lancedb_reindex_switches_generation_and_survives_restart() {
         e.paths.clone(),
         config.clone(),
         embedder.clone(),
-        vector_source(&config, &e.paths).unwrap(),
+        vector_source(&config).unwrap(),
     )
     .unwrap();
     ingest(&e.paths, &e.transcript, HookEvent::Stop);
-    wait_until(|| status(&e.paths).embed_jobs == 0);
-    let base = e.paths.vectors("default");
+    wait_until(|| totals(&status(&e.paths)).1 == 0);
+    let base = e.paths.project_vectors(&only_project(&e.paths), "default");
     let before = fs::read_to_string(base.join("ACTIVE")).unwrap();
-    request(&e.paths.socket(), &Request::Reindex, TIMEOUT).unwrap();
+    request(&e.paths.socket(), &reindex_all(), TIMEOUT).unwrap();
     assert_eq!(wait_reindex(&e.paths).reindex, "done");
     let after = fs::read_to_string(base.join("ACTIVE")).unwrap();
     assert_ne!(before, after);
-    assert_eq!(status(&e.paths).vectors, 4);
+    assert_eq!(totals(&status(&e.paths)).2, 4);
     handle.shutdown();
 
     let handle = start(
         e.paths.clone(),
         config.clone(),
         embedder,
-        vector_source(&config, &e.paths).unwrap(),
+        vector_source(&config).unwrap(),
     )
     .unwrap();
     let st = status(&e.paths);
-    assert_eq!((st.vectors, st.compatibility.as_str()), (4, "compatible"));
+    assert_eq!(
+        (
+            st.projects[0].vectors,
+            st.projects[0].compatibility.as_str()
+        ),
+        (4, "compatible")
+    );
     let generations = fs::read_dir(&base)
         .unwrap()
         .filter_map(Result::ok)
@@ -522,7 +562,7 @@ fn hook_autostarts_daemon_and_ingests() {
         None
     );
     assert!(slot.lock().unwrap().is_some(), "데몬을 띄움");
-    assert_eq!(status(&e.paths).iterations, 2);
+    assert_eq!(totals(&status(&e.paths)).0, 2);
     assert_eq!(spool::pending_count(&e.paths.spool()), 0);
     assert!(
         ensure_daemon(&e.paths, &launch_disabled, Duration::from_millis(100)),
@@ -604,7 +644,7 @@ fn zero_idle_timeout_never_exits() {
     )
     .unwrap();
     std::thread::sleep(Duration::from_millis(1_500));
-    assert_eq!(status(&e.paths).iterations, 0);
+    assert!(status(&e.paths).projects.is_empty());
     handle.shutdown();
 }
 
@@ -639,7 +679,7 @@ fn reindex_blocks_idle_exit() {
     .unwrap();
     ingest(&e.paths, &e.transcript, HookEvent::Stop);
     assert_eq!(
-        request(&e.paths.socket(), &Request::Reindex, TIMEOUT).unwrap(),
+        request(&e.paths.socket(), &reindex_all(), TIMEOUT).unwrap(),
         Response::Done
     );
     std::thread::sleep(Duration::from_millis(1_500));
@@ -683,13 +723,7 @@ fn search_falls_back_to_fts_when_embedding_fails() {
     )
     .unwrap();
     ingest(&e.paths, &e.transcript, HookEvent::Stop);
-    let search = Request::Search(SearchRequest {
-        query: "두 파일은 병렬로".into(),
-        kind: SearchKind::Iteration,
-        cwd: None,
-        exclude_session: None,
-        limit: 5,
-    });
+    let search = search_req("두 파일은 병렬로", Scope::Path(s2_cwd()), "/");
     let out = text(request(&e.paths.socket(), &search, TIMEOUT).unwrap());
     let first = out.lines().next().unwrap();
     assert!(
@@ -709,6 +743,612 @@ fn search_falls_back_to_fts_when_embedding_fails() {
             &input
         ),
         None
+    );
+    handle.shutdown();
+}
+
+// ---- SRS 3.2.10 프로젝트 (FR-PRJ), FR-DMN-6, FR-DMN-9 ----
+
+const S2_PROMPT: &str = "8f64252a-0037-484d-a451-35aa2c0076ed";
+
+fn prompt_of(session: &str) -> String {
+    format!("p-{session}")
+}
+
+/// s2 fixture를 세션 id, prompt id, cwd를 바꿔 쓴다. `later_cwd`가 있으면 첫 cwd 라인 뒤의 cwd를 그 값으로 바꾼다.
+fn transcript_at(dir: &Path, session: &str, cwd: &Path, later_cwd: Option<&Path>) -> PathBuf {
+    let mut first = true;
+    let body: String = read_fixture("s2_tools.jsonl")
+        .replace(S2, session)
+        .replace(S2_PROMPT, &prompt_of(session))
+        .lines()
+        .map(|l| {
+            let mut v: serde_json::Value = serde_json::from_str(l).unwrap();
+            if v.get("cwd").is_some() {
+                let value = match (first, later_cwd) {
+                    (false, Some(later)) => later,
+                    _ => cwd,
+                };
+                v["cwd"] = json!(value.to_string_lossy());
+                first = false;
+            }
+            format!("{v}\n")
+        })
+        .collect();
+    let path = dir.join(format!("{session}.jsonl"));
+    fs::write(&path, body).unwrap();
+    path
+}
+
+fn ingest_session(paths: &Paths, session: &str, transcript: &Path) -> Response {
+    let req = Request::Ingest(IngestRequest {
+        event: HookEvent::Stop,
+        session_id: session.into(),
+        transcript_path: transcript.to_path_buf(),
+    });
+    request(&paths.socket(), &req, TIMEOUT).unwrap()
+}
+
+fn mkdir(e: &Env, name: &str) -> PathBuf {
+    let p = e._dir.path().join(name);
+    fs::create_dir_all(&p).unwrap();
+    fs::canonicalize(&p).unwrap()
+}
+
+fn s(p: &Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+
+fn project_at<'a>(st: &'a StatusInfo, location: &Path) -> &'a hippo::protocol::ProjectStatus {
+    st.projects
+        .iter()
+        .find(|p| p.location == s(location))
+        .unwrap_or_else(|| panic!("{location:?} not in {st:?}"))
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{args:?}: {out:?}");
+}
+
+fn two_project_env() -> (Env, DaemonHandle, PathBuf, PathBuf) {
+    let e = env();
+    let a = mkdir(&e, "a");
+    let b = mkdir(&e, "b");
+    let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
+    let ta = transcript_at(e._dir.path(), "sa", &a, None);
+    let tb = transcript_at(e._dir.path(), "sb", &b, None);
+    assert_eq!(ingest_session(&e.paths, "sa", &ta), Response::Done);
+    assert_eq!(ingest_session(&e.paths, "sb", &tb), Response::Done);
+    wait_until(|| totals(&status(&e.paths)).1 == 0);
+    (e, handle, a, b)
+}
+
+#[test]
+fn sessions_in_different_projects_are_stored_and_searched_separately() {
+    let (e, handle, a, b) = two_project_env();
+    let st = status(&e.paths);
+    assert_eq!(st.projects.len(), 2);
+    assert_eq!(project_at(&st, &a).iterations, 2);
+    assert_eq!(project_at(&st, &b).iterations, 2);
+    let rendered = st.render();
+    assert!(rendered.contains(&project_at(&st, &a).id), "{rendered}");
+
+    let q = "두 파일은 병렬로";
+    let only_a = text(
+        request(
+            &e.paths.socket(),
+            &search_req(q, Scope::Project, &s(&a)),
+            TIMEOUT,
+        )
+        .unwrap(),
+    );
+    assert!(
+        only_a.contains("sa:") && !only_a.contains("sb:"),
+        "{only_a}"
+    );
+    let only_b = text(
+        request(
+            &e.paths.socket(),
+            &search_req(q, Scope::Path(s(&b)), "/"),
+            TIMEOUT,
+        )
+        .unwrap(),
+    );
+    assert!(
+        only_b.contains("sb:") && !only_b.contains("sa:"),
+        "{only_b}"
+    );
+    let all = text(
+        request(
+            &e.paths.socket(),
+            &search_req(q, Scope::All, &s(&a)),
+            TIMEOUT,
+        )
+        .unwrap(),
+    );
+    assert!(
+        all.contains("sa:") && all.contains("sb:") && all.contains("project="),
+        "{all}"
+    );
+    let none = text(
+        request(
+            &e.paths.socket(),
+            &search_req(q, Scope::Project, "/no/such/project"),
+            TIMEOUT,
+        )
+        .unwrap(),
+    );
+    assert!(none.contains("프로젝트 없음"), "{none}");
+
+    let embed_text = RecordStore::open(&e.paths.project_records(&project_at(&st, &a).id))
+        .unwrap()
+        .iterations_for_prompt(&prompt_of("sa"))
+        .unwrap()[1]
+        .embed_text
+        .clone();
+    let input = |cwd: &str| {
+        json!({"session_id": "new", "transcript_path": "/t", "cwd": cwd, "prompt": embed_text})
+            .to_string()
+    };
+    let injected = hook_no_autostart(
+        &e.paths,
+        Duration::from_secs(5),
+        "user-prompt-submit",
+        &input(&s(&a)),
+    )
+    .unwrap();
+    assert!(
+        injected.contains(&prompt_of("sa")) && !injected.contains(&prompt_of("sb")),
+        "{injected}"
+    );
+    assert_eq!(
+        hook_no_autostart(
+            &e.paths,
+            Duration::from_secs(5),
+            "user-prompt-submit",
+            &input("/no/such/project")
+        ),
+        None,
+        "프로젝트가 없으면 주입하지 않음"
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn session_stays_in_its_start_project_after_cd() {
+    let e = env();
+    let a = mkdir(&e, "a");
+    let b = mkdir(&e, "b");
+    let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
+    let t = transcript_at(e._dir.path(), "sa", &a, Some(&b));
+    assert_eq!(ingest_session(&e.paths, "sa", &t), Response::Done);
+    let st = status(&e.paths);
+    assert_eq!(st.projects.len(), 1);
+    assert_eq!(project_at(&st, &a).iterations, 2);
+    handle.shutdown();
+}
+
+#[test]
+fn worktrees_share_the_main_project_and_moved_repository_is_followed() {
+    let e = env();
+    let repo = mkdir(&e, "repo");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    fs::create_dir_all(repo.join("src")).unwrap();
+    let wt = e._dir.path().join("wt");
+    git(&repo, &["worktree", "add", "-q", "-b", "feature", &s(&wt)]);
+    let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
+    let ta = transcript_at(e._dir.path(), "sa", &repo.join("src"), None);
+    let tb = transcript_at(e._dir.path(), "sb", &wt, None);
+    ingest_session(&e.paths, "sa", &ta);
+    ingest_session(&e.paths, "sb", &tb);
+    let st = status(&e.paths);
+    assert_eq!(st.projects.len(), 1, "{st:?}");
+    assert_eq!(project_at(&st, &repo.join(".git")).iterations, 4);
+
+    let moved = e._dir.path().join("moved");
+    fs::rename(&repo, &moved).unwrap();
+    let moved = fs::canonicalize(&moved).unwrap();
+    let tc = transcript_at(e._dir.path(), "sc", &moved, None);
+    ingest_session(&e.paths, "sc", &tc);
+    let st = status(&e.paths);
+    assert_eq!(st.projects.len(), 1, "{st:?}");
+    assert_eq!(project_at(&st, &moved.join(".git")).iterations, 6);
+    handle.shutdown();
+}
+
+fn project_list(paths: &Paths) -> String {
+    text(request(&paths.socket(), &Request::ProjectList, TIMEOUT).unwrap())
+}
+
+fn adopt(paths: &Paths, source: &str, cwd: &Path) -> Response {
+    request(
+        &paths.socket(),
+        &Request::ProjectAdopt {
+            source: source.into(),
+            cwd: s(cwd),
+        },
+        TIMEOUT,
+    )
+    .unwrap()
+}
+
+#[test]
+fn project_list_shows_id_location_and_counts() {
+    let e = env();
+    let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
+    assert!(project_list(&e.paths).contains("프로젝트 없음"));
+    let a = mkdir(&e, "a");
+    let t = transcript_at(e._dir.path(), "sa", &a, None);
+    ingest_session(&e.paths, "sa", &t);
+    let id = only_project(&e.paths);
+    let list = project_list(&e.paths);
+    assert!(
+        list.contains(&id) && list.contains(&s(&a)) && list.contains("iterations=2"),
+        "{list}"
+    );
+    assert!(!list.contains("위치 없음"), "{list}");
+    fs::remove_dir(&a).unwrap();
+    assert!(project_list(&e.paths).contains("위치 없음"));
+    handle.shutdown();
+}
+
+#[test]
+fn adopt_moves_location_when_current_directory_has_no_project() {
+    let e = env();
+    let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
+    let a = mkdir(&e, "a");
+    ingest_session(
+        &e.paths,
+        "sa",
+        &transcript_at(e._dir.path(), "sa", &a, None),
+    );
+    let id = only_project(&e.paths);
+    let b = e._dir.path().join("b");
+    fs::rename(&a, &b).unwrap();
+    let b = fs::canonicalize(&b).unwrap();
+    assert!(matches!(adopt(&e.paths, &s(&a), &b), Response::Text { .. }));
+    let st = status(&e.paths);
+    assert_eq!(st.projects.len(), 1);
+    assert_eq!(project_at(&st, &b).id, id);
+    ingest_session(
+        &e.paths,
+        "sb",
+        &transcript_at(e._dir.path(), "sb", &b, None),
+    );
+    let st = status(&e.paths);
+    assert_eq!((st.projects.len(), project_at(&st, &b).iterations), (1, 4));
+    handle.shutdown();
+}
+
+#[test]
+fn adopt_merges_into_current_project_copying_vectors() {
+    let (e, handle, a, b) = two_project_env();
+    let st = status(&e.paths);
+    let source = project_at(&st, &a).id.clone();
+    let target = project_at(&st, &b).id.clone();
+    let out = text(adopt(&e.paths, &source, &b));
+    assert!(out.contains("복사"), "{out}");
+    let st = status(&e.paths);
+    assert_eq!(st.projects.len(), 1);
+    let p = project_at(&st, &b);
+    assert_eq!(
+        (p.id.as_str(), p.iterations, p.embed_jobs, p.vectors),
+        (target.as_str(), 4, 0, 6),
+        "반복 4 + 결과 2(같은 원문은 해시로 합쳐짐)"
+    );
+    assert!(!e.paths.project_dir(&source).exists(), "원본 디렉터리 삭제");
+
+    ingest_session(&e.paths, "sa", &e._dir.path().join("sa.jsonl"));
+    assert_eq!(
+        status(&e.paths).projects.len(),
+        1,
+        "원본 세션은 대상 프로젝트로 감"
+    );
+    let found = text(
+        request(
+            &e.paths.socket(),
+            &search_req("두 파일은 병렬로", Scope::Project, &s(&b)),
+            TIMEOUT,
+        )
+        .unwrap(),
+    );
+    assert!(found.contains("sa:") && found.contains("sb:"), "{found}");
+    handle.shutdown();
+}
+
+#[test]
+fn adopt_merge_reembeds_when_source_vectors_are_incompatible() {
+    let e = env();
+    let a = mkdir(&e, "a");
+    let b = mkdir(&e, "b");
+    let handle = launch(&e.paths, Arc::new(mismatched_store())).unwrap();
+    ingest_session(
+        &e.paths,
+        "sa",
+        &transcript_at(e._dir.path(), "sa", &a, None),
+    );
+    ingest_session(
+        &e.paths,
+        "sb",
+        &transcript_at(e._dir.path(), "sb", &b, None),
+    );
+    wait_until(|| project_at(&status(&e.paths), &b).embed_jobs == 0);
+    let source = project_at(&status(&e.paths), &a).id.clone();
+    assert_eq!(project_at(&status(&e.paths), &a).compatibility, "mismatch");
+    let out = text(adopt(&e.paths, &source, &b));
+    assert!(out.contains("임베딩 작업"), "{out}");
+    wait_until(|| totals(&status(&e.paths)).1 == 0);
+    let st = status(&e.paths);
+    assert_eq!(st.projects.len(), 1);
+    assert_eq!(
+        project_at(&st, &b).vectors,
+        6,
+        "반복 4 + 결과 2(같은 원문은 해시로 합쳐짐). 이전 모델 벡터는 옮기지 않고 다시 임베딩"
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn adopt_same_project_or_unknown_source() {
+    let e = env();
+    let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
+    let a = mkdir(&e, "a");
+    ingest_session(
+        &e.paths,
+        "sa",
+        &transcript_at(e._dir.path(), "sa", &a, None),
+    );
+    assert!(text(adopt(&e.paths, &s(&a), &a)).contains("변경 없음"));
+    assert!(matches!(
+        adopt(&e.paths, "/no/such/source", &a),
+        Response::Error { .. }
+    ));
+    assert_eq!(status(&e.paths).projects.len(), 1);
+    handle.shutdown();
+}
+
+fn show(paths: &Paths, prompt: &str, scope: Option<Scope>, cwd: &str) -> String {
+    text(
+        request(
+            &paths.socket(),
+            &Request::Show {
+                prompt_id: prompt.into(),
+                with_results: false,
+                scope,
+                cwd: cwd.into(),
+            },
+            TIMEOUT,
+        )
+        .unwrap(),
+    )
+}
+
+#[test]
+fn show_looks_in_current_project_first_then_others() {
+    let (e, handle, a, b) = two_project_env();
+    let p = prompt_of("sa");
+    assert!(
+        show(&e.paths, &p, None, &s(&b)).contains("[1]"),
+        "다른 프로젝트에서도 찾음"
+    );
+    assert!(show(&e.paths, &p, Some(Scope::Project), &s(&b)).contains("기록 없음"));
+    assert!(show(&e.paths, &p, Some(Scope::Path(s(&a))), "/").contains("[1]"));
+    handle.shutdown();
+}
+
+#[test]
+fn reindex_scope_selects_projects() {
+    let (e, handle, a, b) = two_project_env();
+    let st = status(&e.paths);
+    let active = |id: &str| {
+        fs::read_to_string(e.paths.project_vectors(id, "default").join("ACTIVE")).unwrap()
+    };
+    let (ia, ib) = (
+        project_at(&st, &a).id.clone(),
+        project_at(&st, &b).id.clone(),
+    );
+    let (a0, b0) = (active(&ia), active(&ib));
+    let one = Request::Reindex {
+        scope: Scope::Path(s(&a)),
+        cwd: "/".into(),
+    };
+    assert_eq!(
+        request(&e.paths.socket(), &one, TIMEOUT).unwrap(),
+        Response::Done
+    );
+    assert_eq!(wait_reindex(&e.paths).reindex, "done");
+    let (a1, b1) = (active(&ia), active(&ib));
+    assert_ne!(a1, a0);
+    assert_eq!(b1, b0);
+    assert_eq!(
+        request(&e.paths.socket(), &reindex_all(), TIMEOUT).unwrap(),
+        Response::Done
+    );
+    assert_eq!(wait_reindex(&e.paths).reindex, "done");
+    assert_ne!(active(&ia), a1);
+    assert_ne!(active(&ib), b1);
+    let unknown = Request::Reindex {
+        scope: Scope::Project,
+        cwd: "/no/such/project".into(),
+    };
+    assert!(matches!(
+        request(&e.paths.socket(), &unknown, TIMEOUT).unwrap(),
+        Response::Error { .. }
+    ));
+    handle.shutdown();
+}
+
+fn counting_source(opens: Arc<std::sync::atomic::AtomicUsize>) -> VectorSource {
+    VectorSource {
+        name: "default".into(),
+        open: Arc::new(move |_dir: &Path| {
+            opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Arc::new(MemoryVectorStore::default()) as Arc<dyn VectorStore>)
+        }),
+    }
+}
+
+fn reopen_count(max_open: usize) -> usize {
+    let e = env();
+    let a = mkdir(&e, "a");
+    let b = mkdir(&e, "b");
+    let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handle = start(
+        e.paths.clone(),
+        config_with(&format!("[daemon]\nmax_open_projects = {max_open}\n")),
+        Arc::new(HashEmbedder::new(256, 8_000)),
+        counting_source(Arc::clone(&opens)),
+    )
+    .unwrap();
+    ingest_session(
+        &e.paths,
+        "sa",
+        &transcript_at(e._dir.path(), "sa", &a, None),
+    );
+    ingest_session(
+        &e.paths,
+        "sb",
+        &transcript_at(e._dir.path(), "sb", &b, None),
+    );
+    wait_until(|| totals(&status(&e.paths)).1 == 0);
+    let before = opens.load(std::sync::atomic::Ordering::SeqCst);
+    for dir in [&a, &b, &a, &b] {
+        text(
+            request(
+                &e.paths.socket(),
+                &search_req("병렬로", Scope::Project, &s(dir)),
+                TIMEOUT,
+            )
+            .unwrap(),
+        );
+    }
+    let reopened = opens.load(std::sync::atomic::Ordering::SeqCst) - before;
+    handle.shutdown();
+    reopened
+}
+
+#[test]
+fn open_projects_are_limited_and_least_recently_used_is_closed() {
+    assert_eq!(reopen_count(8), 0, "상한 안이면 다시 열지 않음");
+    assert!(
+        reopen_count(1) >= 3,
+        "상한 1이면 프로젝트를 바꿀 때마다 다시 엶"
+    );
+}
+
+struct RecordingEmbedder(HashEmbedder, Arc<Mutex<Vec<String>>>);
+
+impl Embedder for RecordingEmbedder {
+    fn model_id(&self) -> &str {
+        self.0.model_id()
+    }
+    fn dimension(&self) -> usize {
+        self.0.dimension()
+    }
+    fn max_input_tokens(&self) -> usize {
+        self.0.max_input_tokens()
+    }
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, hippo::embedder::EmbedError> {
+        self.1.lock().unwrap().extend(texts.iter().cloned());
+        self.0.embed(texts)
+    }
+}
+
+fn marked_iteration(session: &str, marker: &str) -> hippo::store::NewIteration {
+    let iteration = hippo::transcript::Iteration {
+        session_id: session.into(),
+        prompt_id: Some(prompt_of(session)),
+        message_id: "m1".into(),
+        iteration_index: 0,
+        cwd: "/x".into(),
+        ts: "2026-11-02T00:00:00Z".into(),
+        inputs: vec![],
+        texts: vec![marker.into()],
+        tool_calls: vec![],
+    };
+    let embed_text = hippo::embed_text::build_embed_text(&iteration, 500);
+    hippo::store::NewIteration {
+        iteration,
+        embed_text,
+    }
+}
+
+#[test]
+fn startup_queue_orders_jobs_across_projects_by_enqueue_time() {
+    use hippo::project::{Location, LocationKind};
+    let e = env();
+    let dir_loc = |p: &str| Location {
+        path: p.into(),
+        kind: LocationKind::Dir,
+        toplevel: None,
+        root_commits: vec![],
+    };
+    let mut registry = hippo::registry::Registry::open(&e.paths.registry()).unwrap();
+    let ia = registry.resolve(&dir_loc("/gone/a"), 2).unwrap();
+    let ib = registry.resolve(&dir_loc("/gone/b"), 1).unwrap();
+    drop(registry);
+    for (id, session, marker) in [(&ib, "sb", "MARKER_B"), (&ia, "sa", "MARKER_A")] {
+        RecordStore::open(&e.paths.project_records(id))
+            .unwrap()
+            .apply(&hippo::store::Batch {
+                session_id: session.into(),
+                transcript_path: "/t".into(),
+                iterations: vec![marked_iteration(session, marker)],
+                completions: vec![],
+                state: hippo::transcript::ExtractorState::default(),
+            })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let handle = start(
+        e.paths.clone(),
+        config(),
+        Arc::new(RecordingEmbedder(
+            HashEmbedder::new(256, 8_000),
+            Arc::clone(&seen),
+        )),
+        memory_source(&e.paths, Arc::new(MemoryVectorStore::default())),
+    )
+    .unwrap();
+    wait_until(|| totals(&status(&e.paths)).1 == 0);
+    let seen = seen.lock().unwrap().clone();
+    let pos = |m: &str| seen.iter().position(|t| t.contains(m)).unwrap();
+    assert!(pos("MARKER_B") < pos("MARKER_A"), "{seen:?}");
+    handle.shutdown();
+}
+
+#[test]
+fn project_list_escapes_control_characters() {
+    let e = env();
+    let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
+    let odd = mkdir(&e, "odd\u{1b}[31m");
+    ingest_session(
+        &e.paths,
+        "sa",
+        &transcript_at(e._dir.path(), "sa", &odd, None),
+    );
+    let list = project_list(&e.paths);
+    assert!(
+        !list.contains('\u{1b}') && list.contains("\\u{1b}"),
+        "{list:?}"
     );
     handle.shutdown();
 }

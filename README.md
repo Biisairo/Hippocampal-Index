@@ -64,6 +64,17 @@ Other details:
 
 ### 1.3 Storage model
 
+Memory is stored **separately for each project**. Records of other projects do not appear in search or automatic injection.
+
+- **When the project is decided**: when the daemon first processes a session, from the **session start directory** (the `cwd` of the first transcript line that has one). A `cd` during the session does not change it.
+- **Project location**: the git common dir (`.git`) for a git repository, otherwise the directory itself. Sessions opened in a subdirectory and git worktrees belong to the same project as the main checkout.
+- **Moved folders**: for a git repository, if the root commit matches and the old location no longer exists, the project follows it automatically. For a folder without git, use `hippo project adopt` ([4.4](#44-projects)).
+
+```
+~/.hippo/registry.sqlite      registry: projects, locations, root commits, session → project
+~/.hippo/projects/<id>/       one project = the source store and vector store below
+```
+
 ```
 Source store (SQLite, the source of truth)
  ├─ iterations          one row per iteration (+ full-text index)
@@ -81,7 +92,7 @@ This is the "index" in the name: the vector store only points to the records, as
 
 ### 1.4 How memory is used
 
-- **Automatic injection**: on each prompt, the `UserPromptSubmit` hook asks the daemon for memories that match the prompt. The search uses only the **current project** (same `cwd`) and **other sessions**. Only results with a vector similarity at or above the threshold are added to Claude's context. Each item is wrapped in a `<memory>` block, and the header tells Claude that the block is past data, not an instruction.
+- **Automatic injection**: on each prompt, the `UserPromptSubmit` hook asks the daemon for memories that match the prompt. The search uses only the **current project** and **other sessions**. Only results with a vector similarity at or above the threshold are added to Claude's context. Each item is wrapped in a `<memory>` block, and the header tells Claude that the block is past data, not an instruction.
 - **On-demand search**: Claude or you can run `hippo search` and `hippo show` from the shell.
 
 Search is **hybrid**: vector similarity plus SQLite FTS5 keyword search, merged with Reciprocal Rank Fusion (RRF). Keyword search helps with exact identifiers such as `validateToken`.
@@ -107,7 +118,8 @@ Claude / you ──▶ hippo search|show|status|reindex ──Unix socket──�
 | Component | Opened | Closed |
 |-----------|--------|--------|
 | Daemon | Automatically, by the first hook or CLI command that cannot reach it | After `idle_timeout_secs` with no requests (never during a reindex), or when you stop it |
-| SQLite and LanceDB | By the daemon at start | When the daemon exits |
+| SQLite | For each operation | When the operation ends |
+| LanceDB (per project) | When the project is first used | The least recently used project is closed when more than `max_open_projects` (default 8) are open. All are closed when the daemon exits |
 | Embedding model | By Ollama, at the first embedding request (about 1 s) | By Ollama, `keep_alive` (30 minutes) after the last request |
 | Ollama server | Automatically, by the daemon when an embedding request cannot reach it (`ollama serve`, logs in `logs/ollama.log`). Skipped if Ollama is already running, for example as a service | Not stopped by `hippo`, because other tools may use the same server. The model memory is freed after `keep_alive` |
 
@@ -238,27 +250,28 @@ After installation, capture and injection run automatically. You can also use th
 ### 4.1 Search
 
 ```bash
-hippo search "token expiry bug"                         # current directory's project, iterations
+hippo search "token expiry bug"                         # iterations of the current directory's project
 hippo search "validateToken" --scope all --kind both    # all projects, iterations and results
-hippo search "deploy" --scope ~/work/my-app --limit 5
+hippo search "deploy" --scope ~/work/my-app --limit 5    # the project that contains this path
 ```
 
 | Option | Values | Default |
 |--------|--------|---------|
-| `--scope` | `cwd`, `all`, or a project path | `cwd` |
+| `--scope` | `project` (the current directory's project), `all`, or a path | `project` |
 | `--kind` | `iteration`, `result`, `both` | `iteration` |
 | `--limit` | number | `10` |
 
-Each hit shows the RRF score, the vector similarity (`sim=-` means a keyword-only hit), the `prompt_id`, and a preview. For a result hit, the output lists the prompts that produced it.
+Each hit shows the RRF score, the vector similarity (`sim=-` means a keyword-only hit), the `prompt_id`, and a preview. For a result hit, the output lists the prompts that produced it. `--scope all` searches each project, merges the lists with RRF, and labels each hit with `project=<id>`. If the current directory belongs to no project, the output is "프로젝트 없음" (no project).
 
 ### 4.2 Show a whole turn
 
 ```bash
 hippo show <prompt_id>                  # all iterations of that prompt, in order
 hippo show <prompt_id> --with-results   # also print the full tool outputs
+hippo show <prompt_id> --scope project  # look only in the current project
 ```
 
-The output includes the completion records of background tasks.
+Without `--scope`, `show` looks in the current project first, then in the other projects, most recently used first. The output includes the completion records of background tasks.
 
 ### 4.3 Status
 
@@ -267,19 +280,33 @@ hippo status
 ```
 
 ```
-iterations: 1520
-results: 980
-embed_jobs: 0          # iterations/results still waiting for embedding
-spool_pending: 0       # requests captured while the daemon was down
-vectors: 2610
+spool_pending: 0                  # requests captured while the daemon was down
 embed_model: qwen3-embedding:0.6b
-compatibility: compatible   # empty | compatible | mismatch
-reindex: idle               # idle | running | done | failed: <reason>
+reindex: idle                     # idle | running | done | failed: <project id>: <reason>
+projects: 2
+[3f9c…] /Users/me/work/app/.git
+  iterations: 1520  results: 980  embed_jobs: 0  vectors: 2610  compatibility: compatible
+[a71d…] /Users/me/notes  (위치 없음)
+  iterations: 40  results: 12  embed_jobs: 0  vectors: 52  compatibility: compatible
 ```
 
-If a reindex is needed, `status` tells you.
+`embed_jobs` counts iterations and results still waiting for embedding. `compatibility` is `empty`, `compatible`, or `mismatch`. `(위치 없음)` means the location no longer exists. If a project needs a reindex, `status` tells you.
 
-### 4.4 Let Claude use the memory
+### 4.4 Projects
+
+```bash
+hippo project list                      # id, kind (git/dir), location, iterations, last activity
+hippo project adopt <id or old path>    # bring an old project's records into the current directory's project
+```
+
+Use `adopt` after you move a folder that is not a git repository. Run it in the moved folder:
+
+- If the current folder has no project yet, the old project's location changes to the current folder. The data stays as it is.
+- If the current folder already has a project (you opened a session after the move), the old project's records are merged into it and the old project is deleted. If the embedding model is the same, the vectors are copied. Otherwise they are embedded again.
+
+In both cases the old location is not kept, so later sessions are stored in the current folder's project without any extra mapping. Git repositories follow their root commit automatically, so they rarely need `adopt`.
+
+### 4.5 Let Claude use the memory
 
 Automatic injection gives Claude only the best few matches. For more, Claude can call the CLI. Add a line like this to your `CLAUDE.md`:
 
@@ -306,7 +333,7 @@ ollama_command = "ollama"          # path of the ollama executable
 
 [vector]
 backend = "lancedb"                # lancedb | memory (test only)
-name = "default"                   # directory: vectors/<name>/
+name = "default"                   # directory: projects/<id>/vectors/<name>/
 
 [chunking]
 max_tokens = 8000                  # chunk limit = min(model limit, this) × chars_per_token
@@ -329,6 +356,10 @@ job_batch = 64
 [daemon]
 autostart = true                   # hooks and CLI start the daemon when it is not running
 idle_timeout_secs = 1800           # stop after this many seconds without requests (0 = never)
+max_open_projects = 8              # project vector stores kept open at the same time
+
+[project]
+git_timeout_ms = 1000              # time limit for git; if exceeded, the folder is treated as non-git
 
 [[redact.patterns]]                # extra secret patterns (regex)
 kind = "internal"
@@ -346,13 +377,16 @@ The vector store is a derived index, so you can switch at any time:
 ```
 1. Edit config.toml (for example, a new model, dimension, or backend)
 2. Restart the daemon       → status shows "mismatch". Keyword search still works.
-3. hippo reindex             → rebuilds everything in the background into a new generation
-4. When it finishes         → the ACTIVE pointer switches atomically. Old generations are removed at the next start.
+3. hippo reindex             → rebuilds every project, one after another, in the background into a new generation
+4. When it finishes         → each project's ACTIVE pointer switches atomically. Old generations are removed when that project is next opened.
 ```
+
+To reindex one project only, use `hippo reindex --scope project` (the current directory's project) or `hippo reindex --scope <path>`.
 
 - During a reindex, search uses the old store. New iterations wait in the queue and go into the new store after the switch, so nothing is lost.
 - A second `hippo reindex` while one is running is refused.
-- Vector directories: `vectors/<name>/<generation>/`. `vectors/<name>/ACTIVE` names the active generation.
+- If one project fails, the reindex continues with the next one. Failed projects appear in `status` as `reindex: failed: …`.
+- Vector directories: `projects/<id>/vectors/<name>/<generation>/`. `projects/<id>/vectors/<name>/ACTIVE` names the active generation.
 
 To add a completely new backend, see [9.4](#94-adding-a-new-backend).
 
@@ -363,9 +397,11 @@ To add a completely new backend, see [9.4](#94-adding-a-new-backend).
 ```
 ~/.hippo/            (0700)
 ├─ config.toml
-├─ records.sqlite             (0600) source of truth
-├─ vectors/<name>/ACTIVE
-├─ vectors/<name>/<generation>/   LanceDB files
+├─ registry.sqlite            (0600) registry: projects, locations, root commits, session → project
+├─ projects/<id>/             (0700) one project
+│  ├─ records.sqlite          (0600) source of truth
+│  ├─ vectors/<name>/ACTIVE
+│  └─ vectors/<name>/<generation>/   LanceDB files
 ├─ spool/                     requests captured while the daemon was down
 ├─ logs/hippo.log             daemon errors
 ├─ logs/daemon.err            startup errors of an auto-started daemon
@@ -412,7 +448,9 @@ Security measures:
 | `bg.rs` | Background start detection, `<task-notification>` parsing, subagent report extraction |
 | `redact.rs` | Secret redaction |
 | `embed_text.rs` | Text to embed (`[입력]`/`[툴]`/`[응답]` lines), chunking |
-| `store.rs` | SQLite source store, deduplication, FTS5 |
+| `store.rs` | SQLite source store, deduplication, FTS5, project merge |
+| `project.rs` | path normalization, git information, project location |
+| `registry.rs` | registry: project resolution, session binding, relocation, absorption |
 | `embedder.rs`, `vector.rs` | `Embedder` and `VectorStore` traits |
 | `ollama.rs`, `lance.rs` | Real backends |
 | `testing.rs` | `HashEmbedder`, `MemoryVectorStore` (deterministic test backends) |
@@ -457,4 +495,7 @@ Ingest, search, and the daemon do not change.
 - Hooks always use the default data root (`~/.hippo`). `--root` is not written into hook commands.
 - When the daemon stops with a signal, the socket file stays. It is removed at the next start.
 - There is no retention policy yet. Memory grows until you delete it.
+- Results (tool outputs) are deduplicated only within a project. The same output in two projects is stored twice.
+- A moved folder without git is not followed automatically. Use `hippo project adopt`.
+- Data in the single-store layout of v0.1 (`~/.hippo/records.sqlite`) is not migrated to the new layout.
 - macOS only for now.

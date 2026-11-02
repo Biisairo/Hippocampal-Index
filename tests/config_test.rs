@@ -110,12 +110,34 @@ fn load_reads_file() {
 #[test]
 fn paths_layout() {
     let p = Paths::new(PathBuf::from("/r"));
-    assert_eq!(p.records(), PathBuf::from("/r/records.sqlite"));
-    assert_eq!(p.vectors("default"), PathBuf::from("/r/vectors/default"));
+    assert_eq!(p.registry(), PathBuf::from("/r/registry.sqlite"));
+    assert_eq!(p.projects(), PathBuf::from("/r/projects"));
+    assert_eq!(p.project_dir("abc"), PathBuf::from("/r/projects/abc"));
+    assert_eq!(
+        p.project_records("abc"),
+        PathBuf::from("/r/projects/abc/records.sqlite")
+    );
+    assert_eq!(
+        p.project_vectors("abc", "default"),
+        PathBuf::from("/r/projects/abc/vectors/default")
+    );
     assert_eq!(p.spool(), PathBuf::from("/r/spool"));
     assert_eq!(p.logs(), PathBuf::from("/r/logs"));
     assert_eq!(p.config(), PathBuf::from("/r/config.toml"));
     assert_eq!(p.socket(), PathBuf::from("/r/hippo.sock"));
     assert_eq!(p.lock(), PathBuf::from("/r/hippo.lock"));
     assert!(Paths::default_root().unwrap().ends_with(".hippo"));
+}
+
+#[test]
+fn project_and_daemon_defaults() {
+    let c = Config::default();
+    assert_eq!(c.daemon.max_open_projects, 8);
+    assert_eq!(c.project.git_timeout_ms, 1_000);
+    let c =
+        Config::parse("[daemon]\nmax_open_projects = 2\n[project]\ngit_timeout_ms = 50\n").unwrap();
+    assert_eq!(
+        (c.daemon.max_open_projects, c.project.git_timeout_ms),
+        (2, 50)
+    );
 }

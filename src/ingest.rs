@@ -146,6 +146,18 @@ pub fn ingest(
     Ok(report)
 }
 
+/// 세션 시작 경로: 개행으로 끝난 라인 중 `cwd` 필드를 가진 첫 라인의 값. (FR-PRJ-1)
+pub fn session_start_cwd(bytes: &[u8]) -> Option<String> {
+    let end = bytes.iter().rposition(|b| *b == b'\n')?;
+    bytes[..end].split(|b| *b == b'\n').find_map(|raw| {
+        serde_json::from_slice::<serde_json::Value>(raw)
+            .ok()?
+            .get("cwd")?
+            .as_str()
+            .map(str::to_string)
+    })
+}
+
 /// 개행으로 끝난 라인까지만 읽는다. 기록 중인 마지막 라인은 다음 처리로 미룬다.
 fn read_events(
     extractor: &mut Extractor,

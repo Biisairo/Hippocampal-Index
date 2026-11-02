@@ -5,10 +5,11 @@ use std::time::{Duration, Instant};
 use common::*;
 use hippo::bg::TaskNotification;
 use hippo::embed_text::build_embed_text;
+use hippo::embedder::{EmbedError, Embedder};
 use hippo::indexer::{ChunkConfig, process_embed_jobs};
 use hippo::search::{
-    InjectConfig, SearchError, SearchKind, SearchRequest, VectorBackends, build_injection, fuse,
-    render_hits, render_turn, search,
+    InjectConfig, ProjectSearch, SearchError, SearchKind, SearchRequest, VectorBackends,
+    build_injection, fuse, render_hits, render_project_hits, render_turn, search, search_projects,
 };
 use hippo::store::{Batch, FtsFilter, NewCompletion, NewIteration, RecordKind, RecordStore};
 use hippo::testing::{HashEmbedder, MemoryVectorStore};
@@ -331,13 +332,12 @@ fn result_in_scope_checks_links() {
 // ---- FR-RET-1, 3, 4, 5 ----
 
 #[test]
-fn injection_includes_only_relevant_items_from_this_project_and_other_sessions() {
+fn injection_includes_relevant_items_from_other_sessions_of_this_store() {
     let env = Env::standard();
     let text = build_injection(
         &env.records,
         env.backends(),
         RELEVANT,
-        "/proj/a",
         "s-cur",
         CONFIG,
         far_deadline(),
@@ -346,7 +346,10 @@ fn injection_includes_only_relevant_items_from_this_project_and_other_sessions()
     .unwrap();
     assert!(text.contains("p-m1"));
     assert!(text.contains("hippo show"));
-    assert!(!text.contains("p-m3"), "다른 프로젝트");
+    assert!(
+        text.contains("p-m3"),
+        "같은 저장소(프로젝트)면 cwd가 달라도 대상이다"
+    );
     assert!(!text.contains("p-m4"), "현재 세션");
     assert!(!text.contains("p-m2"), "임계값 미만");
     assert!(text.chars().count() <= CONFIG.total_chars);
@@ -360,7 +363,6 @@ fn injection_none_when_nothing_passes_threshold() {
             &env.records,
             env.backends(),
             "전혀 무관한 질의 문장",
-            "/proj/a",
             "s-cur",
             CONFIG,
             far_deadline()
@@ -383,7 +385,6 @@ fn injection_respects_top_k_and_lengths() {
         &env.records,
         env.backends(),
         RELEVANT,
-        "/proj/a",
         "s-cur",
         InjectConfig { top_k: 1, ..CONFIG },
         far_deadline(),
@@ -396,7 +397,6 @@ fn injection_respects_top_k_and_lengths() {
         &env.records,
         env.backends(),
         RELEVANT,
-        "/proj/a",
         "s-cur",
         InjectConfig {
             per_item_chars: 10,
@@ -417,7 +417,6 @@ fn injection_respects_top_k_and_lengths() {
         &env.records,
         env.backends(),
         RELEVANT,
-        "/proj/a",
         "s-cur",
         tight,
         far_deadline(),
@@ -434,7 +433,6 @@ fn injection_skipped_without_backends_empty_prompt_or_deadline() {
             &env.records,
             None,
             RELEVANT,
-            "/proj/a",
             "s-cur",
             CONFIG,
             far_deadline()
@@ -447,7 +445,6 @@ fn injection_skipped_without_backends_empty_prompt_or_deadline() {
             &env.records,
             env.backends(),
             "   ",
-            "/proj/a",
             "s-cur",
             CONFIG,
             far_deadline()
@@ -461,7 +458,6 @@ fn injection_skipped_without_backends_empty_prompt_or_deadline() {
             &env.records,
             env.backends(),
             RELEVANT,
-            "/proj/a",
             "s-cur",
             CONFIG,
             past
@@ -591,7 +587,6 @@ fn injection_wraps_items_as_untrusted_memory() {
         &env.records,
         env.backends(),
         RELEVANT,
-        "/proj/a",
         "s-cur",
         CONFIG,
         far_deadline(),
@@ -634,7 +629,6 @@ fn rendered_output_escapes_control_characters() {
         &env.records,
         env.backends(),
         "[입력] 질문 [응답] 정상 빨강 끝",
-        "/w",
         "other",
         CONFIG,
         far_deadline(),
@@ -645,4 +639,122 @@ fn rendered_output_escapes_control_characters() {
         assert!(!out.contains('\u{1b}') && !out.contains('\u{7}'), "{out:?}");
         assert!(out.contains("\\u{1b}"));
     }
+}
+
+// ---- FR-RET-9 ----
+
+struct FailingEmbedder;
+
+impl Embedder for FailingEmbedder {
+    fn model_id(&self) -> &str {
+        "test-hash-256"
+    }
+    fn dimension(&self) -> usize {
+        256
+    }
+    fn max_input_tokens(&self) -> usize {
+        8_000
+    }
+    fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        Err(EmbedError::InvalidResponse("down".into()))
+    }
+}
+
+fn two_projects() -> (Env, Env) {
+    let a = Env::new(
+        vec![
+            it("s1", "m1", "/a", RELEVANT, None),
+            it("s1", "m2", "/a", "날씨 이야기 산책 커피", None),
+        ],
+        HashEmbedder::new(256, 8_000),
+    );
+    let b = Env::new(
+        vec![it("s2", "m3", "/b", RELEVANT, None)],
+        HashEmbedder::new(256, 8_000),
+    );
+    (a, b)
+}
+
+#[test]
+fn all_scope_fuses_project_lists_and_labels_hits() {
+    let (a, b) = two_projects();
+    let projects = [
+        ProjectSearch {
+            id: "pa",
+            records: &a.records,
+            backends: a.backends(),
+        },
+        ProjectSearch {
+            id: "pb",
+            records: &b.records,
+            backends: b.backends(),
+        },
+    ];
+    let out = search_projects(
+        &projects,
+        &req(RELEVANT, SearchKind::Iteration, None, None, 2),
+    )
+    .unwrap();
+    let mut got: Vec<(String, String)> = out
+        .hits
+        .iter()
+        .map(|h| (h.project.clone(), h.hit.id.clone()))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        [
+            ("pa".to_string(), "s1:m1".to_string()),
+            ("pb".to_string(), "s2:m3".to_string())
+        ]
+    );
+    assert!(out.fallbacks.is_empty());
+    let text = render_project_hits(&projects, &out).unwrap();
+    assert!(text.contains("project=pa"), "{text}");
+    assert!(text.contains("project=pb"), "{text}");
+    assert!(!text.contains("벡터 검색을 쓰지 못해"), "{text}");
+}
+
+#[test]
+fn all_scope_falls_back_to_keywords_per_project() {
+    let (a, b) = two_projects();
+    let failing = FailingEmbedder;
+    let projects = [
+        ProjectSearch {
+            id: "pa",
+            records: &a.records,
+            backends: a.backends(),
+        },
+        ProjectSearch {
+            id: "pb",
+            records: &b.records,
+            backends: Some(VectorBackends {
+                embedder: &failing,
+                vectors: &b.vectors,
+            }),
+        },
+    ];
+    let out = search_projects(
+        &projects,
+        &req("validateToken", SearchKind::Iteration, None, None, 10),
+    )
+    .unwrap();
+    assert_eq!(out.fallbacks.len(), 1);
+    assert_eq!(out.fallbacks[0].0, "pb");
+    assert!(
+        out.hits
+            .iter()
+            .any(|h| h.project == "pb" && h.hit.id == "s2:m3")
+    );
+    assert!(out.hits.iter().any(|h| h.project == "pa"));
+    let text = render_project_hits(&projects, &out).unwrap();
+    assert!(text.lines().next().unwrap().contains("pb"), "{text}");
+    assert!(text.contains("벡터 검색을 쓰지 못해"), "{text}");
+}
+
+#[test]
+fn all_scope_without_projects_reports_no_results() {
+    let out = search_projects(&[], &req(RELEVANT, SearchKind::Iteration, None, None, 5)).unwrap();
+    assert!(out.hits.is_empty());
+    assert_eq!(render_project_hits(&[], &out).unwrap(), "결과 없음\n");
 }

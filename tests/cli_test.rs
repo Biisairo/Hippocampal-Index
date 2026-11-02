@@ -9,7 +9,12 @@ use serde_json::Value;
 const BIN: &str = env!("CARGO_BIN_EXE_hippo");
 
 fn hippo(root: &Path, args: &[&str], stdin: &str) -> Output {
+    hippo_in(root, Path::new("/"), args, stdin)
+}
+
+fn hippo_in(root: &Path, cwd: &Path, args: &[&str], stdin: &str) -> Output {
     let mut child = Command::new(BIN)
+        .current_dir(cwd)
         .arg("--root")
         .arg(root)
         .args(args)
@@ -135,7 +140,7 @@ fn daemon_serves_status_search_show() {
         String::from_utf8_lossy(&status.stderr)
     );
     let text = String::from_utf8(status.stdout).unwrap();
-    assert!(text.contains("iterations: 0"), "{text}");
+    assert!(text.contains("projects: 0"), "{text}");
     assert!(text.contains("test-hash-64"));
 
     let search = hippo(
@@ -343,5 +348,88 @@ fn cli_autostarts_daemon_which_exits_when_idle() {
             Duration::from_secs(15)
         ),
         "유휴 종료"
+    );
+}
+
+fn stdout(out: &Output) -> String {
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout.clone()).unwrap()
+}
+
+#[test]
+fn project_commands_and_scopes_use_current_directory() {
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let root = dir.path().join("root");
+    let work = fs::canonicalize(dir.path()).unwrap().join("work");
+    fs::create_dir_all(work.join("sub")).unwrap();
+    let _daemon = spawn_daemon(&root);
+
+    let fixture = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/s2_tools.jsonl"),
+    )
+    .unwrap();
+    let body: String = fixture
+        .lines()
+        .map(|l| {
+            let mut v: Value = serde_json::from_str(l).unwrap();
+            if v.get("cwd").is_some() {
+                v["cwd"] = Value::String(work.to_string_lossy().into_owned());
+            }
+            format!("{v}\n")
+        })
+        .collect();
+    let transcript = dir.path().join("s.jsonl");
+    fs::write(&transcript, body).unwrap();
+    let input = serde_json::json!({"session_id": "afd070e6-4625-4b31-8c43-f1f553949222", "transcript_path": transcript, "cwd": work}).to_string();
+    assert!(hippo(&root, &["hook", "stop"], &input).status.success());
+
+    let list = stdout(&hippo(&root, &["project", "list"], ""));
+    assert!(list.contains(&*work.to_string_lossy()), "{list}");
+
+    let here = stdout(&hippo_in(&root, &work, &["search", "병렬로"], ""));
+    assert!(
+        here.contains("[iteration]"),
+        "기본 범위는 현재 프로젝트: {here}"
+    );
+    let relative = stdout(&hippo_in(
+        &root,
+        &work.join("sub"),
+        &["search", "병렬로", "--scope", ".."],
+        "",
+    ));
+    assert!(
+        relative.contains("[iteration]"),
+        "상대 경로 범위: {relative}"
+    );
+    let elsewhere = stdout(&hippo_in(&root, dir.path(), &["search", "병렬로"], ""));
+    assert!(elsewhere.contains("프로젝트 없음"), "{elsewhere}");
+
+    let shown = stdout(&hippo_in(
+        &root,
+        &work,
+        &[
+            "show",
+            "8f64252a-0037-484d-a451-35aa2c0076ed",
+            "--scope",
+            "project",
+        ],
+        "",
+    ));
+    assert!(shown.contains("[1]"), "{shown}");
+
+    let same = stdout(&hippo_in(&root, &work, &["project", "adopt", "."], ""));
+    assert!(same.contains("변경 없음"), "{same}");
+    let unknown = hippo_in(&root, &work, &["project", "adopt", "/no/such/source"], "");
+    assert_eq!(unknown.status.code(), Some(1));
+
+    assert!(hippo(&root, &["reindex"], "").status.success());
+    let status = stdout(&hippo(&root, &["status"], ""));
+    assert!(
+        status.contains("projects: 1") && status.contains("iterations: 2"),
+        "{status}"
     );
 }

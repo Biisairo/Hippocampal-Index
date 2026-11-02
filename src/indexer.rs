@@ -42,11 +42,22 @@ pub fn process_embed_jobs(
     limit: usize,
 ) -> Result<usize, IndexError> {
     let jobs = records.embed_jobs(limit)?;
+    process_jobs(records, embedder, vectors, chunking, &jobs)
+}
+
+/// 주어진 작업을 차례로 처리한다. 실패하면 그때까지 끝난 작업만 완료 처리하고 오류를 돌려준다. (FR-DMN-6)
+pub fn process_jobs(
+    records: &mut RecordStore,
+    embedder: &dyn Embedder,
+    vectors: &dyn VectorStore,
+    chunking: ChunkConfig,
+    jobs: &[EmbedJob],
+) -> Result<usize, IndexError> {
     let mut done: Vec<EmbedJob> = Vec::new();
     let mut failure = None;
     for job in jobs {
         match index_one(records, embedder, vectors, chunking, job.kind, &job.ref_id) {
-            Ok(()) => done.push(job),
+            Ok(()) => done.push(job.clone()),
             Err(e) => {
                 failure = Some(e);
                 break;
