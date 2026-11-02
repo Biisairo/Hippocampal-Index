@@ -402,8 +402,29 @@ fn status_info(iterations: u64, vectors: u64, compatibility: &str, reindex: &str
             embed_jobs: 0,
             vectors,
             compatibility: compatibility.into(),
+            embed_per_min: None,
         }],
     }
+}
+
+#[test]
+fn status_render_shows_embedding_rate_and_remaining_time() {
+    let mut st = status_info(3, 5, "compatible", "idle");
+    st.projects[0].embed_jobs = 300;
+    assert!(
+        !st.render(Lang::En).contains("/min"),
+        "속도를 모르면 표시하지 않음"
+    );
+    st.projects[0].embed_per_min = Some(120);
+    let en = st.render(Lang::En);
+    assert!(en.contains("120/min") && en.contains("3 min left"), "{en}");
+    let ko = st.render(Lang::Ko);
+    assert!(ko.contains("분당 120") && ko.contains("3분"), "{ko}");
+    st.projects[0].embed_jobs = 0;
+    assert!(
+        !st.render(Lang::En).contains("/min"),
+        "대기 건수가 없으면 표시하지 않음"
+    );
 }
 
 #[test]

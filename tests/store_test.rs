@@ -26,7 +26,7 @@ fn batch_from_fixture(name: &str) -> Batch {
 }
 
 fn new_iteration(it: Iteration) -> NewIteration {
-    let embed_text = build_embed_text(&it, 500);
+    let embed_text = build_embed_text(&it, 500, &[]);
     NewIteration {
         iteration: it,
         embed_text,
@@ -711,4 +711,117 @@ fn merge_copies_background_records() {
     for task in bg {
         assert_eq!(dst.bg_task(&task.tool_use_id).unwrap(), Some(task));
     }
+}
+
+// ---- FR-STO-11 ----
+
+fn hippo_iteration(session: &str, mid: &str) -> NewIteration {
+    let result = |text: &str| {
+        Some(ToolResultData {
+            text: text.into(),
+            is_error: false,
+            structured: None,
+        })
+    };
+    new_iteration(Iteration {
+        session_id: session.into(),
+        prompt_id: Some(format!("p-{session}")),
+        message_id: mid.into(),
+        iteration_index: 0,
+        cwd: "/a".into(),
+        ts: "2026-11-02T00:00:00Z".into(),
+        inputs: vec![],
+        texts: vec![],
+        tool_calls: vec![
+            ToolCall {
+                id: "h1".into(),
+                name: "Bash".into(),
+                input: json!({"command": "/opt/bin/hippo search fork"}),
+                result: result("hippoOutputMarker recalled memory"),
+            },
+            ToolCall {
+                id: "r1".into(),
+                name: "Read".into(),
+                input: json!({"file_path": "a.rs"}),
+                result: result("readOutputMarker file body"),
+            },
+        ],
+    })
+}
+
+#[test]
+fn hippo_call_results_are_stored_but_not_indexed() {
+    let mut store = RecordStore::open_in_memory().unwrap();
+    store
+        .apply(&batch("s1", vec![hippo_iteration("s1", "m1")], vec![]))
+        .unwrap();
+    assert_eq!(store.counts().unwrap().results, 2, "원본에는 둘 다 저장");
+    let fts = |q: &str| {
+        store
+            .search_results_fts(q, &FtsFilter::default(), 10)
+            .unwrap()
+            .len()
+    };
+    assert_eq!(fts("readOutputMarker"), 1);
+    assert_eq!(fts("hippoOutputMarker"), 0, "hippo 결과는 FTS 제외");
+    let jobs: Vec<String> = store
+        .embed_jobs(100)
+        .unwrap()
+        .into_iter()
+        .map(|j| j.ref_id)
+        .collect();
+    let page: Vec<String> = store
+        .result_page(0, 100)
+        .unwrap()
+        .into_iter()
+        .map(|(_, id)| id)
+        .collect();
+    for listed in [&jobs, &page] {
+        assert!(
+            listed.iter().all(|id| store
+                .result(id)
+                .unwrap()
+                .is_none_or(|r| !r.text.contains("hippoOutputMarker"))),
+            "임베딩 작업과 재색인 대상에서 제외: {listed:?}"
+        );
+    }
+    assert_eq!(page.len(), 1);
+    let shown = store.iteration("s1:m1").unwrap().unwrap();
+    assert!(
+        shown.tool_calls[0].result_id.is_some(),
+        "show는 결과를 그대로 연결"
+    );
+}
+
+#[test]
+fn merge_keeps_hippo_call_results_unindexed() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_path = dir.path().join("a.sqlite");
+    RecordStore::open(&src_path)
+        .unwrap()
+        .apply(&batch("s1", vec![hippo_iteration("s1", "m1")], vec![]))
+        .unwrap();
+    let mut dst = RecordStore::open(&dir.path().join("b.sqlite")).unwrap();
+    let report = dst.merge_from(&src_path, true).unwrap();
+    assert_eq!(report.results, 2);
+    assert_eq!(
+        dst.search_results_fts("hippoOutputMarker", &FtsFilter::default(), 10)
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        dst.search_results_fts("readOutputMarker", &FtsFilter::default(), 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(dst.result_page(0, 100).unwrap().len(), 1);
+    let queued_results = dst
+        .embed_jobs(100)
+        .unwrap()
+        .into_iter()
+        .filter(|j| j.kind == RecordKind::Result)
+        .count();
+    assert_eq!(queued_results, 1, "hippo 결과는 임베딩 작업도 만들지 않음");
 }

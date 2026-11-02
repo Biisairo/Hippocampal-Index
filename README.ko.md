@@ -46,6 +46,9 @@
 - **도구 호출**: 호출한 도구의 이름과 입력
 - **응답**: 모델의 텍스트(`thinking`은 저장하지 않음)
 - **결과**: 도구 출력 원문. 따로 저장하며, 내용 해시로 중복을 없앱니다
+- **사용자의 답**: `AskUserQuestion`처럼 사용자에게 묻는 도구는 결과(사용자가 고른 답)도 반복 기록에 `[answer]`로 넣습니다. 그래서 "무엇을 정했는가"가 검색됩니다
+
+`hippo`를 실행한 도구 호출(`hippo search` 등)은 원본에는 저장하지만 검색 색인에는 넣지 않습니다. 기억을 찾던 장면이 다음 검색에 다시 나오지 않게 하기 위해서입니다. `hippo show`로 턴을 볼 때는 그대로 보입니다.
 
 ### 1.2 반복을 수집하는 방법 (hook)
 
@@ -235,9 +238,9 @@ launchd는 데몬이 비정상 종료했을 때만 다시 띄우고, 유휴 종�
 - 다시 실행해도 결과가 같으면 아무것도 바꾸지 않습니다("변경 없음").
 - 심볼릭 링크를 거쳐서는 쓰지 않고, JSON이 깨진 설정 파일은 건드리지 않습니다.
 - 파일은 2칸 들여쓰기 JSON으로 다시 쓰입니다. 키 순서와 값은 유지되지만, 원래 형식은 달라질 수 있습니다. 원본은 백업에 남습니다.
-- Claude가 `hippo search`와 `hippo show`를 쓸 수 있다는 영어 안내 블록을 메모리 파일에 넣습니다. `--scope user`는 `~/.claude/CLAUDE.md`, `--scope project`는 `<프로젝트>/CLAUDE.local.md`(공식 문서가 권장하는 개인용 파일)입니다. 블록은 `<!-- hippo:begin -->`과 `<!-- hippo:end -->` 사이에 있고, 이 표식은 Claude Code가 컨텍스트에 넣기 전에 지우므로 토큰을 쓰지 않습니다. 블록 밖의 내용은 그대로 둡니다. `CLAUDE.local.md`가 git에서 무시되지 않으면 경고만 출력하고, `.gitignore`는 바꾸지 않습니다.
+- Claude가 `hippo search`와 `hippo show`를 쓸 수 있다는 영어 안내 블록을 메모리 파일에 넣습니다. 명령은 설치에 쓴 hippo 실행 파일의 절대 경로로 적으므로 `hippo`가 PATH에 없어도 됩니다. `--scope user`는 `~/.claude/CLAUDE.md`, `--scope project`는 `<프로젝트>/CLAUDE.local.md`(공식 문서가 권장하는 개인용 파일)입니다. 블록은 `<!-- hippo:begin -->`과 `<!-- hippo:end -->` 사이에 있고, 이 표식은 Claude Code가 컨텍스트에 넣기 전에 지우므로 토큰을 쓰지 않습니다. 블록 밖의 내용은 그대로 둡니다. `CLAUDE.local.md`가 git에서 무시되지 않으면 경고만 출력하고, `.gitignore`는 바꾸지 않습니다.
 
-hook 블록만 출력해 직접 넣을 수도 있습니다: `hippo hooks-config`. `uninstall`은 hook 항목과 안내 블록만 지웁니다. 안내 블록만 있던 메모리 파일은 지웁니다.
+hook 블록만 출력해 직접 넣을 수도 있습니다: `hippo hooks-config`. `uninstall`은 hook 항목과 안내 블록만 지웁니다. hippo 내용만 있던 설정 파일과 메모리 파일은 백업 없이 지우고, 그래서 비게 된 `.claude/` 디렉터리도 지웁니다. 다른 내용이 남는 파일은 백업한 뒤 고칩니다.
 
 hook을 등록한 뒤에는 Claude Code 세션을 새로 시작하십시오.
 
@@ -299,15 +302,16 @@ projects: 2
   iterations: 40  results: 12  embed_jobs: 0  vectors: 52  compatibility: compatible
 ```
 
-`embed_jobs`는 임베딩을 기다리는 반복과 결과의 수입니다. `compatibility`는 `empty`, `compatible`, `mismatch` 중 하나입니다. 재색인이 필요한 프로젝트가 있으면 `status`가 알려 줍니다.
+`embed_jobs`는 임베딩을 기다리는 반복과 결과의 수입니다. 최근 5분 동안 처리한 작업이 있으면 `embed_jobs: 601 (분당 120건, 약 6분 남음)`처럼 속도와 남은 예상 시간도 나옵니다. `compatibility`는 `empty`, `compatible`, `mismatch` 중 하나입니다. 재색인이 필요한 프로젝트가 있으면 `status`가 알려 줍니다.
 
 ### 4.4 프로젝트와 과거 기록 가져오기
 
 ```bash
-hippo project list                       # id, 종류(git/dir), 위치, 반복 수, 마지막 활동 시각
+hippo project list                       # id, 종류(git/dir), 위치, 반복 수, 마지막 활동 시각(로컬 시간 YYYY-MM-DD HH:MM:SS)
 hippo import                             # 현재 폴더(하위 폴더와 worktree 포함)의 과거 세션을 현재 프로젝트로
 hippo import --from ~/old/app            # 이전 경로에서 진행한 세션을 현재 폴더의 프로젝트로
 hippo import --from <프로젝트 id> --to ~/work/app
+hippo import --wait                      # 가져온 뒤 임베딩이 끝날 때까지 진행률을 보여 줌
 ```
 
 `import`는 Claude Code가 남긴 과거 transcript(`~/.claude/projects/*/*.jsonl`)를 읽어 `--to` 폴더의 프로젝트에 기록을 추가합니다. 생략한 인자는 현재 폴더입니다. 서브에이전트 transcript는 읽지 않습니다.
@@ -361,7 +365,8 @@ max_tokens = 8000                  # 청크 한도 = min(모델 한도, 이 값)
 chars_per_token = 1.0
 
 [embed_text]
-max_tool_input_chars = 500         # 임베딩 텍스트에서만 도구 입력 JSON을 이 길이로 자름
+max_tool_input_chars = 500         # 임베딩 텍스트에서만 도구 입력 JSON과 [answer]를 이 길이로 자름
+answer_tools = ["AskUserQuestion", "ExitPlanMode"]   # 결과(사용자의 답)를 [answer]로 넣는 도구
 
 [inject]
 threshold = 0.40                   # 자동 주입의 최소 벡터 유사도

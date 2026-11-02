@@ -55,7 +55,7 @@ fn it(session: &str, mid: &str, cwd: &str, response: &str, result: Option<&str>)
             .into_iter()
             .collect(),
     };
-    let embed_text = build_embed_text(&iteration, 500);
+    let embed_text = build_embed_text(&iteration, 500, &[]);
     NewIteration {
         iteration,
         embed_text,
@@ -466,7 +466,7 @@ fn render_turn_lists_iterations_and_results() {
             iterations: its
                 .into_iter()
                 .map(|i| {
-                    let e = build_embed_text(&i, 500);
+                    let e = build_embed_text(&i, 500, &[]);
                     NewIteration {
                         iteration: i,
                         embed_text: e,
@@ -510,7 +510,7 @@ fn render_turn_shows_background_completions() {
             iterations: its
                 .into_iter()
                 .map(|i| {
-                    let e = build_embed_text(&i, 500);
+                    let e = build_embed_text(&i, 500, &[]);
                     NewIteration {
                         iteration: i,
                         embed_text: e,

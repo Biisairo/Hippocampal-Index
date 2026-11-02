@@ -16,7 +16,7 @@ use crate::config::{Config, Paths};
 use crate::embedder::Embedder;
 use crate::fsutil::{ensure_private_dir, open_private_append, set_private_file};
 use crate::generations::{activate, active_dir, cleanup_inactive, new_generation};
-use crate::i18n::Lang;
+use crate::i18n::{Lang, local_time};
 use crate::import::candidates;
 use crate::indexer::{ChunkConfig, Compatibility, compatibility, process_jobs, reindex};
 use crate::ingest::{
@@ -60,6 +60,19 @@ const EMBED_RETRY: Duration = Duration::from_secs(5);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const REINDEX_PAGE: usize = 256;
 const LOG_FILE: &str = "hippo.log";
+/// 처리 속도를 셀 때 보는 시간. (IF-CLI-5)
+const RATE_WINDOW: Duration = Duration::from_secs(300);
+/// 처리를 막 시작했을 때 속도가 부풀지 않게 하는 최소 시간.
+const RATE_MIN_SPAN: Duration = Duration::from_secs(30);
+
+fn prune_rate_window(entries: &mut VecDeque<(Instant, usize)>) {
+    while entries
+        .front()
+        .is_some_and(|(at, _)| at.elapsed() > RATE_WINDOW)
+    {
+        entries.pop_front();
+    }
+}
 const REINDEX_IDLE: &str = "idle";
 const REINDEX_DONE: &str = "done";
 fn no_project(lang: Lang) -> String {
@@ -175,6 +188,8 @@ struct Shared {
     registry: Mutex<Registry>,
     open: Mutex<OpenProjects>,
     queue: Mutex<EmbedQueue>,
+    /// 프로젝트별 최근 임베딩 처리 기록 (완료 시각, 작업 수). (IF-CLI-5)
+    embed_log: Mutex<HashMap<String, VecDeque<(Instant, usize)>>>,
     /// 임베딩 처리와 프로젝트 병합을 서로 막는다. 병합이 지운 프로젝트를 임베딩 스레드가 다시 만들지 않게 한다.
     embed_lock: Mutex<()>,
     write_tx: Sender<WriteJob>,
@@ -324,6 +339,25 @@ impl Shared {
         Config::load(&path).map_or(self.config.ui.language, |c| c.ui.language)
     }
 
+    fn record_embedded(&self, project: &str, jobs: usize) {
+        if let Ok(mut log) = self.embed_log.lock() {
+            let entries = log.entry(project.to_string()).or_default();
+            entries.push_back((Instant::now(), jobs));
+            prune_rate_window(entries);
+        }
+    }
+
+    /// 최근 5분 동안 처리한 작업 수로 구한 분당 속도. 기록이 없으면 `None`. (IF-CLI-5)
+    fn embed_per_min(&self, project: &str) -> Option<u64> {
+        let mut log = self.embed_log.lock().ok()?;
+        let entries = log.get_mut(project)?;
+        prune_rate_window(entries);
+        let first = entries.front()?.0;
+        let jobs: usize = entries.iter().map(|(_, n)| n).sum();
+        let elapsed = first.elapsed().max(RATE_MIN_SPAN).as_secs_f64();
+        Some((jobs as f64 * 60.0 / elapsed).round() as u64)
+    }
+
     fn chunking(&self) -> ChunkConfig {
         ChunkConfig {
             max_tokens: self.config.chunking.max_tokens,
@@ -440,6 +474,7 @@ pub fn start(
             entries: VecDeque::new(),
         }),
         queue: Mutex::new(EmbedQueue::default()),
+        embed_log: Mutex::new(HashMap::new()),
         embed_lock: Mutex::new(()),
         write_tx,
         notify_tx,
@@ -470,9 +505,10 @@ fn spawn_writer(shared: Arc<Shared>, redactor: Redactor, rx: Receiver<WriteJob>)
     thread::spawn(move || {
         let options = IngestOptions {
             max_tool_input_chars: shared.config.embed_text.max_tool_input_chars,
+            answer_tools: shared.config.embed_text.answer_tools.clone(),
         };
         let run = |req: &IngestRequest| -> Response {
-            match ingest_session(&shared, &redactor, options, req) {
+            match ingest_session(&shared, &redactor, &options, req) {
                 Ok(()) => Response::Done,
                 Err(message) => {
                     shared.log(&format!("ingest {} failed: {message}", req.session_id));
@@ -539,7 +575,7 @@ fn spawn_writer(shared: Arc<Shared>, redactor: Redactor, rx: Receiver<WriteJob>)
                     let resp = import_one(
                         &shared,
                         &redactor,
-                        options,
+                        &options,
                         &project_id,
                         &session_id,
                         &transcript_path,
@@ -589,7 +625,7 @@ fn session_project(shared: &Shared, req: &IngestRequest) -> Result<Option<String
 fn ingest_session(
     shared: &Shared,
     redactor: &Redactor,
-    options: IngestOptions,
+    options: &IngestOptions,
     req: &IngestRequest,
 ) -> Result<(), String> {
     let Some(id) = session_project(shared, req)? else {
@@ -722,7 +758,7 @@ fn import_plan(shared: &Shared, from: String, to: String) -> Result<Response, St
 fn import_one(
     shared: &Shared,
     redactor: &Redactor,
-    options: IngestOptions,
+    options: &IngestOptions,
     project_id: &str,
     session_id: &str,
     transcript_path: &Path,
@@ -850,6 +886,7 @@ fn spawn_embed(shared: Arc<Shared>, notify: Receiver<()>) -> JoinHandle<()> {
                 };
                 match embed_batch(&shared, &project, &jobs, &mut next_index_at) {
                     Ok(()) => {
+                        shared.record_embedded(&project, jobs.len());
                         if let Ok(mut q) = shared.queue.lock() {
                             q.remove(&project, &jobs);
                         }
@@ -1265,6 +1302,7 @@ fn status(shared: &Shared) -> Result<StatusInfo, String> {
         };
         projects.push(ProjectStatus {
             exists: Path::new(&row.location).exists(),
+            embed_per_min: shared.embed_per_min(&row.id),
             id: row.id,
             location: row.location,
             iterations: counts.iterations,
@@ -1311,7 +1349,7 @@ fn project_list(shared: &Shared) -> Result<String, String> {
             row.id,
             row.kind.as_str(),
             row.location,
-            row.last_active_at
+            local_time(row.last_active_at)
         ));
     }
     Ok(escape_control(&out))

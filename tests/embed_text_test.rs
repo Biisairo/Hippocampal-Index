@@ -47,7 +47,7 @@ fn full_iteration_format() {
         vec!["확인하겠습니다", "두 번째 문단"],
     );
     assert_eq!(
-        build_embed_text(&it, 500),
+        build_embed_text(&it, 500, &[]),
         "[input] 로그인 버그 고쳐줘\n[tool] Read({\"file_path\":\"auth.ts\"})\n[tool] Grep({\"pattern\":\"token\"})\n[response] 확인하겠습니다\n두 번째 문단"
     );
 }
@@ -55,14 +55,14 @@ fn full_iteration_format() {
 #[test]
 fn empty_sections_are_omitted() {
     let it = iteration(vec![], vec![], vec!["답만 있음"]);
-    assert_eq!(build_embed_text(&it, 500), "[response] 답만 있음");
+    assert_eq!(build_embed_text(&it, 500, &[]), "[response] 답만 있음");
     let tools_only = iteration(vec![], vec![call("Bash", json!({"command": "ls"}))], vec![]);
     assert_eq!(
-        build_embed_text(&tools_only, 500),
+        build_embed_text(&tools_only, 500, &[]),
         "[tool] Bash({\"command\":\"ls\"})"
     );
     assert_eq!(
-        build_embed_text(&iteration(vec![], vec![], vec![]), 500),
+        build_embed_text(&iteration(vec![], vec![], vec![]), 500, &[]),
         ""
     );
 }
@@ -86,7 +86,7 @@ fn notification_and_agent_message_inputs() {
         vec!["24"],
     );
     assert_eq!(
-        build_embed_text(&it, 500),
+        build_embed_text(&it, 500, &[]),
         "[input] completed: npm test completed (exit code 0)\n[input] 보고: 24\n[response] 24"
     );
 }
@@ -99,7 +99,7 @@ fn long_tool_input_is_truncated_in_embed_text_only() {
         vec![call("Write", json!({"content": content}))],
         vec![],
     );
-    let text = build_embed_text(&it, 20);
+    let text = build_embed_text(&it, 20, &[]);
     let json_part = text
         .strip_prefix("[tool] Write(")
         .unwrap()
@@ -170,5 +170,92 @@ fn chunks_are_lossless_and_within_limit() {
         chunks
             .iter()
             .all(|c| !c.is_empty() && c.chars().count() <= limit.get())
+    );
+}
+
+// ---- FR-STO-2 [answer], FR-STO-11 ----
+
+use hippo::embed_text::is_hippo_call;
+use hippo::transcript::ToolResultData;
+
+fn answered(name: &str, input: serde_json::Value, result: &str) -> ToolCall {
+    ToolCall {
+        result: Some(ToolResultData {
+            text: result.into(),
+            is_error: false,
+            structured: None,
+        }),
+        ..call(name, input)
+    }
+}
+
+fn answer_tools() -> Vec<String> {
+    vec!["AskUserQuestion".into(), "ExitPlanMode".into()]
+}
+
+#[test]
+fn user_answer_follows_its_tool_line() {
+    let it = iteration(
+        vec![],
+        vec![
+            answered(
+                "AskUserQuestion",
+                json!({"q": "fork?"}),
+                "User chose: skip copies",
+            ),
+            answered("Read", json!({"file_path": "a.rs"}), "file body"),
+        ],
+        vec![],
+    );
+    assert_eq!(
+        build_embed_text(&it, 500, &answer_tools()),
+        "[tool] AskUserQuestion({\"q\":\"fork?\"})\n[answer] User chose: skip copies\n[tool] Read({\"file_path\":\"a.rs\"})",
+        "응답 도구만 결과를 넣음"
+    );
+    let long = iteration(
+        vec![],
+        vec![answered("AskUserQuestion", json!({}), "0123456789abc")],
+        vec![],
+    );
+    assert_eq!(
+        build_embed_text(&long, 10, &answer_tools()),
+        "[tool] AskUserQuestion({})\n[answer] 0123456789…"
+    );
+    let unanswered = iteration(vec![], vec![call("AskUserQuestion", json!({}))], vec![]);
+    assert_eq!(
+        build_embed_text(&unanswered, 500, &answer_tools()),
+        "[tool] AskUserQuestion({})"
+    );
+}
+
+#[test]
+fn hippo_calls_are_recognized_by_first_word() {
+    let bash = |cmd: &str| call("Bash", json!({"command": cmd}));
+    assert!(is_hippo_call(&bash("/opt/bin/hippo search \"fork\"")));
+    assert!(is_hippo_call(&bash("hippo status")));
+    assert!(is_hippo_call(&bash("  '/a b/hippo' show p1")));
+    assert!(is_hippo_call(&bash("\"/x/hippo\" import --wait")));
+    assert!(!is_hippo_call(&bash("cd /x && hippo status")));
+    assert!(!is_hippo_call(&bash("hippocampus run")));
+    assert!(!is_hippo_call(&call("Read", json!({"file_path": "hippo"}))));
+    assert!(!is_hippo_call(&call("Bash", json!({}))));
+}
+
+#[test]
+fn hippo_calls_are_left_out_of_embed_text() {
+    let hippo = call("Bash", json!({"command": "/opt/bin/hippo search fork"}));
+    let only = iteration(vec![], vec![hippo.clone()], vec![]);
+    assert_eq!(build_embed_text(&only, 500, &[]), "", "색인할 내용 없음");
+    let with_prompt = iteration(
+        vec![IterationInput::Prompt {
+            text: "fork 중복 어떻게 했지".into(),
+        }],
+        vec![hippo, call("Read", json!({"file_path": "a.rs"}))],
+        vec![],
+    );
+    assert_eq!(
+        build_embed_text(&with_prompt, 500, &[]),
+        "[input] fork 중복 어떻게 했지\n[tool] Read({\"file_path\":\"a.rs\"})",
+        "사용자 프롬프트는 남김"
     );
 }

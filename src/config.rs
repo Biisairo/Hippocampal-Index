@@ -52,6 +52,8 @@ pub struct ChunkingConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct EmbedTextConfig {
     pub max_tool_input_chars: usize,
+    /// 결과를 `[answer]`로 임베딩 텍스트에 넣는 사용자 응답 도구. (FR-STO-2)
+    pub answer_tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -271,6 +273,7 @@ impl Default for EmbedTextConfig {
     fn default() -> Self {
         Self {
             max_tool_input_chars: 500,
+            answer_tools: vec!["AskUserQuestion".into(), "ExitPlanMode".into()],
         }
     }
 }

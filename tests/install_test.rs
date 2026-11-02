@@ -302,6 +302,8 @@ fn backup_and_result_are_owner_only_when_new() {
 
 // ---- FR-INS-7, IF-SKL-1: Claude 안내 블록 ----
 
+const EXE: &str = "/opt/hippo bin/hippo";
+
 use hippo::install::{
     GUIDE_BEGIN, GUIDE_END, apply_memory, guide_block, memory_file, remove_block, upsert_block,
     warn_untracked,
@@ -322,10 +324,10 @@ fn memory_files_follow_hook_scope() {
 
 #[test]
 fn guide_block_is_english_and_marked() {
-    let block = guide_block();
+    let block = guide_block(Path::new(EXE));
     assert!(block.starts_with(&format!("{GUIDE_BEGIN}\n")));
     assert!(block.ends_with(&format!("{GUIDE_END}\n")));
-    assert!(block.contains("hippo search") && block.contains("hippo show"));
+    assert!(block.contains("hippo' search") && block.contains("hippo' show"));
     assert!(
         !block.chars().any(|c| ('가'..='힣').contains(&c)),
         "영어 고정 (FR-UI-2)"
@@ -335,20 +337,30 @@ fn guide_block_is_english_and_marked() {
 #[test]
 fn block_is_appended_replaced_and_removed_without_touching_other_text() {
     let original = "# Mine\nkeep this\n";
-    let installed = upsert_block(original).unwrap();
-    assert_eq!(installed, format!("{original}\n{}", guide_block()));
+    let installed = upsert_block(original, &guide_block(Path::new(EXE))).unwrap();
     assert_eq!(
-        upsert_block(&installed).unwrap(),
+        installed,
+        format!("{original}\n{}", guide_block(Path::new(EXE)))
+    );
+    assert_eq!(
+        upsert_block(&installed, &guide_block(Path::new(EXE))).unwrap(),
         installed,
         "다시 넣어도 같음"
     );
     let stale = installed.replace("hippo show", "old text");
-    assert_eq!(upsert_block(&stale).unwrap(), installed, "이전 블록은 교체");
+    assert_eq!(
+        upsert_block(&stale, &guide_block(Path::new(EXE))).unwrap(),
+        installed,
+        "이전 블록은 교체"
+    );
     assert_eq!(remove_block(&installed).unwrap(), original);
 
-    let middle = format!("top\n\n{}\nbottom\n", guide_block());
+    let middle = format!("top\n\n{}\nbottom\n", guide_block(Path::new(EXE)));
     assert_eq!(remove_block(&middle).unwrap(), "top\n\nbottom\n");
-    assert_eq!(upsert_block("").unwrap(), guide_block());
+    assert_eq!(
+        upsert_block("", &guide_block(Path::new(EXE))).unwrap(),
+        guide_block(Path::new(EXE))
+    );
     assert_eq!(remove_block("no block\n").unwrap(), "no block\n");
 }
 
@@ -356,7 +368,7 @@ fn block_is_appended_replaced_and_removed_without_touching_other_text() {
 fn unclosed_block_is_rejected() {
     let broken = format!("a\n{GUIDE_BEGIN}\nhalf\n");
     assert!(matches!(
-        upsert_block(&broken),
+        upsert_block(&broken, &guide_block(Path::new(EXE))),
         Err(InstallError::UnclosedBlock)
     ));
     assert!(matches!(
@@ -366,7 +378,7 @@ fn unclosed_block_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("CLAUDE.md");
     fs::write(&path, &broken).unwrap();
-    assert!(apply_memory(&path, true, false).is_err());
+    assert!(apply_memory(&path, Some(&guide_block(Path::new(EXE))), false).is_err());
     assert_eq!(fs::read_to_string(&path).unwrap(), broken, "수정하지 않음");
 }
 
@@ -374,22 +386,32 @@ fn unclosed_block_is_rejected() {
 fn memory_file_roundtrip_backup_dry_run_and_delete_when_empty() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("CLAUDE.local.md");
-    let dry = apply_memory(&path, true, true).unwrap();
+    let dry = apply_memory(&path, Some(&guide_block(Path::new(EXE))), true).unwrap();
     assert!(dry.changed && !path.exists());
 
-    let created = apply_memory(&path, true, false).unwrap();
+    let created = apply_memory(&path, Some(&guide_block(Path::new(EXE))), false).unwrap();
     assert!(created.changed && created.backup.is_none());
-    assert_eq!(fs::read_to_string(&path).unwrap(), guide_block());
-    assert!(!apply_memory(&path, true, false).unwrap().changed);
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        guide_block(Path::new(EXE))
+    );
+    assert!(
+        !apply_memory(&path, Some(&guide_block(Path::new(EXE))), false)
+            .unwrap()
+            .changed
+    );
 
-    let removed = apply_memory(&path, false, false).unwrap();
-    assert!(removed.changed && removed.backup.is_some());
+    let removed = apply_memory(&path, None, false).unwrap();
+    assert!(
+        removed.changed && removed.backup.is_none(),
+        "지우는 파일은 백업하지 않음"
+    );
     assert!(!path.exists(), "공백만 남으면 파일을 지움");
-    assert!(!apply_memory(&path, false, false).unwrap().changed);
+    assert!(!apply_memory(&path, None, false).unwrap().changed);
 
     fs::write(&path, "mine\n").unwrap();
-    apply_memory(&path, true, false).unwrap();
-    apply_memory(&path, false, false).unwrap();
+    apply_memory(&path, Some(&guide_block(Path::new(EXE))), false).unwrap();
+    apply_memory(&path, None, false).unwrap();
     assert_eq!(fs::read_to_string(&path).unwrap(), "mine\n");
 }
 
@@ -401,7 +423,7 @@ fn symlinked_memory_file_is_refused() {
     let link = dir.path().join("CLAUDE.md");
     std::os::unix::fs::symlink(&real, &link).unwrap();
     assert!(matches!(
-        apply_memory(&link, true, false),
+        apply_memory(&link, Some(&guide_block(Path::new(EXE))), false),
         Err(InstallError::Symlink(_))
     ));
     assert_eq!(fs::read_to_string(&real).unwrap(), "x\n");
@@ -433,4 +455,41 @@ fn warns_when_local_memory_file_is_not_git_ignored() {
     assert!(warn_untracked(&repo));
     fs::write(repo.join(".gitignore"), "CLAUDE.local.md\n").unwrap();
     assert!(!warn_untracked(&repo));
+}
+
+#[test]
+fn guide_block_uses_absolute_quoted_executable_path() {
+    let block = guide_block(Path::new(EXE));
+    assert!(block.contains("`'/opt/hippo bin/hippo' search"), "{block}");
+    assert!(block.contains("`'/opt/hippo bin/hippo' show"), "{block}");
+    let plain = guide_block(Path::new("/usr/local/bin/hippo"));
+    assert!(plain.contains("`/usr/local/bin/hippo search"), "{plain}");
+    let quote = guide_block(Path::new("/it's/hippo"));
+    assert!(quote.contains("`'/it'\\''s/hippo' search"), "{quote}");
+}
+
+// ---- FR-INS-4: 빈 설정 정리 ----
+
+#[test]
+fn uninstall_deletes_settings_left_empty_and_empty_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("p/.claude/settings.local.json");
+    apply(&path, &Action::Install(ours("/a/hippo")), false).unwrap();
+    let out = apply(&path, &Action::Uninstall, false).unwrap();
+    assert!(
+        out.changed && out.backup.is_none(),
+        "지우는 파일은 백업하지 않음"
+    );
+    assert!(!path.exists());
+    assert!(!dir.path().join("p/.claude").exists(), "빈 디렉터리도 지움");
+    assert!(dir.path().join("p").exists(), "그 위 디렉터리는 그대로");
+
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, "{\n  \"model\": \"opus\"\n}\n").unwrap();
+    fs::write(path.with_file_name("other.json"), "{}").unwrap();
+    apply(&path, &Action::Install(ours("/a/hippo")), false).unwrap();
+    let kept = apply(&path, &Action::Uninstall, false).unwrap();
+    assert!(kept.backup.is_some(), "다른 내용이 남는 파일은 백업");
+    let left: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(left, json!({"model": "opus"}));
 }

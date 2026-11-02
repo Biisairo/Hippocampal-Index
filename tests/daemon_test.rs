@@ -168,6 +168,10 @@ fn ingest_embed_search_show_end_to_end() {
     wait_until(|| totals(&status(&e.paths)).1 == 0);
     let st = status(&e.paths);
     assert_eq!(st.projects.len(), 1);
+    assert!(
+        st.projects[0].embed_per_min.is_some_and(|n| n > 0),
+        "최근 처리 속도 (IF-CLI-5)"
+    );
     assert_eq!(st.projects[0].compatibility, "compatible");
     assert_eq!(
         st.projects[0].location,
@@ -1017,6 +1021,17 @@ fn project_list_shows_id_location_and_counts() {
         "{list}"
     );
     assert!(!list.contains("location missing"), "{list}");
+    let stamp = list.split("last_active=").nth(1).unwrap().trim();
+    assert!(
+        stamp.len() == 19
+            && stamp.chars().enumerate().all(|(i, c)| match i {
+                4 | 7 => c == '-',
+                10 => c == ' ',
+                13 | 16 => c == ':',
+                _ => c.is_ascii_digit(),
+            }),
+        "로컬 YYYY-MM-DD HH:MM:SS: {stamp}"
+    );
     fs::remove_dir(&a).unwrap();
     assert!(project_list(&e.paths).contains("location missing"));
     handle.shutdown();
@@ -1466,7 +1481,7 @@ fn marked_iteration(session: &str, marker: &str) -> hippo::store::NewIteration {
         texts: vec![marker.into()],
         tool_calls: vec![],
     };
-    let embed_text = hippo::embed_text::build_embed_text(&iteration, 500);
+    let embed_text = hippo::embed_text::build_embed_text(&iteration, 500, &[]);
     hippo::store::NewIteration {
         iteration,
         embed_text,

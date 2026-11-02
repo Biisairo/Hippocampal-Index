@@ -256,8 +256,11 @@ fn install_and_uninstall_project_scope() {
         .status
         .success()
     );
-    let v: Value = serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
-    assert_eq!(v, serde_json::json!({}));
+    assert!(!target.exists(), "hippo만 있던 설정 파일은 지움 (FR-INS-4)");
+    assert!(
+        !target.parent().unwrap().exists(),
+        "빈 .claude 디렉터리도 지움"
+    );
 }
 
 #[test]
@@ -482,7 +485,11 @@ fn project_commands_and_scopes_use_current_directory() {
             &work.join("sub").to_string_lossy(),
         );
     fs::write(past_dir.join("old-session.jsonl"), past).unwrap();
-    let imported = stdout(&hippo_in(&root, &work, &["import"], ""));
+    let imported = stdout(&hippo_in(&root, &work, &["import", "--wait"], ""));
+    assert!(
+        imported.contains("Embedding complete"),
+        "--wait: {imported}"
+    );
     assert!(
         imported.contains("[1/1] old-sess imported  iterations 2"),
         "{imported}"

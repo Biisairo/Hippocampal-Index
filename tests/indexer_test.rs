@@ -46,7 +46,7 @@ fn iteration(mid: &str, response: &str, result: Option<&str>) -> NewIteration {
             .into_iter()
             .collect(),
     };
-    let embed_text = build_embed_text(&it, 500);
+    let embed_text = build_embed_text(&it, 500, &[]);
     NewIteration {
         iteration: it,
         embed_text,

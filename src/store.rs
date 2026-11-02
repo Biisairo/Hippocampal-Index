@@ -8,6 +8,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::bg::{BackgroundKind, TaskNotification, background_start};
+use crate::embed_text::is_hippo_call;
 use crate::transcript::{ExtractorState, Iteration, IterationInput};
 
 #[derive(Debug, thiserror::Error)]
@@ -170,7 +171,8 @@ CREATE TABLE IF NOT EXISTS iterations (
 CREATE INDEX IF NOT EXISTS iterations_prompt ON iterations(prompt_id, iteration_index);
 CREATE INDEX IF NOT EXISTS iterations_message ON iterations(message_id);
 CREATE TABLE IF NOT EXISTS results (
-    id TEXT PRIMARY KEY, tool_name TEXT NOT NULL, text TEXT NOT NULL, first_seen_ts TEXT NOT NULL
+    id TEXT PRIMARY KEY, tool_name TEXT NOT NULL, text TEXT NOT NULL, first_seen_ts TEXT NOT NULL,
+    indexed INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS iteration_results (
     iteration_id TEXT NOT NULL, tool_use_id TEXT NOT NULL, result_id TEXT NOT NULL,
@@ -488,17 +490,23 @@ impl RecordStore {
 
     /// `rowid > after`인 반복 id를 rowid 순으로 최대 `limit`개 돌려준다. (재색인용)
     pub fn iteration_page(&self, after: i64, limit: usize) -> Result<Vec<(i64, String)>> {
-        self.page("iterations", after, limit)
+        self.page("iterations", "", after, limit)
     }
 
     /// `rowid > after`인 결과 id를 rowid 순으로 최대 `limit`개 돌려준다. (재색인용)
     pub fn result_page(&self, after: i64, limit: usize) -> Result<Vec<(i64, String)>> {
-        self.page("results", after, limit)
+        self.page("results", "AND indexed = 1", after, limit)
     }
 
-    fn page(&self, table: &str, after: i64, limit: usize) -> Result<Vec<(i64, String)>> {
+    fn page(
+        &self,
+        table: &str,
+        extra: &str,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, String)>> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT rowid, id FROM {table} WHERE rowid > ?1 ORDER BY rowid LIMIT ?2"
+            "SELECT rowid, id FROM {table} WHERE rowid > ?1 {extra} ORDER BY rowid LIMIT ?2"
         ))?;
         let rows = stmt.query_map(params![after, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -705,7 +713,14 @@ fn insert_iteration(tx: &Transaction, new: &NewIteration, bulk: bool) -> Result<
     enqueue(tx, RecordKind::Iteration, &id, bulk)?;
     for call in &it.tool_calls {
         if let Some(result) = &call.result
-            && let Some(result_id) = insert_result(tx, &call.name, &result.text, &it.ts, bulk)?
+            && let Some(result_id) = insert_result(
+                tx,
+                &call.name,
+                &result.text,
+                &it.ts,
+                bulk,
+                !is_hippo_call(call),
+            )?
         {
             tx.execute(
                 "INSERT OR IGNORE INTO iteration_results (iteration_id, tool_use_id, result_id) VALUES (?1, ?2, ?3)",
@@ -745,7 +760,7 @@ fn insert_completion(tx: &Transaction, c: &NewCompletion, bulk: bool) -> Result<
         .optional()?;
     let tool_name = kind.as_deref().unwrap_or(UNKNOWN_BG_TOOL);
     let result_id = match &c.result_text {
-        Some(text) => insert_result(tx, tool_name, text, &c.ts, bulk)?,
+        Some(text) => insert_result(tx, tool_name, text, &c.ts, bulk, true)?,
         None => None,
     };
     let seq: u32 = tx.query_row(
@@ -781,6 +796,7 @@ fn insert_result(
     text: &str,
     ts: &str,
     bulk: bool,
+    index: bool,
 ) -> Result<Option<String>> {
     if text.is_empty() {
         return Ok(None);
@@ -790,10 +806,10 @@ fn insert_result(
         .map(|b| format!("{b:02x}"))
         .collect();
     let inserted = tx.execute(
-        "INSERT OR IGNORE INTO results (id, tool_name, text, first_seen_ts) VALUES (?1, ?2, ?3, ?4)",
-        params![id, tool_name, text, ts],
+        "INSERT OR IGNORE INTO results (id, tool_name, text, first_seen_ts, indexed) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![id, tool_name, text, ts, index],
     )?;
-    if inserted > 0 {
+    if inserted > 0 && index {
         tx.execute(
             "INSERT INTO results_fts (rowid, text) VALUES (last_insert_rowid(), ?1)",
             [text],
@@ -818,20 +834,21 @@ fn now_millis() -> i64 {
 }
 
 const ITERATION_COLUMNS: &str = "id, session_id, prompt_id, message_id, iteration_index, cwd, ts, inputs, tool_calls, response_text, embed_text";
-const RESULT_COLUMNS: &str = "id, tool_name, text, first_seen_ts";
+const RESULT_COLUMNS: &str = "id, tool_name, text, first_seen_ts, indexed";
 
 /// `src`로 붙인 원본 저장소의 행을 한 트랜잭션으로 가져온다. FTS 행은 새로 추가한 행에만 만든다.
 fn merge_attached(conn: &mut Connection, enqueue: bool) -> Result<MergeReport> {
     let tx = conn.transaction()?;
     let now = now_millis();
     let mut report = MergeReport::default();
-    for (table, fts, text, kind, columns) in [
+    for (table, fts, text, kind, columns, indexed) in [
         (
             "iterations",
             "iterations_fts",
             "embed_text",
             RecordKind::Iteration,
             ITERATION_COLUMNS,
+            "1",
         ),
         (
             "results",
@@ -839,6 +856,7 @@ fn merge_attached(conn: &mut Connection, enqueue: bool) -> Result<MergeReport> {
             "text",
             RecordKind::Result,
             RESULT_COLUMNS,
+            "indexed = 1",
         ),
     ] {
         tx.execute_batch(&format!(
@@ -846,7 +864,7 @@ fn merge_attached(conn: &mut Connection, enqueue: bool) -> Result<MergeReport> {
              CREATE TEMP TABLE merged (id TEXT PRIMARY KEY);
              INSERT INTO temp.merged SELECT id FROM src.{table} WHERE id NOT IN (SELECT id FROM main.{table});
              INSERT INTO main.{table} ({columns}) SELECT {columns} FROM src.{table} WHERE id IN (SELECT id FROM temp.merged);
-             INSERT INTO main.{fts} (rowid, {text}) SELECT rowid, {text} FROM main.{table} WHERE id IN (SELECT id FROM temp.merged);"
+             INSERT INTO main.{fts} (rowid, {text}) SELECT rowid, {text} FROM main.{table} WHERE id IN (SELECT id FROM temp.merged) AND {indexed};"
         ))?;
         let added: i64 = tx.query_row("SELECT COUNT(*) FROM temp.merged", [], |r| r.get(0))?;
         let added = added.unsigned_abs() as usize;
@@ -856,8 +874,10 @@ fn merge_attached(conn: &mut Connection, enqueue: bool) -> Result<MergeReport> {
         }
         if enqueue {
             report.jobs += tx.execute(
-                "INSERT OR IGNORE INTO main.embed_jobs (kind, ref_id, enqueued_at, bulk)
-                 SELECT ?1, id, ?2, 1 FROM temp.merged",
+                &format!(
+                    "INSERT OR IGNORE INTO main.embed_jobs (kind, ref_id, enqueued_at, bulk)
+                     SELECT ?1, id, ?2, 1 FROM main.{table} WHERE id IN (SELECT id FROM temp.merged) AND {indexed}"
+                ),
                 params![job_kind_str(kind), now],
             )?;
         }

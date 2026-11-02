@@ -13,9 +13,12 @@ use hippo::redact::Redactor;
 use hippo::store::{RecordStore, iteration_id};
 use serde_json::{Value, json};
 
-const OPTS: IngestOptions = IngestOptions {
-    max_tool_input_chars: 500,
-};
+fn opts() -> IngestOptions {
+    IngestOptions {
+        max_tool_input_chars: 500,
+        answer_tools: vec!["AskUserQuestion".into()],
+    }
+}
 
 /// 기존 시나리오는 transcript의 첫 턴을 기준 턴으로 삼는다. (FR-EXT-12)
 fn req(event: HookEvent, session: &str, path: &Path) -> IngestRequest {
@@ -48,7 +51,7 @@ fn run(
     ingest(
         store,
         &Redactor::new(&[]).unwrap(),
-        OPTS,
+        &opts(),
         &req(event, session, path),
     )
     .unwrap()
@@ -170,7 +173,7 @@ fn missing_transcript_is_an_error() {
     let err = ingest(
         &mut store,
         &Redactor::new(&[]).unwrap(),
-        OPTS,
+        &opts(),
         &req(HookEvent::Stop, "s", Path::new("/nonexistent/t.jsonl")),
     )
     .unwrap_err();
@@ -594,7 +597,7 @@ fn live(
     ingest(
         store,
         &Redactor::new(&[]).unwrap(),
-        OPTS,
+        &opts(),
         &IngestRequest {
             event,
             session_id: session.into(),
@@ -606,7 +609,7 @@ fn live(
 }
 
 fn import(store: &mut RecordStore, session: &str, path: &Path) -> ImportReport {
-    import_session(store, &Redactor::new(&[]).unwrap(), OPTS, session, path).unwrap()
+    import_session(store, &Redactor::new(&[]).unwrap(), &opts(), session, path).unwrap()
 }
 
 fn has(store: &RecordStore, session: &str, message: &str) -> bool {
@@ -795,5 +798,34 @@ fn imported_embed_jobs_are_bulk_and_live_jobs_are_not() {
             (iteration_id("A", "m-p1"), true),
             (iteration_id("B", "m-p9"), false)
         ]
+    );
+}
+
+#[test]
+fn user_answer_is_part_of_embed_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let lines = vec![
+        user_line("u1", "p1", json!("결정해 줘")),
+        assistant_line(
+            "a1",
+            "m1",
+            json!([{"type": "tool_use", "id": "tu1", "name": "AskUserQuestion", "input": {"q": "fork?"}}]),
+        ),
+        user_line(
+            "r1",
+            "p1",
+            json!([{"type": "tool_result", "tool_use_id": "tu1", "content": "User answered: skip copies"}]),
+        ),
+        assistant_line("a2", "m2", json!([{"type": "text", "text": "정했습니다"}])),
+    ];
+    let path = write_transcript(dir.path(), "S", &in_session(&lines, "S"));
+    let mut store = RecordStore::open_in_memory().unwrap();
+    live(&mut store, HookEvent::Stop, "S", &path, Some("p1"));
+    let it = store.iteration(&iteration_id("S", "m1")).unwrap().unwrap();
+    assert!(
+        it.embed_text
+            .contains("[answer] User answered: skip copies"),
+        "{}",
+        it.embed_text
     );
 }

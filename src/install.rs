@@ -69,8 +69,9 @@ Records from earlier Claude Code sessions are stored locally by `hippo`. Relevan
 
 When you need more context from earlier work, run these with Bash:
 
-- `hippo search \"<query>\"`: search past iterations of this project. Add `--scope all` for every project, or `--kind result` to search tool outputs.
-- `hippo show <prompt_id>`: show a whole past turn in order. Add `--with-results` to include tool outputs.";
+- `{EXE} search \"<query>\"`: search past iterations of this project. Add `--scope all` for every project, or `--kind result` to search tool outputs.
+- `{EXE} show <prompt_id>`: show a whole past turn in order. Add `--with-results` to include tool outputs.";
+const EXE_PLACEHOLDER: &str = "{EXE}";
 const BACKUP_SUFFIX: &str = "hippo-backup";
 const MAX_BACKUP_ATTEMPTS: u32 = 100;
 #[cfg(unix)]
@@ -97,8 +98,19 @@ pub fn memory_file(scope: &Scope) -> Result<PathBuf, InstallError> {
     })
 }
 
-pub fn guide_block() -> String {
-    format!("{GUIDE_BEGIN}\n{GUIDE_BODY}\n{GUIDE_END}\n")
+/// 안내 블록. 명령은 hippo 실행 파일의 절대 경로로 쓴다. (FR-INS-7)
+pub fn guide_block(exe: &Path) -> String {
+    let body = GUIDE_BODY.replace(EXE_PLACEHOLDER, &shell_quote(&exe.to_string_lossy()));
+    format!("{GUIDE_BEGIN}\n{body}\n{GUIDE_END}\n")
+}
+
+/// 셸에서 그대로 쓸 수 있는 문자만 있으면 그대로, 아니면 작은따옴표로 감싼다.
+fn shell_quote(text: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "/._-+".contains(c);
+    if !text.is_empty() && text.chars().all(safe) {
+        return text.to_string();
+    }
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 /// 표식 줄의 위치 (시작, 끝). 블록이 없으면 `None`. 끝 표식이 없으면 오류.
@@ -123,8 +135,8 @@ fn join_lines(lines: &[&str]) -> String {
 }
 
 /// 블록이 있으면 교체하고, 없으면 빈 줄 하나를 두고 끝에 덧붙인다. (FR-INS-7)
-pub fn upsert_block(text: &str) -> Result<String, InstallError> {
-    let block = guide_block();
+pub fn upsert_block(text: &str, block: &str) -> Result<String, InstallError> {
+    let block = block.to_string();
     let lines: Vec<&str> = text.lines().collect();
     match block_range(&lines)? {
         Some((begin, end)) => {
@@ -160,15 +172,18 @@ pub fn remove_block(text: &str) -> Result<String, InstallError> {
     Ok(join_lines(&next))
 }
 
-/// 메모리 파일에 안내 블록을 넣거나(`install`) 지운다. 공백만 남으면 파일을 지운다. (FR-INS-7)
-pub fn apply_memory(path: &Path, install: bool, dry_run: bool) -> Result<Outcome, InstallError> {
+/// 메모리 파일에 안내 블록을 넣거나(`Some`) 지운다(`None`). 공백만 남으면 파일을 지운다. (FR-INS-7)
+pub fn apply_memory(
+    path: &Path,
+    block: Option<&str>,
+    dry_run: bool,
+) -> Result<Outcome, InstallError> {
     reject_symlinks(path)?;
     let existing = read_existing(path)?;
     let current = existing.clone().unwrap_or_default();
-    let next = if install {
-        upsert_block(&current)?
-    } else {
-        remove_block(&current)?
+    let next = match block {
+        Some(block) => upsert_block(&current, block)?,
+        None => remove_block(&current)?,
     };
     if existing.is_none() && next.trim().is_empty() || next == current {
         return Ok(Outcome {
@@ -322,6 +337,14 @@ pub fn apply(path: &Path, action: &Action, dry_run: bool) -> Result<Outcome, Ins
         });
     }
     let before = existing.as_ref().map(|_| render(&current));
+    let emptied = next.as_object().is_some_and(Map::is_empty) && existing.is_some();
+    if matches!(action, Action::Uninstall) && emptied {
+        let outcome = write_change(path, before.as_deref(), None, dry_run)?;
+        if !dry_run && let Some(dir) = path.parent() {
+            let _ = fs::remove_dir(dir);
+        }
+        return Ok(outcome);
+    }
     write_change(path, before.as_deref(), Some(&render(&next)), dry_run)
 }
 
@@ -333,7 +356,7 @@ fn read_existing(path: &Path) -> Result<Option<String>, InstallError> {
     }
 }
 
-/// 백업 후 임시 파일에 써서 원자적으로 바꾼다. `after`가 `None`이면 파일을 지운다. (FR-INS-5)
+/// 백업 후 임시 파일에 써서 원자적으로 바꾼다. `after`가 `None`이면 백업 없이 파일을 지운다. (FR-INS-4, 5, 7)
 /// `before`는 diff에 쓰는 기존 내용이며, 백업은 디스크의 원래 내용으로 만든다.
 fn write_change(
     path: &Path,
@@ -360,7 +383,7 @@ fn write_change(
         .unwrap_or(Path::new("."));
     fs::create_dir_all(dir)?;
     reject_symlinks(path)?;
-    let backup = match read_existing(path)? {
+    let backup = match read_existing(path)?.filter(|_| after.is_some()) {
         Some(original) => {
             let secs = SystemTime::now()
                 .duration_since(UNIX_EPOCH)

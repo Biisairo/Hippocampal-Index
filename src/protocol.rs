@@ -82,6 +82,8 @@ pub struct ProjectStatus {
     pub vectors: u64,
     /// `empty`, `compatible`, `mismatch`
     pub compatibility: String,
+    /// 최근 5분 동안의 임베딩 처리 속도(분당 작업 수). 처리한 작업이 없으면 없다. (IF-CLI-5)
+    pub embed_per_min: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,8 +134,15 @@ impl StatusInfo {
                 missing_location(lang)
             };
             out.push_str(&format!(
-                "[{}] {}{missing}\n  iterations: {}  results: {}  embed_jobs: {}  vectors: {}  compatibility: {}\n",
-                p.id, p.location, p.iterations, p.results, p.embed_jobs, p.vectors, p.compatibility
+                "[{}] {}{missing}\n  iterations: {}  results: {}  embed_jobs: {}{}  vectors: {}  compatibility: {}\n",
+                p.id,
+                p.location,
+                p.iterations,
+                p.results,
+                p.embed_jobs,
+                embed_progress(p.embed_jobs, p.embed_per_min, lang),
+                p.vectors,
+                p.compatibility
             ));
         }
         if self.reindex == REINDEX_RUNNING {
@@ -165,6 +174,19 @@ impl StatusInfo {
 }
 
 pub const COMPAT_MISMATCH: &str = "mismatch";
+/// 대기 건수 뒤에 붙이는 속도와 남은 예상 시간. 대기 건수나 속도가 없으면 빈 문자열. (IF-CLI-5)
+pub fn embed_progress(pending: u64, per_min: Option<u64>, lang: Lang) -> String {
+    let Some(rate) = per_min.filter(|r| *r > 0 && pending > 0) else {
+        return String::new();
+    };
+    let minutes = pending.div_ceil(rate);
+    tr!(
+        lang,
+        " ({rate}/min, about {minutes} min left)",
+        " (분당 {rate}건, 약 {minutes}분 남음)"
+    )
+}
+
 /// 위치가 사라진 프로젝트 표시. (IF-CLI-5, FR-PRJ-6)
 pub fn missing_location(lang: Lang) -> String {
     tr!(lang, "  (location missing)", "  (위치 없음)")

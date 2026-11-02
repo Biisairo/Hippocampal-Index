@@ -46,6 +46,9 @@ Your prompt
 - **Tool calls**: the name and input of each tool call
 - **Response**: the model's text (`thinking` blocks are not stored)
 - **Results**: the full tool output, stored separately and deduplicated by content hash
+- **User answers**: for tools that ask you something, such as `AskUserQuestion`, the result (your answer) is also added to the iteration record as `[answer]`. So "what did we decide" can be found
+
+Tool calls that run `hippo` (`hippo search` and so on) are stored, but they are kept out of the search index. This stops past lookups from coming back in the next search. `hippo show` still shows them in the turn.
 
 ### 1.2 How iterations are captured (hooks)
 
@@ -235,9 +238,9 @@ What `install` does:
 - If you run it again, nothing changes ("No change").
 - It refuses to write through a symbolic link, and it does not touch a settings file that is not valid JSON.
 - The file is rewritten as 2-space-indented JSON. Key order and values are kept, but the original formatting may change. The backup keeps the original.
-- It adds an English guide block to a memory file, so Claude knows it can run `hippo search` and `hippo show`. `--scope user` uses `~/.claude/CLAUDE.md`, and `--scope project` uses `<project>/CLAUDE.local.md` (the personal file the official docs recommend). The block sits between `<!-- hippo:begin -->` and `<!-- hippo:end -->`. Claude Code strips these markers before they reach the context, so they cost no tokens. Text outside the block is kept. If `CLAUDE.local.md` is not ignored by git, it prints a warning but does not change `.gitignore`.
+- It adds an English guide block to a memory file, so Claude knows it can run `hippo search` and `hippo show`. The commands use the absolute path of the hippo executable you installed with, so `hippo` does not need to be on your PATH. `--scope user` uses `~/.claude/CLAUDE.md`, and `--scope project` uses `<project>/CLAUDE.local.md` (the personal file the official docs recommend). The block sits between `<!-- hippo:begin -->` and `<!-- hippo:end -->`. Claude Code strips these markers before they reach the context, so they cost no tokens. Text outside the block is kept. If `CLAUDE.local.md` is not ignored by git, it prints a warning but does not change `.gitignore`.
 
-You can also print the hook block and add it by hand: `hippo hooks-config`. `uninstall` removes only the hook entries and the guide block. A memory file that held only the guide block is deleted.
+You can also print the hook block and add it by hand: `hippo hooks-config`. `uninstall` removes only the hook entries and the guide block. A settings file or memory file that held only hippo content is deleted without a backup, and a `.claude/` directory left empty by that is removed. A file that keeps other content is backed up before it is changed.
 
 Start a new Claude Code session after you install the hooks.
 
@@ -299,15 +302,16 @@ projects: 2
   iterations: 40  results: 12  embed_jobs: 0  vectors: 52  compatibility: compatible
 ```
 
-`embed_jobs` counts iterations and results still waiting for embedding. `compatibility` is `empty`, `compatible`, or `mismatch`. `(location missing)` means the location no longer exists. If a project needs a reindex, `status` tells you.
+`embed_jobs` counts iterations and results still waiting for embedding. If jobs were processed in the last 5 minutes, the rate and the estimated time left are shown too, for example `embed_jobs: 601 (120/min, about 6 min left)`. `compatibility` is `empty`, `compatible`, or `mismatch`. `(location missing)` means the location no longer exists. If a project needs a reindex, `status` tells you.
 
 ### 4.4 Projects and importing past records
 
 ```bash
-hippo project list                       # id, kind (git/dir), location, iterations, last activity
+hippo project list                       # id, kind (git/dir), location, iterations, last activity (local time YYYY-MM-DD HH:MM:SS)
 hippo import                             # past sessions of the current folder (subfolders and worktrees too) into the current project
 hippo import --from ~/old/app            # sessions you ran at an old path into the current folder's project
 hippo import --from <project id> --to ~/work/app
+hippo import --wait                      # after importing, show progress until embedding is done
 ```
 
 `import` reads the past transcripts that Claude Code keeps (`~/.claude/projects/*/*.jsonl`) and adds their records to the project of the `--to` folder. An argument you leave out is the current folder. Subagent transcripts are not read.
@@ -361,7 +365,8 @@ max_tokens = 8000                  # chunk limit = min(model limit, this) × cha
 chars_per_token = 1.0
 
 [embed_text]
-max_tool_input_chars = 500         # tool-input JSON is cut here in the embedded text only
+max_tool_input_chars = 500         # tool-input JSON and [answer] are cut here in the embedded text only
+answer_tools = ["AskUserQuestion", "ExitPlanMode"]   # tools whose result (your answer) is added as [answer]
 
 [inject]
 threshold = 0.40                   # minimum vector similarity for automatic injection

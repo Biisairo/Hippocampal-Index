@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -13,15 +13,20 @@ use hippo::daemon;
 use hippo::i18n::Lang;
 use hippo::ingest::ImportOutcome;
 use hippo::install::{
-    Action, Outcome, Scope, apply, apply_memory, memory_file, target_file, warn_untracked,
+    Action, Outcome, Scope, apply, apply_memory, guide_block, memory_file, target_file,
+    warn_untracked,
 };
-use hippo::protocol::{ImportSessionReport, Request, Response, Scope as QueryScope};
+use hippo::protocol::{
+    ImportSessionReport, Request, Response, Scope as QueryScope, embed_progress,
+};
 use hippo::registry::is_project_id;
 use hippo::search::{SearchKind, escape_control};
 use hippo::setup::{hooks_config, launchd_plist};
 use hippo::tr;
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+/// `import --wait`이 상태를 묻는 간격. (IF-CLI-9)
+const WAIT_POLL: Duration = Duration::from_secs(2);
 /// UserPromptSubmit hook timeout(초)은 시간 예산보다 이만큼 여유를 둔다.
 const INJECT_TIMEOUT_MARGIN_SECS: u64 = 2;
 
@@ -83,6 +88,9 @@ enum Command {
         /// Path of the project that receives the records
         #[arg(long)]
         to: Option<String>,
+        /// Wait until the imported records are embedded, showing progress
+        #[arg(long)]
+        wait: bool,
     },
     /// Print the hook settings for settings.json
     HooksConfig,
@@ -201,8 +209,8 @@ fn main() -> ExitCode {
             Err(e) => fail(&e),
         },
         Command::Project(ProjectCommand::List) => query_daemon(&paths, &Request::ProjectList),
-        Command::Import { from, to } => match current_dir() {
-            Ok(cwd) => run_import(&paths, &cwd, from, to),
+        Command::Import { from, to, wait } => match current_dir() {
+            Ok(cwd) => run_import(&paths, &cwd, from, to, wait),
             Err(e) => fail(&e),
         },
         Command::Daemon => run_daemon(paths),
@@ -271,10 +279,14 @@ fn run_install(args: &InstallArgs, action: Action, lang: Lang) -> ExitCode {
         },
     };
     let install = matches!(action, Action::Install(_));
+    let block = match install.then(std::env::current_exe).transpose() {
+        Ok(exe) => exe.map(|exe| guide_block(&exe)),
+        Err(e) => return fail(&e.to_string()),
+    };
     let settings = target_file(&scope).and_then(|path| apply(&path, &action, args.dry_run));
     let memory = settings.and_then(|settings| {
         memory_file(&scope)
-            .and_then(|path| apply_memory(&path, install, args.dry_run))
+            .and_then(|path| apply_memory(&path, block.as_deref(), args.dry_run))
             .map(|memory| (settings, memory))
     });
     let (settings, memory) = match memory {
@@ -371,7 +383,13 @@ fn query_daemon(paths: &Paths, req: &Request) -> ExitCode {
 }
 
 /// 준비 요청으로 후보를 받고, 세션마다 요청을 하나씩 보내며 진행률을 출력한다. (FR-IMP-1)
-fn run_import(paths: &Paths, cwd: &str, from: Option<String>, to: Option<String>) -> ExitCode {
+fn run_import(
+    paths: &Paths,
+    cwd: &str,
+    from: Option<String>,
+    to: Option<String>,
+    wait: bool,
+) -> ExitCode {
     let from = match from {
         Some(f) if is_project_id(&f) => f,
         Some(f) => absolute(cwd, &f),
@@ -461,7 +479,48 @@ fn run_import(paths: &Paths, cwd: &str, from: Option<String>, to: Option<String>
             )
         );
     }
+    if wait {
+        return wait_for_embedding(paths, &project_id, lang);
+    }
     ExitCode::SUCCESS
+}
+
+/// 대상 프로젝트의 임베딩 대기 건수가 0이 될 때까지 진행률 한 줄을 갱신한다. (IF-CLI-9)
+fn wait_for_embedding(paths: &Paths, project_id: &str, lang: Lang) -> ExitCode {
+    loop {
+        let project = match request(&paths.socket(), &Request::Status, QUERY_TIMEOUT) {
+            Ok(Response::Status(s)) => s.projects.into_iter().find(|p| p.id == project_id),
+            Ok(Response::Error { message }) => return fail(&message),
+            Ok(other) => return fail(&format!("unexpected response: {other:?}")),
+            Err(e) => return fail(&e.to_string()),
+        };
+        let Some(project) = project else {
+            return fail(&tr!(
+                lang,
+                "Project not found: {project_id}",
+                "프로젝트가 없습니다: {project_id}"
+            ));
+        };
+        if project.embed_jobs == 0 {
+            println!(
+                "\r{}",
+                tr!(lang, "Embedding complete.", "임베딩을 마쳤습니다.")
+            );
+            return ExitCode::SUCCESS;
+        }
+        let pending = project.embed_jobs;
+        let progress = embed_progress(pending, project.embed_per_min, lang);
+        print!(
+            "\r{}",
+            tr!(
+                lang,
+                "Embedding: {pending} pending{progress}   ",
+                "임베딩 중: {pending}건 남음{progress}   "
+            )
+        );
+        let _ = std::io::stdout().flush();
+        std::thread::sleep(WAIT_POLL);
+    }
 }
 
 const SESSION_ID_SHORT: usize = 8;

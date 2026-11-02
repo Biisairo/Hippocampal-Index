@@ -53,9 +53,10 @@ pub struct ImportReport {
     pub fork_skipped: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestOptions {
     pub max_tool_input_chars: usize,
+    pub answer_tools: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -88,7 +89,7 @@ struct Collected {
 pub fn ingest(
     records: &mut RecordStore,
     redactor: &Redactor,
-    options: IngestOptions,
+    options: &IngestOptions,
     req: &IngestRequest,
 ) -> Result<IngestReport, IngestError> {
     let bytes = read_transcript(&req.transcript_path)?;
@@ -133,7 +134,7 @@ pub fn ingest(
 pub fn import_session(
     records: &mut RecordStore,
     redactor: &Redactor,
-    options: IngestOptions,
+    options: &IngestOptions,
     session_id: &str,
     transcript_path: &Path,
 ) -> Result<ImportReport, IngestError> {
@@ -221,7 +222,7 @@ fn prompt_start(bytes: &[u8], prompt_id: &str) -> Option<u64> {
 fn collect(
     records: &RecordStore,
     redactor: &Redactor,
-    options: IngestOptions,
+    options: &IngestOptions,
     events: Vec<Event>,
     req: &IngestRequest,
     skip_forks: bool,
@@ -237,7 +238,8 @@ fn collect(
                     continue;
                 }
                 redactor.redact_iteration(&mut it);
-                let embed_text = build_embed_text(&it, options.max_tool_input_chars);
+                let embed_text =
+                    build_embed_text(&it, options.max_tool_input_chars, &options.answer_tools);
                 iterations.push(NewIteration {
                     iteration: it,
                     embed_text,
