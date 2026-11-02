@@ -179,11 +179,11 @@ Claude (Bash) ──▶ smem search ... ──Unix socket───────�
 | ID | 요구사항 | 우선순위 |
 |----|----------|----------|
 | FR-STO-1 | 원본 저장소의 `iterations` 테이블에 반복마다 행 1개를 저장해야 한다. 필드: `id`, `session_id`, `prompt_id`, `message_id`, `iteration_index`(턴 안 순번), `cwd`, `ts`, `input_text`, `tool_calls`(JSON), `response_text`, `result_ids`, `bg_links`, `embed_text`. 벡터 저장소에는 `id`, `vector`, `embed_model`과 필터용 메타데이터(`cwd`, `session_id`, `ts`)를 저장한다. | M |
-| FR-STO-2 | `embed_text`는 다음 순서로 만든다. 비어 있는 섹션은 넣지 않는다.<br>`[입력] <반복 입력>`<br>`[툴] <name>(<input 요약 JSON>)` (호출마다 1줄)<br>`[응답] <text 블록 이어 붙임>` | M |
+| FR-STO-2 | `embed_text`는 다음 순서로 만든다. 비어 있는 섹션은 넣지 않는다.<br>`[입력] <반복 입력>` (입력마다 1줄. 완료 알림은 `<status>: <summary>`)<br>`[툴] <name>(<input compact JSON>)` (호출마다 1줄. JSON이 설정 길이(기본 500자)를 넘으면 그 길이에서 자르고 `…`를 붙인다. 원문 입력은 `tool_calls`에 그대로 남는다)<br>`[응답] <text 블록을 개행으로 이어 붙임>` | M |
 | FR-STO-3 | 원본 저장소의 `results` 테이블에 결과 원문을 저장해야 한다. 필드: `id`, `content_hash`(SHA-256), `tool_name`, `text`, `chunk_index`, `first_seen_ts`. 벡터는 벡터 저장소에 청크 단위로 저장한다. | M |
 | FR-STO-4 | 같은 `content_hash`가 이미 있으면 결과를 새로 저장하거나 임베딩하지 않고 기존 결과 id를 반복에 연결해야 한다. | M |
-| FR-STO-5 | 결과 원문이 임베더의 `max_input_tokens()`와 설정값(기본 8,000 토큰 상당) 중 작은 값을 넘으면 여러 청크로 나눠 청크마다 벡터를 만들어야 한다. | M |
-| FR-STO-6 | 저장과 임베딩 전에 비밀값 패턴을 `[REDACTED:<종류>]`로 치환해야 한다. 기본 패턴: API 키 접두사(`sk-`, `ghp_`, `gho_`, `xox[bp]-`, `AKIA`), `Bearer <토큰>`, PEM 개인 키 블록, `*_KEY=`/`*_TOKEN=`/`*_SECRET=`/`PASSWORD=` 형태의 값. 패턴은 설정 파일로 추가할 수 있어야 한다. | M |
+| FR-STO-5 | 결과 원문이나 반복의 `embed_text`가 청크 한도를 넘으면 여러 청크로 나눠 청크마다 벡터를 만들어야 한다. 청크 한도(문자 수)는 임베더의 `max_input_tokens()`와 설정값(기본 8,000) 중 작은 값에 `chars_per_token`(기본 1.0)을 곱한 값이다. 청크는 한도 안에서 마지막 개행 위치에서 나누고, 개행이 없으면 한도에서 나눈다. 청크를 순서대로 이어 붙이면 원문과 같아야 한다. | M |
+| FR-STO-6 | 저장과 임베딩 전에 비밀값 패턴을 `[REDACTED:<종류>]`로 치환해야 한다. 기본 패턴: API 키(`sk-` 뒤 20자 이상, `gh[pousr]_` 뒤 36자 이상, `xox[abprs]-`, `AKIA` 뒤 16자), `Bearer <토큰 16자 이상>`, PEM 개인 키 블록, 이름이 `KEY`/`TOKEN`/`SECRET`/`PASSWORD`로 끝나는(대소문자 무시) `이름=값` 또는 `이름: 값`의 값(8자 이상, 이름은 남김). 마스킹은 반복 입력, 응답 텍스트, 도구 입력 JSON의 모든 문자열, 결과 원문에 적용한다. 패턴은 설정 파일로 추가할 수 있어야 하며, 잘못된 패턴은 시작 시 오류로 보고한다. | M |
 | FR-STO-7 | 임베딩은 반복 저장과 분리된 작업 큐로 처리해야 한다. Ollama가 응답하지 않으면 작업을 큐에 남기고 재시도해야 한다. | M |
 | FR-STO-8 | 원본 저장소에서 `iterations.embed_text`와 `results.text`에 SQLite FTS5 인덱스(trigram 토크나이저)를 만들어야 한다. | M |
 | FR-STO-9 | 벡터 행 수가 설정된 기준(기본 10만)을 넘으면 `VectorStore::ensure_index`를 호출해야 한다. | S |
