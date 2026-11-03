@@ -287,7 +287,7 @@ fn question_answers(it: &StoredIteration, input_lines: &str) -> Vec<(Vec<String>
         .embed_text
         .strip_prefix(input_lines)
         .unwrap_or(&it.embed_text);
-    let response = format!("{RESPONSE_PREFIX}{}", it.response_text);
+    let response = format!("\n{RESPONSE_PREFIX}{}", it.response_text);
     if !it.response_text.is_empty() {
         rest = rest.strip_suffix(response.as_str()).unwrap_or(rest);
     }

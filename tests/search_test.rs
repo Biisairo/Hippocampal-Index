@@ -1106,3 +1106,26 @@ fn long_query_embeds_only_first_query_chars_but_fts_uses_all() {
         "FTS는 질의 전체(validateToken)로 찾는다: {hits:?}"
     );
 }
+
+#[test]
+fn answer_followed_by_response_in_same_iteration_has_no_trailing_blank() {
+    let env = Env::new(
+        vec![turn_it(
+            "s-old",
+            "p-qa",
+            0,
+            "2026-10-01T00:00:00Z",
+            prompt("q"),
+            &[RELEVANT],
+            vec![ask_call("c1", "어느 쪽?", "왼쪽")],
+        )],
+        HashEmbedder::new(256, 8_000),
+    );
+    let text = inject(&env, RELEVANT, CONFIG).unwrap();
+    assert!(
+        text.contains(&format!(
+            "[input] q\n[response] {RELEVANT}\n[question] 어느 쪽?\n[answer] 왼쪽\n</memory>"
+        )),
+        "{text}"
+    );
+}
