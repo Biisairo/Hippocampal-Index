@@ -27,6 +27,9 @@ pub enum Request {
         prompt: String,
         cwd: String,
         session_id: String,
+        /// 클라이언트가 적용한 시간 예산. 없으면 데몬 설정의 `budget_ms`. (FR-RET-5)
+        #[serde(default)]
+        budget_ms: Option<u64>,
     },
     Search {
         query: String,

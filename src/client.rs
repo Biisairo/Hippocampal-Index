@@ -151,9 +151,11 @@ pub fn inject_output(context: &str) -> String {
 }
 
 /// hook을 실행하고 stdout에 쓸 내용을 돌려준다. 어떤 경우에도 실패를 밖으로 내지 않는다. (QA-5)
+/// 자동 주입은 데몬에 바로 연결되지 않아 새로 띄워야 하면 `cold_budget`을 쓴다. (FR-RET-5)
 pub fn run_hook(
     paths: &Paths,
     budget: Duration,
+    cold_budget: Duration,
     event_arg: &str,
     input: &str,
     launcher: Launcher,
@@ -177,10 +179,16 @@ pub fn run_hook(
             session_id,
         } => {
             let started = Instant::now();
+            let budget = if UnixStream::connect(paths.socket()).is_ok() {
+                budget
+            } else {
+                cold_budget
+            };
             if !ensure_daemon(paths, launcher, budget) {
                 return None;
             }
-            let remaining = budget.saturating_sub(started.elapsed());
+            // 모델이 내려가 있으면 데몬이 콜드 예산까지 늘리므로 그만큼 기다린다. (FR-RET-5)
+            let remaining = cold_budget.max(budget).saturating_sub(started.elapsed());
             if remaining.is_zero() {
                 return None;
             }
@@ -190,6 +198,7 @@ pub fn run_hook(
                     prompt,
                     cwd,
                     session_id,
+                    budget_ms: Some(budget.as_millis() as u64),
                 },
                 remaining,
             ) {

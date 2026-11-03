@@ -371,6 +371,7 @@ threshold = 0.40                   # minimum vector similarity for automatic inj
 top_k = 3                          # number of turns to inject
 total_chars = 12000                # total injection limit; a turn that does not fit is skipped whole, never cut
 budget_ms = 800                    # time budget for the UserPromptSubmit hook
+cold_budget_ms = 2500              # budget when the hook has to start the daemon (cold start); at least budget_ms
 
 [index]
 vector_index_threshold = 100000    # build an ANN index when the vector count reaches this

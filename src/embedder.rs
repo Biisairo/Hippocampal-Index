@@ -22,6 +22,10 @@ pub trait Embedder: Send + Sync {
     fn max_input_tokens(&self) -> usize;
     /// 입력 순서대로 `dimension()` 길이의 벡터를 돌려준다.
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError>;
+    /// 모델이 메모리에 올라 있어 바로 임베딩할 수 있는지. 알 수 없는 백엔드는 참이다. (FR-RET-5)
+    fn is_loaded(&self) -> bool {
+        true
+    }
 }
 
 /// 처리 중인 자동 주입 요청 수. (FR-DMN-6 (a))
@@ -73,5 +77,9 @@ impl Embedder for YieldingEmbedder<'_> {
             thread::sleep(GATE_POLL);
         }
         self.inner.embed(texts)
+    }
+
+    fn is_loaded(&self) -> bool {
+        self.inner.is_loaded()
     }
 }

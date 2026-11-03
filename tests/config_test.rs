@@ -19,9 +19,10 @@ fn defaults_match_srs() {
             c.inject.threshold,
             c.inject.top_k,
             c.inject.total_chars,
-            c.inject.budget_ms
+            c.inject.budget_ms,
+            c.inject.cold_budget_ms
         ),
-        (0.40, 3, 12_000, 800)
+        (0.40, 3, 12_000, 800, 2_500)
     );
     assert_eq!(c.index.vector_index_threshold, 100_000);
     assert!(c.redact.patterns.is_empty());
@@ -179,4 +180,16 @@ fn per_item_chars_is_no_longer_accepted() {
         Config::parse("[inject]\nper_item_chars = 800\n"),
         Err(ConfigError::Parse(_))
     ));
+}
+
+// ---- FR-RET-5 콜드 시작 예산 ----
+
+#[test]
+fn rejects_cold_budget_below_budget() {
+    assert!(matches!(
+        Config::parse("[inject]\nbudget_ms = 1000\ncold_budget_ms = 999\n"),
+        Err(ConfigError::ColdBudget { .. })
+    ));
+    let ok = Config::parse("[inject]\nbudget_ms = 1000\ncold_budget_ms = 1000\n").unwrap();
+    assert_eq!(ok.inject.cold_budget_ms, 1_000);
 }

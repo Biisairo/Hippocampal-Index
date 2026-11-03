@@ -61,6 +61,7 @@ const EMBED_RETRY: Duration = Duration::from_secs(5);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const REINDEX_PAGE: usize = 256;
 const LOG_FILE: &str = "hippo.log";
+const WARMUP_TEXT: &str = "warmup";
 /// 처리 속도를 셀 때 보는 시간. (IF-CLI-5)
 const RATE_WINDOW: Duration = Duration::from_secs(300);
 /// 처리를 막 시작했을 때 속도가 부풀지 않게 하는 최소 시간.
@@ -508,6 +509,7 @@ pub fn start(
     if let Err(e) = shared.fill_queue() {
         shared.log(&format!("filling embed queue failed: {e}"));
     }
+    spawn_warmup(Arc::clone(&shared));
 
     let threads = vec![
         spawn_writer(Arc::clone(&shared), redactor, write_rx),
@@ -519,6 +521,15 @@ pub fn start(
         threads,
         _lock: lock_file,
     })
+}
+
+/// 임베딩 모델을 미리 메모리에 올린다. 끝을 기다리지 않는다. (FR-DMN-10)
+fn spawn_warmup(shared: Arc<Shared>) {
+    thread::spawn(move || {
+        if let Err(e) = shared.embedder.embed(&[WARMUP_TEXT.to_string()]) {
+            shared.log(&format!("embedder warmup failed: {e}"));
+        }
+    });
 }
 
 /// 수집과 프로젝트 가져오기는 이 스레드 하나가 요청 순서대로 처리한다. 시작할 때 스풀을 먼저 비운다. (FR-DMN-6, FR-CAP-6)
@@ -1144,7 +1155,12 @@ fn handle_request(shared: &Arc<Shared>, req: Request) -> Response {
             prompt,
             cwd,
             session_id,
-        } => inject(shared, &prompt, &cwd, &session_id).map(|context| Response::Inject { context }),
+            budget_ms,
+        } => {
+            let budget_ms = budget_ms.unwrap_or(shared.config.inject.budget_ms);
+            inject(shared, &prompt, &cwd, &session_id, budget_ms)
+                .map(|context| Response::Inject { context })
+        }
         Request::Search {
             query,
             kind,
@@ -1176,9 +1192,16 @@ fn inject(
     prompt: &str,
     cwd: &str,
     session_id: &str,
+    budget_ms: u64,
 ) -> Result<Option<String>, String> {
     let started = Instant::now();
     let _active = shared.inject_gate.enter();
+    let cold_ms = shared.config.inject.cold_budget_ms;
+    let budget_ms = if budget_ms < cold_ms && !shared.embedder.is_loaded() {
+        cold_ms
+    } else {
+        budget_ms
+    };
     let bound = lock(&shared.registry)?
         .session_project(session_id)
         .map_err(|e| e.to_string())?;
@@ -1193,7 +1216,7 @@ fn inject(
         top_k: c.top_k,
         total_chars: c.total_chars,
     };
-    let budget = Duration::from_millis(c.budget_ms);
+    let budget = Duration::from_millis(budget_ms);
     let deadline = Instant::now() + budget;
     let result = build_injection(
         &records,
@@ -1210,7 +1233,7 @@ fn inject(
         shared.log(&format!(
             "project {id}: inject budget exceeded: elapsed={}ms budget={}ms queue normal={normal} bulk={bulk}",
             elapsed.as_millis(),
-            c.budget_ms
+            budget_ms
         ));
     }
     result

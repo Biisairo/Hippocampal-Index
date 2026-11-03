@@ -29,7 +29,7 @@ fn s2_cwd() -> String {
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 fn hook_no_autostart(paths: &Paths, budget: Duration, event: &str, input: &str) -> Option<String> {
-    run_hook(paths, budget, event, input, &launch_disabled)
+    run_hook(paths, budget, budget, event, input, &launch_disabled)
 }
 
 struct Env {
@@ -584,6 +584,7 @@ fn hook_autostarts_daemon_and_ingests() {
         run_hook(
             &e.paths,
             Duration::from_millis(800),
+            Duration::from_millis(800),
             "stop",
             &input,
             &launcher
@@ -609,6 +610,7 @@ fn autostart_failure_falls_back_to_spool() {
     assert_eq!(
         run_hook(
             &e.paths,
+            Duration::from_millis(800),
             Duration::from_millis(800),
             "stop",
             &input,
@@ -1633,6 +1635,7 @@ fn inject_request(paths: &Paths, session_id: &str) -> Response {
             prompt: "anything".into(),
             cwd: s2_cwd(),
             session_id: session_id.into(),
+            budget_ms: None,
         },
         TIMEOUT,
     )
@@ -1677,4 +1680,190 @@ fn inject_within_budget_is_not_logged() {
     handle.shutdown();
 
     assert!(inject_log_lines(&e.paths).is_empty());
+}
+
+// ---- FR-RET-5 콜드 시작 예산, FR-DMN-10 워밍업 ----
+
+fn zero_budget_config() -> Config {
+    let mut c = config();
+    c.inject.budget_ms = 0;
+    c
+}
+
+fn inject_with_budget(paths: &Paths, prompt: &str, budget_ms: Option<u64>) -> Response {
+    request(
+        &paths.socket(),
+        &Request::Inject {
+            prompt: prompt.into(),
+            cwd: s2_cwd(),
+            session_id: "other".into(),
+            budget_ms,
+        },
+        TIMEOUT,
+    )
+    .unwrap()
+}
+
+/// 색인된 데이터를 만든 뒤 데몬을 내린다. 이후 hook이 데몬을 새로 띄우는 콜드 시작을 재현한다.
+fn indexed_then_stopped(e: &Env, vectors: &Arc<MemoryVectorStore>) -> String {
+    let handle = launch_with(&e.paths, vectors.clone(), zero_budget_config()).unwrap();
+    ingest(&e.paths, &e.transcript, HookEvent::Stop);
+    wait_until(|| totals(&status(&e.paths)).1 == 0);
+    let prompt = project_records(&e.paths)
+        .iterations_for_prompt(S2_PROMPT)
+        .unwrap()[1]
+        .embed_text
+        .clone();
+    handle.shutdown();
+    prompt
+}
+
+#[test]
+fn cold_start_hook_uses_cold_budget_and_daemon_honors_request_budget() {
+    let e = env();
+    let vectors = Arc::new(MemoryVectorStore::default());
+    let prompt = indexed_then_stopped(&e, &vectors);
+    let slot: Mutex<Option<DaemonHandle>> = Mutex::new(None);
+    let launcher = |paths: &Paths| match launch_with(paths, vectors.clone(), zero_budget_config()) {
+        Ok(handle) => {
+            *slot.lock().unwrap() = Some(handle);
+            Ok(())
+        }
+        Err(err) => Err(std::io::Error::other(err.to_string())),
+    };
+    let input =
+        json!({"session_id": "other", "transcript_path": "/t", "cwd": s2_cwd(), "prompt": prompt})
+            .to_string();
+
+    let cold = run_hook(
+        &e.paths,
+        Duration::ZERO,
+        Duration::from_secs(5),
+        "user-prompt-submit",
+        &input,
+        &launcher,
+    );
+    assert!(slot.lock().unwrap().is_some(), "데몬을 새로 띄움");
+    assert!(
+        cold.is_some_and(|out| out.contains("<memory ")),
+        "콜드 시작은 cold 예산으로 주입한다"
+    );
+
+    let warm = run_hook(
+        &e.paths,
+        Duration::ZERO,
+        Duration::from_secs(5),
+        "user-prompt-submit",
+        &input,
+        &launcher,
+    );
+    assert_eq!(warm, None, "데몬이 떠 있으면 평소 예산(0)을 쓴다");
+
+    assert!(matches!(
+        inject_with_budget(&e.paths, &prompt, Some(5_000)),
+        Response::Inject { context: Some(_) }
+    ));
+    assert!(matches!(
+        inject_with_budget(&e.paths, &prompt, None),
+        Response::Inject { context: None }
+    ));
+    slot.lock().unwrap().take().unwrap().shutdown();
+}
+
+struct CountingEmbedder {
+    inner: HashEmbedder,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl Embedder for CountingEmbedder {
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+    fn dimension(&self) -> usize {
+        self.inner.dimension()
+    }
+    fn max_input_tokens(&self) -> usize {
+        self.inner.max_input_tokens()
+    }
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, hippo::embedder::EmbedError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.embed(texts)
+    }
+}
+
+#[test]
+fn daemon_warms_up_embedder_on_start() {
+    let e = env();
+    let embedder = Arc::new(CountingEmbedder {
+        inner: HashEmbedder::new(256, 8_000),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let handle = start(
+        e.paths.clone(),
+        config(),
+        embedder.clone(),
+        memory_source(&e.paths, Arc::new(MemoryVectorStore::default())),
+    )
+    .unwrap();
+    wait_until(|| embedder.calls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    handle.shutdown();
+}
+
+/// 모델이 메모리에 없다고 알리는 임베더. (FR-RET-5 모델 콜드)
+struct UnloadedEmbedder(HashEmbedder);
+
+impl Embedder for UnloadedEmbedder {
+    fn model_id(&self) -> &str {
+        self.0.model_id()
+    }
+    fn dimension(&self) -> usize {
+        self.0.dimension()
+    }
+    fn max_input_tokens(&self) -> usize {
+        self.0.max_input_tokens()
+    }
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, hippo::embedder::EmbedError> {
+        self.0.embed(texts)
+    }
+    fn is_loaded(&self) -> bool {
+        false
+    }
+}
+
+#[test]
+fn daemon_uses_cold_budget_when_model_is_not_loaded() {
+    let e = env();
+    let vectors = Arc::new(MemoryVectorStore::default());
+    let prompt = indexed_then_stopped(&e, &vectors);
+    let handle = start(
+        e.paths.clone(),
+        zero_budget_config(),
+        Arc::new(UnloadedEmbedder(HashEmbedder::new(256, 8_000))),
+        memory_source(&e.paths, vectors),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            inject_with_budget(&e.paths, &prompt, Some(0)),
+            Response::Inject { context: Some(_) }
+        ),
+        "모델이 내려가 있으면 요청 예산(0) 대신 콜드 예산을 쓴다"
+    );
+
+    let input =
+        json!({"session_id": "other", "transcript_path": "/t", "cwd": s2_cwd(), "prompt": prompt})
+            .to_string();
+    let out = run_hook(
+        &e.paths,
+        Duration::ZERO,
+        Duration::from_secs(5),
+        "user-prompt-submit",
+        &input,
+        &launch_disabled,
+    );
+    assert!(
+        out.is_some_and(|o| o.contains("<memory ")),
+        "데몬이 떠 있어도 클라이언트는 콜드 예산까지 기다린다"
+    );
+    handle.shutdown();
 }

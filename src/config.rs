@@ -17,6 +17,8 @@ pub enum ConfigError {
     NonLocalUrl(String),
     #[error("chunking overlap_chars ({overlap}) must be smaller than the chunk limit ({limit})")]
     ChunkOverlap { overlap: usize, limit: usize },
+    #[error("inject cold_budget_ms ({cold}) must not be smaller than budget_ms ({budget})")]
+    ColdBudget { cold: u64, budget: u64 },
     #[error("HOME is not set")]
     NoHome,
 }
@@ -67,6 +69,8 @@ pub struct InjectSection {
     pub top_k: usize,
     pub total_chars: usize,
     pub budget_ms: u64,
+    /// hook이 데몬을 새로 띄운 요청의 예산. (FR-RET-5)
+    pub cold_budget_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -157,6 +161,13 @@ impl Config {
             return Err(ConfigError::ChunkOverlap {
                 overlap: c.overlap_chars,
                 limit,
+            });
+        }
+        let i = &config.inject;
+        if i.cold_budget_ms < i.budget_ms {
+            return Err(ConfigError::ColdBudget {
+                cold: i.cold_budget_ms,
+                budget: i.budget_ms,
             });
         }
         Ok(config)
@@ -296,6 +307,7 @@ impl Default for InjectSection {
             top_k: 3,
             total_chars: 12_000,
             budget_ms: 800,
+            cold_budget_ms: 2_500,
         }
     }
 }

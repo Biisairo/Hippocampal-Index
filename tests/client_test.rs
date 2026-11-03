@@ -38,7 +38,7 @@ fn ingest_req(event: HookEvent) -> IngestRequest {
 // ---- IF-HK-1, FR-CAP-1 ----
 
 fn hook_no_autostart(paths: &Paths, budget: Duration, event: &str, input: &str) -> Option<String> {
-    run_hook(paths, budget, event, input, &launch_disabled)
+    run_hook(paths, budget, budget, event, input, &launch_disabled)
 }
 
 #[test]
@@ -128,6 +128,13 @@ fn protocol_roundtrip() {
             prompt: "p".into(),
             cwd: "/w".into(),
             session_id: "s".into(),
+            budget_ms: None,
+        },
+        Request::Inject {
+            prompt: "p".into(),
+            cwd: "/w".into(),
+            session_id: "s".into(),
+            budget_ms: Some(2_500),
         },
         Request::Search {
             query: "q".into(),
@@ -518,5 +525,20 @@ fn spool_line_without_prompt_id_is_still_read() {
     assert!(
         line.contains("\"prompt_id\":\"p\""),
         "스풀에 prompt_id 기록 (FR-CAP-5)"
+    );
+}
+
+#[test]
+fn inject_request_without_budget_still_parses() {
+    let line = r#"{"type":"inject","prompt":"p","cwd":"/w","session_id":"s"}"#;
+    let parsed: Request = serde_json::from_str(line).unwrap();
+    assert_eq!(
+        parsed,
+        Request::Inject {
+            prompt: "p".into(),
+            cwd: "/w".into(),
+            session_id: "s".into(),
+            budget_ms: None,
+        }
     );
 }

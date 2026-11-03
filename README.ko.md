@@ -371,6 +371,7 @@ threshold = 0.40                   # 자동 주입의 최소 벡터 유사도
 top_k = 3                          # 주입할 턴 수
 total_chars = 12000                # 주입 전체 길이 한도. 넘는 턴은 자르지 않고 통째로 뺌
 budget_ms = 800                    # UserPromptSubmit hook의 시간 예산
+cold_budget_ms = 2500              # hook이 데몬을 새로 띄울 때(콜드 시작)의 예산. budget_ms 이상
 
 [index]
 vector_index_threshold = 100000    # 벡터 수가 이 값에 이르면 ANN 인덱스를 만듦

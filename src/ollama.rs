@@ -14,6 +14,8 @@ use crate::fsutil::{ensure_private_dir, open_private_append};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const EMBED_PATH: &str = "/api/embed";
 const VERSION_PATH: &str = "/api/version";
+const PS_PATH: &str = "/api/ps";
+const DEFAULT_TAG: &str = ":latest";
 const DEFAULT_PORT: u16 = 11434;
 const SERVER_START_WAIT: Duration = Duration::from_secs(10);
 const SERVER_POLL: Duration = Duration::from_millis(100);
@@ -103,6 +105,7 @@ pub struct OllamaEmbedder {
     keep_alive: String,
     agent: ureq::Agent,
     version_endpoint: String,
+    ps_endpoint: String,
     launcher: Option<ServerLauncher>,
     launch_lock: Mutex<()>,
 }
@@ -138,6 +141,7 @@ impl OllamaEmbedder {
             keep_alive: config.keep_alive.clone(),
             agent,
             version_endpoint: format!("{}{VERSION_PATH}", config.url.trim_end_matches('/')),
+            ps_endpoint: format!("{}{PS_PATH}", config.url.trim_end_matches('/')),
             launcher,
             launch_lock: Mutex::new(()),
         })
@@ -249,5 +253,32 @@ impl Embedder for OllamaEmbedder {
             }
             (result, _) => result,
         }
+    }
+
+    /// `GET /api/ps`의 `models[].name`에 설정 모델이 있는지. 태그가 없으면 `:latest`로 본다. (FR-RET-5)
+    fn is_loaded(&self) -> bool {
+        let Ok(mut response) = self.agent.get(&self.ps_endpoint).call() else {
+            return false;
+        };
+        if !response.status().is_success() {
+            return false;
+        }
+        let Ok(payload) = response.body_mut().read_json::<Value>() else {
+            return false;
+        };
+        let tagged = if self.model.contains(':') {
+            self.model.clone()
+        } else {
+            format!("{}{DEFAULT_TAG}", self.model)
+        };
+        payload
+            .get("models")
+            .and_then(Value::as_array)
+            .is_some_and(|models| {
+                models
+                    .iter()
+                    .filter_map(|m| m.get("name").and_then(Value::as_str))
+                    .any(|name| name == tagged)
+            })
     }
 }

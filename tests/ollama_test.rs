@@ -379,3 +379,69 @@ fn resolves_command_from_path_then_fallbacks() {
         "실행 권한 없는 파일은 무시"
     );
 }
+
+// ---- FR-RET-5: 모델 적재 확인 (GET /api/ps) ----
+
+/// GET 요청 한 건을 받아 요청 줄을 돌려주고 정해진 본문으로 응답하는 가짜 서버.
+fn fake_get_server(body: Value) -> (String, mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).unwrap();
+        loop {
+            let mut header = String::new();
+            reader.read_line(&mut header).unwrap();
+            if header == "\r\n" {
+                break;
+            }
+        }
+        tx.send(request_line).unwrap();
+        let text = body.to_string();
+        let mut stream = stream;
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}", text.len()).unwrap();
+    });
+    (url, rx)
+}
+
+fn embedder_for(url: &str, model: &str) -> OllamaEmbedder {
+    OllamaEmbedder::try_new(&EmbedderConfig {
+        model: model.into(),
+        ..config(url, 4)
+    })
+    .unwrap()
+}
+
+#[test]
+fn model_listed_in_ps_is_loaded() {
+    let (url, rx) = fake_get_server(
+        json!({"models": [{"name": "other:1b"}, {"name": "qwen3-embedding:0.6b"}]}),
+    );
+    assert!(embedder_for(&url, "qwen3-embedding:0.6b").is_loaded());
+    assert!(rx.recv().unwrap().starts_with("GET /api/ps "));
+}
+
+#[test]
+fn untagged_model_matches_latest_tag() {
+    let (url, _rx) = fake_get_server(json!({"models": [{"name": "bge-m3:latest"}]}));
+    assert!(embedder_for(&url, "bge-m3").is_loaded());
+}
+
+#[test]
+fn model_missing_from_ps_is_not_loaded() {
+    let (url, _rx) = fake_get_server(json!({"models": [{"name": "other:1b"}]}));
+    assert!(!embedder_for(&url, "qwen3-embedding:0.6b").is_loaded());
+    let (url, _rx) = fake_get_server(json!({"unexpected": true}));
+    assert!(!embedder_for(&url, "qwen3-embedding:0.6b").is_loaded());
+}
+
+#[test]
+fn unreachable_server_is_not_loaded() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    assert!(!embedder_for(&url, "qwen3-embedding:0.6b").is_loaded());
+}

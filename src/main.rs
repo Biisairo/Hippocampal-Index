@@ -150,7 +150,15 @@ fn main() -> ExitCode {
             let _ = std::io::stdin().read_to_string(&mut input);
             let config = Config::load(&paths.config()).unwrap_or_default();
             let budget = Duration::from_millis(config.inject.budget_ms);
-            if let Some(out) = run_hook(&paths, budget, &event, &input, launcher(&config)) {
+            let cold_budget = Duration::from_millis(config.inject.cold_budget_ms);
+            if let Some(out) = run_hook(
+                &paths,
+                budget,
+                cold_budget,
+                &event,
+                &input,
+                launcher(&config),
+            ) {
                 println!("{out}");
             }
             ExitCode::SUCCESS
@@ -259,12 +267,12 @@ fn scope_arg(cwd: &str, scope: &str) -> QueryScope {
     }
 }
 
-/// 실행 중인 hippo 경로로 hook 설정을 만든다. UserPromptSubmit timeout은 시간 예산보다 여유를 둔다.
+/// 실행 중인 hippo 경로로 hook 설정을 만든다. UserPromptSubmit timeout은 콜드 시작 예산보다 여유를 둔다. (IF-HK-4)
 fn hook_settings(paths: &Paths, exe: &Path) -> Result<serde_json::Value, String> {
     let budget_ms = Config::load(&paths.config())
         .map_err(|e| e.to_string())?
         .inject
-        .budget_ms;
+        .cold_budget_ms;
     let timeout = budget_ms.div_ceil(1_000) + INJECT_TIMEOUT_MARGIN_SECS;
     Ok(hooks_config(exe, timeout))
 }
