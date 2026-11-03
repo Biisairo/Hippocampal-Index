@@ -1146,3 +1146,154 @@ fn totals_count_sessions_turns_iterations_results() {
         }
     );
 }
+
+// ---- FR-GUI-13, FR-GUI-14 ----
+
+use hippo::store::{SessionSummary, TurnSummary};
+
+fn at(
+    mut it: NewIteration,
+    prompt: &str,
+    index: u32,
+    ts: &str,
+    input: Option<&str>,
+) -> NewIteration {
+    it = with_prompt(it, prompt, index);
+    it.iteration.ts = ts.into();
+    it.iteration.inputs = input
+        .map(|text| vec![IterationInput::Prompt { text: text.into() }])
+        .unwrap_or_default();
+    it.embed_text = build_embed_text(&it.iteration, 500, &[]);
+    it
+}
+
+/// sa(가장 이름): 턴 2개, sb: 턴 1개, sc(가장 최근): 턴 1개.
+fn browse_store() -> RecordStore {
+    let mut store = RecordStore::open_in_memory().unwrap();
+    let long = format!("첫   질문\n{}", "가".repeat(100));
+    store
+        .apply(&batch(
+            "sa",
+            vec![
+                at(
+                    synthetic(
+                        "sa",
+                        "a1",
+                        "/w",
+                        "응답 하나 zebraWord",
+                        &[("t1", "결과 원문")],
+                    ),
+                    "pa1",
+                    0,
+                    "2026-11-01T00:00:00Z",
+                    Some(&long),
+                ),
+                at(
+                    synthetic("sa", "a2", "/w", "응답 둘", &[]),
+                    "pa1",
+                    1,
+                    "2026-11-01T00:00:05Z",
+                    None,
+                ),
+                at(
+                    synthetic("sa", "a3", "/w", "응답 셋", &[]),
+                    "pa2",
+                    0,
+                    "2026-11-01T00:01:00Z",
+                    Some("두 번째 턴 xy"),
+                ),
+            ],
+            vec![],
+        ))
+        .unwrap();
+    store
+        .apply(&batch(
+            "sb",
+            vec![at(
+                synthetic("sb", "b1", "/w", "다른 응답", &[]),
+                "pb1",
+                0,
+                "2026-11-02T00:00:00Z",
+                Some("sb 질문"),
+            )],
+            vec![],
+        ))
+        .unwrap();
+    store
+        .apply(&batch(
+            "sc",
+            vec![at(
+                synthetic("sc", "c1", "/w", "zebraWord 또", &[]),
+                "pc1",
+                0,
+                "2026-11-03T00:00:00Z",
+                Some("sc 질문"),
+            )],
+            vec![],
+        ))
+        .unwrap();
+    store
+}
+
+fn session_ids(page: &[SessionSummary]) -> Vec<&str> {
+    page.iter().map(|s| s.session_id.as_str()).collect()
+}
+
+#[test]
+fn session_page_is_newest_first_with_counts_and_paging() {
+    let store = browse_store();
+    let page = store.session_page("", 0, 50).unwrap();
+    assert_eq!(page.total, 3);
+    assert_eq!(session_ids(&page.items), vec!["sc", "sb", "sa"]);
+    let sa = &page.items[2];
+    assert_eq!(sa.started_at, "2026-11-01T00:00:00Z");
+    assert_eq!((sa.turns, sa.iterations), (2, 3));
+    assert!(
+        sa.first_prompt.starts_with("첫 질문 가가"),
+        "공백을 한 칸으로: {}",
+        sa.first_prompt
+    );
+    assert_eq!(sa.first_prompt.chars().count(), 80);
+    let second = store.session_page("", 1, 1).unwrap();
+    assert_eq!(second.total, 3);
+    assert_eq!(session_ids(&second.items), vec!["sb"]);
+    assert!(store.session_page("", 3, 50).unwrap().items.is_empty());
+}
+
+#[test]
+fn session_and_turn_filters_use_fts_from_three_chars_and_substring_below() {
+    let store = browse_store();
+    let fts = store.session_page("zebraWord", 0, 50).unwrap();
+    assert_eq!(session_ids(&fts.items), vec!["sc", "sa"]);
+    assert_eq!(fts.total, 2);
+    let short = store.session_page("xy", 0, 50).unwrap();
+    assert_eq!(session_ids(&short.items), vec!["sa"], "2자는 부분 문자열");
+    assert_eq!(store.session_page("없는말", 0, 50).unwrap().total, 0);
+    assert_eq!(store.session_page("  ", 0, 50).unwrap().total, 3, "빈 필터");
+    let turns = store.turn_page("sa", "xy", 0, 50).unwrap();
+    let ids: Vec<_> = turns.items.iter().map(|t| t.prompt_id.as_deref()).collect();
+    assert_eq!(ids, vec![Some("pa2")]);
+    assert_eq!(store.turn_page("sa", "zebraWord", 0, 50).unwrap().total, 1);
+}
+
+#[test]
+fn turn_page_is_oldest_first_with_embedding_state() {
+    let mut store = browse_store();
+    let page = store.turn_page("sa", "", 0, 50).unwrap();
+    assert_eq!(page.total, 2);
+    let first: &TurnSummary = &page.items[0];
+    assert_eq!(first.prompt_id.as_deref(), Some("pa1"));
+    assert_eq!(first.ts, "2026-11-01T00:00:00Z");
+    assert_eq!(first.iterations, 2);
+    assert_eq!(first.pending, 3, "반복 2개와 연결 결과 1개");
+    assert!(first.prompt.starts_with("첫 질문"));
+    assert_eq!(page.items[1].prompt, "두 번째 턴 xy");
+    let jobs = store.embed_jobs(100).unwrap();
+    store.complete_embed_jobs(&jobs).unwrap();
+    assert_eq!(
+        store.turn_page("sa", "", 0, 50).unwrap().items[0].pending,
+        0
+    );
+    assert_eq!(store.turn_page("sa", "", 1, 1).unwrap().items.len(), 1);
+    assert_eq!(store.turn_page("nope", "", 0, 50).unwrap().total, 0);
+}

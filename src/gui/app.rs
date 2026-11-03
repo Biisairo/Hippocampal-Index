@@ -10,6 +10,7 @@ use eframe::egui::{self, RichText};
 use egui_extras::{Column, TableBuilder};
 
 use crate::client::request;
+use crate::commands::render_delete_report;
 use crate::commands::{SESSION_ID_SHORT, project_scope, query, run_install, scope_arg};
 use crate::config::PatternEntry;
 use crate::config::{Config, Paths};
@@ -17,8 +18,8 @@ use crate::config_edit::{
     Field, FieldValue, SaveOutcome, changed, fields, needs_reindex, needs_restart, save,
 };
 use crate::gui::state::{
-    ImportForm, ImportProgress, InstallAction, InstallForm, PreviewKey, resolve_import_args,
-    run_import,
+    DeleteTarget, ImportForm, ImportProgress, InstallAction, InstallForm, PreviewKey, RecordsView,
+    Reload, embed_state, page_count, resolve_import_args, run_import, skip_label, verdict_label,
 };
 use crate::gui::text::describe;
 use crate::gui::widgets::{
@@ -29,9 +30,11 @@ use crate::i18n::{Lang, local_time};
 use crate::import::{Candidate, ImportStatus, size_label, started_label};
 use crate::install::{Scope, is_installed, target_file};
 use crate::protocol::{
-    Request, Response, Scope as QueryScope, StatusInfo, embed_progress, missing_location,
+    DeleteReport, Request, Response, Scope as QueryScope, StatusInfo, embed_progress,
+    missing_location,
 };
-use crate::search::SearchKind;
+use crate::search::{HitView, InjectionPlan, IterationView, SearchKind};
+use crate::store::{Page, RecordKind, SessionSummary, TurnSummary};
 use crate::tr;
 
 /// 상태 폴링과 화면 갱신 주기. (FR-GUI-3, FR-GUI-8)
@@ -51,6 +54,10 @@ const OK_COLOR: egui::Color32 = egui::Color32::from_rgb(90, 190, 120);
 const WARN_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 170, 60);
 const CHANGED_COLOR: egui::Color32 = egui::Color32::from_rgb(100, 170, 240);
 const DEFAULT_LIMIT: usize = 10;
+const RECORDS_SEARCH_LIMIT: usize = 20;
+const QUERY_HEIGHT: f32 = 220.0;
+const TS_CHARS: usize = 19;
+const TOOL_INPUT_CHARS: usize = 200;
 const README_EN: &str = include_str!("../../README.md");
 const README_KO: &str = include_str!("../../README.ko.md");
 const LICENSE: &str = include_str!("../../LICENSE");
@@ -120,6 +127,7 @@ impl<T: Send + 'static> Task<T> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Status,
+    Records,
     Settings,
     Import,
     Search,
@@ -129,8 +137,9 @@ enum Tab {
 }
 
 impl Tab {
-    const ALL: [Tab; 7] = [
+    const ALL: [Tab; 8] = [
         Tab::Status,
+        Tab::Records,
         Tab::Settings,
         Tab::Import,
         Tab::Search,
@@ -142,6 +151,7 @@ impl Tab {
     fn label(self, lang: Lang) -> String {
         match self {
             Tab::Status => tr!(lang, "Status", "상태"),
+            Tab::Records => tr!(lang, "Records", "기록"),
             Tab::Settings => tr!(lang, "Settings", "설정"),
             Tab::Import => tr!(lang, "Import", "가져오기"),
             Tab::Search => tr!(lang, "Search", "검색"),
@@ -188,7 +198,39 @@ struct Search {
     show_scope: String,
     with_results: bool,
     output: String,
+    /// 구조화 검색 결과와 안내. 있으면 `output` 대신 보여 준다. (FR-GUI-17)
+    hits: Option<(Vec<HitView>, Vec<String>)>,
     task: Task<Reply>,
+}
+
+/// 기록 탭의 질의 결과. (FR-GUI-16)
+enum QueryOut {
+    Hits(Vec<HitView>, Vec<String>),
+    Preview(InjectionPlan, u64),
+}
+
+/// 확인 창에 보여 줄 삭제 미리 보기. (FR-GUI-15)
+type DeletePreview = (DeleteTarget, Result<Option<DeleteReport>, String>);
+
+#[derive(Default)]
+struct Records {
+    view: RecordsView,
+    sessions: Option<Result<Page<SessionSummary>, String>>,
+    turns: Option<Result<Page<TurnSummary>, String>>,
+    detail: Option<Result<Vec<IterationView>, String>>,
+    session_filter: String,
+    turn_filter: String,
+    query: String,
+    preview_mode: bool,
+    query_out: Option<Result<QueryOut, String>>,
+    confirm: Option<DeletePreview>,
+    message: Option<String>,
+    sessions_task: Task<Reply>,
+    turns_task: Task<Reply>,
+    detail_task: Task<Reply>,
+    query_task: Task<Reply>,
+    preview_task: Task<(DeleteTarget, Reply)>,
+    delete_task: Task<(DeleteTarget, Reply)>,
 }
 
 #[derive(Default)]
@@ -213,6 +255,101 @@ struct Install {
     task: Task<InstallOutcome>,
 }
 
+impl Records {
+    /// 끝난 작업의 결과를 받는다. 프로젝트를 지웠으면 참이다(상태를 바로 다시 묻는다).
+    fn poll(&mut self, lang: Lang) -> bool {
+        if let Some(reply) = self.sessions_task.poll() {
+            self.sessions = Some(match reply {
+                Ok(Response::Sessions(page)) => Ok(page),
+                other => Err(error_of(other)),
+            });
+        }
+        if let Some(reply) = self.turns_task.poll() {
+            self.turns = Some(match reply {
+                Ok(Response::Turns(page)) => Ok(page),
+                other => Err(error_of(other)),
+            });
+        }
+        if let Some(reply) = self.detail_task.poll() {
+            self.detail = Some(match reply {
+                Ok(Response::Turn { iterations, .. }) => Ok(iterations),
+                other => Err(error_of(other)),
+            });
+        }
+        if let Some(reply) = self.query_task.poll() {
+            self.query_out = Some(match reply {
+                Ok(Response::Hits { hits, notes }) => Ok(QueryOut::Hits(hits, notes)),
+                Ok(Response::InjectPreview { plan, elapsed_ms }) => {
+                    Ok(QueryOut::Preview(plan, elapsed_ms))
+                }
+                other => Err(error_of(other)),
+            });
+        }
+        if let Some((target, reply)) = self.preview_task.poll() {
+            self.confirm = Some((
+                target,
+                match reply {
+                    Ok(Response::Delete { report }) => Ok(report),
+                    other => Err(error_of(other)),
+                },
+            ));
+        }
+        if let Some((target, reply)) = self.delete_task.poll() {
+            match reply {
+                Ok(Response::Delete { .. }) => {
+                    self.view.after_delete(&target);
+                    self.message = Some(tr!(lang, "Deleted.", "지웠습니다."));
+                    return matches!(target, DeleteTarget::Project(_));
+                }
+                other => self.message = Some(error_of(other)),
+            }
+        }
+        false
+    }
+
+    /// 선택이 없어진 단계의 목록을 비우고, 다시 불러올 목록을 요청한다.
+    fn start_loads(&mut self, ctx: &egui::Context, paths: &Paths, cwd: &str) {
+        if self.view.project.is_none() {
+            self.sessions = None;
+        }
+        if self.view.session.is_none() {
+            self.turns = None;
+        }
+        if self.view.prompt.is_none() {
+            self.detail = None;
+        }
+        let start = |task: &mut Task<Reply>, req: Option<Request>| {
+            if let Some(req) = req {
+                let paths = paths.clone();
+                task.start(ctx, move || query(&paths, &req, QUERY_TIMEOUT));
+            }
+        };
+        if self.view.reload.sessions && !self.sessions_task.running {
+            self.view.reload.sessions = false;
+            start(&mut self.sessions_task, self.view.session_request(cwd));
+        }
+        if self.view.reload.turns && !self.turns_task.running {
+            self.view.reload.turns = false;
+            start(&mut self.turns_task, self.view.turn_request(cwd));
+        }
+        if self.view.reload.detail && !self.detail_task.running {
+            self.view.reload.detail = false;
+            start(&mut self.detail_task, self.view.detail_request(cwd));
+        }
+    }
+
+    /// `dry_run` 요청으로 미리 보기를 받아 확인 창을 연다. (FR-GUI-15)
+    fn ask_delete(&mut self, ctx: &egui::Context, paths: &Paths, cwd: &str, target: DeleteTarget) {
+        if self.delete_task.running {
+            return;
+        }
+        let req = target.request(cwd, true);
+        let paths = paths.clone();
+        self.preview_task
+            .start(ctx, move || (target, query(&paths, &req, QUERY_TIMEOUT)));
+    }
+}
+
 pub struct App {
     paths: Paths,
     cwd: String,
@@ -230,6 +367,7 @@ pub struct App {
     stop: Arc<AtomicBool>,
     import_started: bool,
     search: Search,
+    records: Records,
     projects: Projects,
     install: Install,
     about_license: bool,
@@ -264,8 +402,10 @@ impl App {
                 show_scope: String::new(),
                 with_results: false,
                 output: String::new(),
+                hits: None,
                 task: Task::default(),
             },
+            records: Records::default(),
             projects: Projects {
                 reindex_scope: "all".into(),
                 ..Projects::default()
@@ -736,7 +876,16 @@ impl App {
         let ctx = ui.ctx().clone();
         let s = &mut self.search;
         if let Some(reply) = s.task.poll() {
-            s.output = text_of(reply);
+            match reply {
+                Ok(Response::Hits { hits, notes }) => {
+                    s.hits = Some((hits, notes));
+                    s.output.clear();
+                }
+                other => {
+                    s.hits = None;
+                    s.output = text_of(other);
+                }
+            }
         }
         let mut search_clicked = false;
         let mut show_clicked = false;
@@ -817,6 +966,7 @@ impl App {
                 limit: s.limit,
                 scope: scope_arg(&self.cwd, s.scope.trim()),
                 cwd: self.cwd.clone(),
+                structured: true,
             };
             let paths = self.paths.clone();
             s.task
@@ -841,12 +991,391 @@ impl App {
                 ui.spinner();
             }
         });
-        output(
+        let mut open = None;
+        match &s.hits {
+            Some((hits, notes)) => {
+                egui::ScrollArea::vertical()
+                    .id_salt("search-hits")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        open = hit_rows(ui, hits, notes, true, lang);
+                    });
+            }
+            None => output(
+                ui,
+                "search-output",
+                &s.output,
+                &tr!(lang, "Results appear here.", "결과가 여기에 표시됩니다."),
+            ),
+        }
+        if let Some(hit) = open
+            && let Some(prompt_id) = &hit.prompt_id
+        {
+            self.records.view.open_turn(&hit.project_id, prompt_id);
+            self.tab = Tab::Records;
+        }
+    }
+
+    /// 기록 탭. 프로젝트 → 세션 → 턴 → 턴 상세 순서로 본다. (FR-GUI-13~16)
+    fn records_tab(&mut self, ui: &mut egui::Ui) {
+        let lang = self.lang;
+        let ctx = ui.ctx().clone();
+        let cwd = self.cwd.clone();
+        let paths = self.paths.clone();
+        let projects: Vec<(String, String)> = match &self.status {
+            Some(Ok(st)) => st
+                .projects
+                .iter()
+                .map(|p| (p.id.clone(), p.location.clone()))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let r = &mut self.records;
+        if r.poll(lang) {
+            self.next_poll = Instant::now();
+        }
+        if r.view
+            .project
+            .as_ref()
+            .is_none_or(|p| !projects.iter().any(|(id, _)| id == p))
+            && let Some((id, _)) = projects.first()
+        {
+            r.view.select_project(id);
+        }
+        let mut delete = None;
+        ui.horizontal(|ui| {
+            ui.label(tr!(lang, "Project", "프로젝트"));
+            let selected = r
+                .view
+                .project
+                .as_ref()
+                .map(|id| project_label(&projects, id))
+                .unwrap_or_default();
+            egui::ComboBox::from_id_salt("records-project")
+                .width(TEXT_FIELD_WIDTH)
+                .selected_text(selected)
+                .show_ui(ui, |ui| {
+                    for (id, _) in &projects {
+                        let on = r.view.project.as_deref() == Some(id.as_str());
+                        if ui
+                            .selectable_label(on, project_label(&projects, id))
+                            .clicked()
+                        {
+                            r.view.select_project(id);
+                        }
+                    }
+                });
+            if ui.add(button(tr!(lang, "Refresh", "새로 고침"))).clicked() {
+                r.view.reload = Reload {
+                    sessions: true,
+                    turns: true,
+                    detail: true,
+                };
+            }
+            if let Some(id) = &r.view.project
+                && ui
+                    .add(button(tr!(lang, "Delete project", "프로젝트 삭제")))
+                    .clicked()
+            {
+                delete = Some(DeleteTarget::Project(id.clone()));
+            }
+            if let Some(message) = &r.message {
+                ui.separator();
+                ui.label(message);
+            }
+        });
+        if projects.is_empty() {
+            ui.weak(tr!(lang, "No project yet.", "아직 프로젝트가 없습니다."));
+            return;
+        }
+        ui.add_space(4.0);
+        let mut open_prompt = None;
+        card(
             ui,
-            "search-output",
-            &s.output,
-            &tr!(lang, "Results appear here.", "결과가 여기에 표시됩니다."),
+            &tr!(lang, "Query this project", "이 프로젝트에 질의"),
+            |ui| {
+                ui.horizontal(|ui| {
+                    let field = text_field(
+                        ui,
+                        TEXT_FIELD_WIDTH,
+                        &mut r.query,
+                        &tr!(lang, "query or prompt", "질의 또는 프롬프트"),
+                    );
+                    let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    ui.radio_value(&mut r.preview_mode, false, tr!(lang, "Search", "검색"));
+                    ui.radio_value(
+                        &mut r.preview_mode,
+                        true,
+                        tr!(lang, "Injection preview", "주입 미리 보기"),
+                    );
+                    let ready = !r.query_task.running && r.view.project.is_some();
+                    if (primary(ui, ready, tr!(lang, "Run", "실행")).clicked() || enter)
+                        && ready
+                        && let Some(id) = r.view.project.clone()
+                    {
+                        let req = if r.preview_mode {
+                            Request::InjectPreview {
+                                scope: QueryScope::Id(id),
+                                cwd: cwd.clone(),
+                                prompt: r.query.clone(),
+                            }
+                        } else {
+                            Request::Search {
+                                query: r.query.clone(),
+                                kind: SearchKind::Iteration,
+                                limit: RECORDS_SEARCH_LIMIT,
+                                scope: QueryScope::Id(id),
+                                cwd: cwd.clone(),
+                                structured: true,
+                            }
+                        };
+                        let paths = paths.clone();
+                        r.query_task
+                            .start(&ctx, move || query(&paths, &req, QUERY_TIMEOUT));
+                    }
+                    if r.query_task.running {
+                        ui.spinner();
+                    }
+                });
+                if let Some(out) = &r.query_out {
+                    egui::ScrollArea::vertical()
+                        .id_salt("records-query")
+                        .max_height(QUERY_HEIGHT)
+                        .show(ui, |ui| match out {
+                            Ok(QueryOut::Hits(hits, notes)) => {
+                                open_prompt = hit_rows(ui, hits, notes, false, lang)
+                                    .and_then(|h| h.prompt_id.clone());
+                            }
+                            Ok(QueryOut::Preview(plan, elapsed_ms)) => {
+                                preview_view(ui, plan, *elapsed_ms, lang);
+                            }
+                            Err(e) => {
+                                ui.colored_label(ui.visuals().error_fg_color, e);
+                            }
+                        });
+                }
+            },
         );
+        if let Some(prompt_id) = open_prompt {
+            r.view.select_turn(&prompt_id);
+        }
+        ui.add_space(4.0);
+        let project = r.view.project.clone().unwrap_or_default();
+        ui.columns(3, |cols| {
+            let ui = &mut cols[0];
+            ui.horizontal(|ui| {
+                ui.strong(tr!(lang, "Sessions", "세션"));
+                if let Some(session_id) = &r.view.session
+                    && ui.small_button(tr!(lang, "Delete", "삭제")).clicked()
+                {
+                    delete = Some(DeleteTarget::Session {
+                        project: project.clone(),
+                        session_id: session_id.clone(),
+                    });
+                }
+            });
+            let filter_hint = tr!(
+                lang,
+                "filter (3+ chars: full text)",
+                "필터 (3자 이상은 전문 검색)"
+            );
+            if text_field(
+                ui,
+                ui.available_width(),
+                &mut r.session_filter,
+                &filter_hint,
+            )
+            .changed()
+            {
+                r.view.set_session_filter(&r.session_filter);
+            }
+            match &r.sessions {
+                None => {
+                    ui.spinner();
+                }
+                Some(Err(e)) => {
+                    ui.colored_label(ui.visuals().error_fg_color, e);
+                }
+                Some(Ok(page)) => {
+                    if let Some(to) = pager(ui, r.view.session_page, page.total, lang) {
+                        r.view.session_page_to(to, page.total);
+                    }
+                    egui::ScrollArea::vertical()
+                        .id_salt("records-sessions")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for item in &page.items {
+                                let on =
+                                    r.view.session.as_deref() == Some(item.session_id.as_str());
+                                let label = tr!(
+                                    lang,
+                                    "{}  {}  turns {}  iterations {}\n{}",
+                                    "{}  {}  턴 {}  반복 {}\n{}",
+                                    ts_label(&item.started_at),
+                                    short(&item.session_id),
+                                    item.turns,
+                                    item.iterations,
+                                    item.first_prompt
+                                );
+                                if ui.selectable_label(on, label).clicked() {
+                                    r.view.select_session(&item.session_id);
+                                }
+                            }
+                        });
+                }
+            }
+
+            let ui = &mut cols[1];
+            ui.horizontal(|ui| {
+                ui.strong(tr!(lang, "Turns", "턴"));
+                if r.view.session.is_some()
+                    && let Some(prompt_id) = &r.view.prompt
+                    && ui.small_button(tr!(lang, "Delete", "삭제")).clicked()
+                {
+                    delete = Some(DeleteTarget::Turn {
+                        project: project.clone(),
+                        prompt_id: prompt_id.clone(),
+                    });
+                }
+            });
+            if r.view.session.is_none() {
+                ui.weak(tr!(lang, "Select a session.", "세션을 고르십시오."));
+            } else {
+                if text_field(ui, ui.available_width(), &mut r.turn_filter, &filter_hint).changed()
+                {
+                    r.view.set_turn_filter(&r.turn_filter);
+                }
+                match &r.turns {
+                    None => {
+                        ui.spinner();
+                    }
+                    Some(Err(e)) => {
+                        ui.colored_label(ui.visuals().error_fg_color, e);
+                    }
+                    Some(Ok(page)) => {
+                        if let Some(to) = pager(ui, r.view.turn_page, page.total, lang) {
+                            r.view.turn_page_to(to, page.total);
+                        }
+                        egui::ScrollArea::vertical()
+                            .id_salt("records-turns")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for item in &page.items {
+                                    let label = tr!(
+                                        lang,
+                                        "{}  {}  iterations {}  {}\n{}",
+                                        "{}  {}  반복 {}  {}\n{}",
+                                        ts_label(&item.ts),
+                                        item.prompt_id.as_deref().map(short).unwrap_or_default(),
+                                        item.iterations,
+                                        embed_state(item.pending, lang),
+                                        item.prompt
+                                    );
+                                    let Some(prompt_id) = &item.prompt_id else {
+                                        ui.weak(label);
+                                        continue;
+                                    };
+                                    let on = r.view.prompt.as_deref() == Some(prompt_id.as_str());
+                                    if ui.selectable_label(on, label).clicked() {
+                                        r.view.select_turn(prompt_id);
+                                    }
+                                }
+                            });
+                    }
+                }
+            }
+
+            let ui = &mut cols[2];
+            ui.horizontal(|ui| {
+                ui.strong(tr!(lang, "Turn detail", "턴 상세"));
+                if r.view.session.is_none()
+                    && let Some(prompt_id) = &r.view.prompt
+                    && ui.small_button(tr!(lang, "Delete", "삭제")).clicked()
+                {
+                    delete = Some(DeleteTarget::Turn {
+                        project: project.clone(),
+                        prompt_id: prompt_id.clone(),
+                    });
+                }
+            });
+            match (&r.view.prompt, &r.detail) {
+                (None, _) => {
+                    ui.weak(tr!(lang, "Select a turn.", "턴을 고르십시오."));
+                }
+                (Some(_), None) => {
+                    ui.spinner();
+                }
+                (Some(_), Some(Err(e))) => {
+                    ui.colored_label(ui.visuals().error_fg_color, e);
+                }
+                (Some(prompt_id), Some(Ok(iterations))) => {
+                    mono_cell(ui, &format!("prompt {prompt_id}"));
+                    egui::ScrollArea::vertical()
+                        .id_salt("records-detail")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if iterations.is_empty() {
+                                ui.weak(tr!(lang, "No records.", "기록 없음"));
+                            }
+                            for it in iterations {
+                                iteration_view(ui, it, lang);
+                            }
+                        });
+                }
+            }
+        });
+        if let Some(target) = delete {
+            r.ask_delete(&ctx, &paths, &cwd, target);
+        }
+        r.start_loads(&ctx, &paths, &cwd);
+        if let Some((target, report)) = r.confirm.clone() {
+            let mut close = false;
+            let mut confirmed = false;
+            let modal = egui::Modal::new(egui::Id::unique("records-delete")).show(&ctx, |ui| {
+                ui.set_max_width(MODAL_WIDTH);
+                ui.label(
+                    RichText::new(tr!(lang, "Delete", "삭제"))
+                        .strong()
+                        .size(16.0),
+                );
+                ui.add_space(4.0);
+                match &report {
+                    Ok(Some(report)) => {
+                        ui.label(render_delete_report(report, lang));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if primary(ui, true, tr!(lang, "Delete", "삭제")).clicked() {
+                                confirmed = true;
+                            }
+                            if ui.add(button(tr!(lang, "Cancel", "취소"))).clicked() {
+                                close = true;
+                            }
+                        });
+                    }
+                    Ok(None) => {
+                        ui.label(tr!(lang, "Nothing to delete.", "대상 없음"));
+                        if ui.add(button("OK".into())).clicked() {
+                            close = true;
+                        }
+                    }
+                    Err(e) => {
+                        ui.colored_label(ui.visuals().error_fg_color, e);
+                        if ui.add(button("OK".into())).clicked() {
+                            close = true;
+                        }
+                    }
+                }
+            });
+            if confirmed {
+                let req = target.request(&cwd, false);
+                let paths = paths.clone();
+                r.delete_task
+                    .start(&ctx, move || (target, query(&paths, &req, QUERY_TIMEOUT)));
+            }
+            if confirmed || close || modal.should_close() {
+                r.confirm = None;
+            }
+        }
     }
 
     fn projects_tab(&mut self, ui: &mut egui::Ui) {
@@ -1148,6 +1677,7 @@ impl eframe::App for App {
             .frame(egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::same(14)))
             .show(ui, |ui| match self.tab {
                 Tab::Status => self.status_tab(ui),
+                Tab::Records => self.records_tab(ui),
                 Tab::Settings => self.settings_tab(ui),
                 Tab::Import => self.import_tab(ui),
                 Tab::Search => self.search_tab(ui),
@@ -1156,6 +1686,218 @@ impl eframe::App for App {
                 Tab::About => self.about_tab(ui),
             });
     }
+}
+
+fn error_of(reply: Reply) -> String {
+    text_of(reply).trim_end().to_string()
+}
+
+fn short(id: &str) -> String {
+    id.chars().take(SESSION_ID_SHORT).collect()
+}
+
+/// ISO 8601 시각을 `YYYY-MM-DD HH:MM:SS`로 보여 준다.
+fn ts_label(ts: &str) -> String {
+    ts.replace('T', " ").chars().take(TS_CHARS).collect()
+}
+
+fn project_label(projects: &[(String, String)], id: &str) -> String {
+    let location = projects
+        .iter()
+        .find(|(p, _)| p == id)
+        .map_or("", |(_, l)| l.as_str());
+    format!("{}  {location}", short(id))
+}
+
+/// 이전·다음 페이지 버튼. 누르면 옮길 페이지를 돌려준다. (FR-GUI-13)
+fn pager(ui: &mut egui::Ui, page: usize, total: u64, lang: Lang) -> Option<usize> {
+    let pages = page_count(total);
+    let mut to = None;
+    ui.horizontal(|ui| {
+        if ui.add_enabled(page > 0, egui::Button::new("◀")).clicked() {
+            to = Some(page - 1);
+        }
+        ui.label(format!("{}/{pages}", page + 1));
+        if ui
+            .add_enabled(page + 1 < pages, egui::Button::new("▶"))
+            .clicked()
+        {
+            to = Some(page + 1);
+        }
+        ui.weak(tr!(lang, "{total} total", "전체 {total}개"));
+    });
+    to
+}
+
+/// 검색 결과 목록. 누른 반복 결과를 돌려준다. (FR-GUI-16, FR-GUI-17)
+fn hit_rows<'a>(
+    ui: &mut egui::Ui,
+    hits: &'a [HitView],
+    notes: &[String],
+    in_search_tab: bool,
+    lang: Lang,
+) -> Option<&'a HitView> {
+    for note in notes {
+        ui.colored_label(WARN_COLOR, note);
+    }
+    if hits.is_empty() {
+        ui.weak(tr!(lang, "No results", "결과 없음"));
+        return None;
+    }
+    let mut clicked = None;
+    for (n, hit) in hits.iter().enumerate() {
+        let sim = hit
+            .similarity
+            .map_or_else(|| "-".to_string(), |s| format!("{s:.3}"));
+        let project = if in_search_tab {
+            format!("project={}  ", short(&hit.project_id))
+        } else {
+            String::new()
+        };
+        let head = format!(
+            "{}. [{}] {}  score={:.4} sim={sim}  {project}prompt={}",
+            n + 1,
+            hit.kind,
+            hit.id,
+            hit.score,
+            hit.prompt_id.as_deref().unwrap_or("-")
+        );
+        ui.horizontal(|ui| {
+            if hit.kind == RecordKind::Iteration.as_str() && hit.prompt_id.is_some() {
+                let text = if in_search_tab {
+                    tr!(lang, "Open in records", "기록에서 열기")
+                } else {
+                    tr!(lang, "Open", "열기")
+                };
+                if ui.small_button(text).clicked() {
+                    clicked = Some(hit);
+                }
+            }
+            ui.add(egui::Label::new(RichText::new(head).monospace()).truncate());
+        });
+        ui.add(egui::Label::new(RichText::new(&hit.preview).weak()).truncate());
+    }
+    clicked
+}
+
+/// 주입 미리 보기: 무주입 사유, 또는 후보별 판정과 최종 주입 텍스트. (FR-GUI-16)
+fn preview_view(ui: &mut egui::Ui, plan: &InjectionPlan, elapsed_ms: u64, lang: Lang) {
+    ui.weak(tr!(
+        lang,
+        "Took {elapsed_ms} ms",
+        "걸린 시간 {elapsed_ms}ms"
+    ));
+    let (candidates, text) = match plan {
+        InjectionPlan::Skipped { reason } => {
+            ui.label(tr!(
+                lang,
+                "Not injected: {}",
+                "주입하지 않음: {}",
+                skip_label(*reason, lang)
+            ));
+            return;
+        }
+        InjectionPlan::Planned { candidates, text } => (candidates, text),
+    };
+    egui::Grid::new("inject-candidates")
+        .striped(true)
+        .show(ui, |ui| {
+            for head in [
+                tr!(lang, "rank", "순위"),
+                tr!(lang, "similarity", "유사도"),
+                tr!(lang, "verdict", "판정"),
+                "prompt".to_string(),
+                tr!(lang, "iteration", "반복"),
+            ] {
+                ui.strong(head);
+            }
+            ui.end_row();
+            for c in candidates {
+                ui.label(c.rank.to_string());
+                ui.label(
+                    c.similarity
+                        .map_or_else(|| "-".to_string(), |s| format!("{s:.3}")),
+                );
+                ui.label(verdict_label(c.verdict, lang));
+                ui.monospace(c.prompt_id.as_deref().map(short).unwrap_or_default());
+                ui.monospace(&c.iteration_id);
+                ui.end_row();
+            }
+        });
+    ui.add_space(4.0);
+    match text {
+        Some(text) => {
+            ui.strong(tr!(lang, "Injected text", "주입 텍스트"));
+            ui.label(RichText::new(text).monospace());
+        }
+        None => {
+            ui.weak(tr!(lang, "Nothing is injected.", "주입할 내용이 없습니다."));
+        }
+    }
+}
+
+/// 반복 하나. 결과 원문은 처음에 접어 둔다. (FR-GUI-13)
+fn iteration_view(ui: &mut egui::Ui, it: &IterationView, lang: Lang) {
+    let (input_label, response_label, result_label) = match lang {
+        Lang::En => ("[input]", "[response]", "result"),
+        Lang::Ko => ("[입력]", "[응답]", "결과"),
+    };
+    ui.label(
+        RichText::new(format!(
+            "[{}] {}  {}",
+            it.iteration_index,
+            ts_label(&it.ts),
+            short(&it.session_id)
+        ))
+        .strong(),
+    );
+    for input in &it.inputs {
+        ui.label(format!("{input_label} {input}"));
+    }
+    for (n, tool) in it.tools.iter().enumerate() {
+        let error = if tool.is_error { " (error)" } else { "" };
+        let input: String = tool.input.chars().take(TOOL_INPUT_CHARS).collect();
+        let cut = if input.len() < tool.input.len() {
+            "…"
+        } else {
+            ""
+        };
+        ui.label(RichText::new(format!("{}({input}{cut}){error}", tool.name)).monospace());
+        if !cut.is_empty() {
+            egui::CollapsingHeader::new(tr!(lang, "full input", "입력 전체"))
+                .id_salt((&it.id, n, "input"))
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.label(RichText::new(&tool.input).monospace());
+                });
+        }
+        if let Some(result) = &tool.result {
+            egui::CollapsingHeader::new(result_label)
+                .id_salt((&it.id, n, "result"))
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.label(RichText::new(result).monospace());
+                });
+        }
+        for done in &tool.completions {
+            ui.label(format!(
+                "bg #{} {}: {}",
+                done.seq, done.status, done.summary
+            ));
+            if let Some(result) = &done.result {
+                egui::CollapsingHeader::new(result_label)
+                    .id_salt((&it.id, n, done.seq))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(result).monospace());
+                    });
+            }
+        }
+    }
+    if !it.response.is_empty() {
+        ui.label(format!("{response_label} {}", it.response));
+    }
+    ui.separator();
 }
 
 fn kind_name(kind: SearchKind) -> &'static str {

@@ -1252,3 +1252,219 @@ fn answer_followed_by_response_in_same_iteration_has_no_trailing_blank() {
         "{text}"
     );
 }
+
+// ---- FR-GUI-13, FR-GUI-16 ----
+
+use hippo::search::{InjectionPlan, SkipReason, Verdict, plan_injection, turn_views};
+
+fn plan(env: &Env, query: &str, exclude: Option<&str>, config: InjectConfig) -> InjectionPlan {
+    plan_injection(&env.records, env.backends(), query, exclude, config, None).unwrap()
+}
+
+fn verdicts(plan: &InjectionPlan) -> Vec<(String, Verdict)> {
+    match plan {
+        InjectionPlan::Planned { candidates, .. } => candidates
+            .iter()
+            .map(|c| (c.prompt_id.clone().unwrap_or_default(), c.verdict))
+            .collect(),
+        InjectionPlan::Skipped { reason } => panic!("{reason:?}"),
+    }
+}
+
+fn selected(plan: &InjectionPlan) -> Vec<String> {
+    let mut out: Vec<String> = verdicts(plan)
+        .into_iter()
+        .filter(|(_, v)| *v == Verdict::Selected)
+        .map(|(p, _)| p)
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn plan_selects_the_same_turns_as_build_injection() {
+    let env = Env::standard();
+    let excluded = plan(&env, RELEVANT, Some("s-cur"), CONFIG);
+    let text = inject(&env, RELEVANT, CONFIG).unwrap();
+    let mut injected: Vec<String> = ["p-m1", "p-m2", "p-m3", "p-m4"]
+        .into_iter()
+        .filter(|p| text.contains(&format!("prompt=\"{p}\"")))
+        .map(str::to_string)
+        .collect();
+    injected.sort();
+    assert_eq!(selected(&excluded), injected);
+    match &excluded {
+        InjectionPlan::Planned {
+            text: t,
+            candidates,
+        } => {
+            assert_eq!(
+                t.as_deref(),
+                Some(text.as_str()),
+                "같은 함수로 만든 주입 텍스트"
+            );
+            let ranks: Vec<usize> = candidates.iter().map(|c| c.rank).collect();
+            assert_eq!(ranks, (1..=candidates.len()).collect::<Vec<_>>());
+            assert!(candidates.iter().all(|c| c.similarity.is_some()));
+        }
+        other => panic!("{other:?}"),
+    }
+    let all = plan(&env, RELEVANT, None, CONFIG);
+    assert!(
+        selected(&all).contains(&"p-m4".to_string()),
+        "미리 보기는 세션 제외 없음"
+    );
+    assert!(
+        verdicts(&all).contains(&("p-m2".to_string(), Verdict::BelowThreshold)),
+        "{:?}",
+        verdicts(&all)
+    );
+}
+
+#[test]
+fn plan_marks_same_turn_over_count_and_over_length() {
+    let env = Env::new(
+        vec![
+            turn_it(
+                "s-old",
+                "p-a",
+                0,
+                "2026-11-01T00:00:00Z",
+                prompt(RELEVANT),
+                &[RELEVANT],
+                vec![],
+            ),
+            turn_it(
+                "s-old",
+                "p-a",
+                1,
+                "2026-11-01T00:00:01Z",
+                vec![],
+                &[RELEVANT],
+                vec![],
+            ),
+            turn_it(
+                "s-old",
+                "p-b",
+                0,
+                "2026-11-01T00:01:00Z",
+                prompt(RELEVANT),
+                &[RELEVANT],
+                vec![],
+            ),
+        ],
+        HashEmbedder::new(256, 8_000),
+    );
+    let loose = InjectConfig {
+        threshold: -1.0,
+        ..CONFIG
+    };
+    let v = verdicts(&plan(&env, RELEVANT, None, loose));
+    assert!(
+        v.iter().any(|(p, x)| p == "p-a" && *x == Verdict::SameTurn),
+        "{v:?}"
+    );
+    let one = verdicts(&plan(
+        &env,
+        RELEVANT,
+        None,
+        InjectConfig { top_k: 1, ..loose },
+    ));
+    assert_eq!(
+        one.iter().filter(|(_, x)| *x == Verdict::Selected).count(),
+        1
+    );
+    assert!(one.iter().any(|(_, x)| *x == Verdict::OverCount), "{one:?}");
+    let tight = verdicts(&plan(
+        &env,
+        RELEVANT,
+        None,
+        InjectConfig {
+            total_chars: 350,
+            ..loose
+        },
+    ));
+    assert!(
+        tight.iter().any(|(_, x)| *x == Verdict::OverLength),
+        "{tight:?}"
+    );
+}
+
+#[test]
+fn plan_reports_skip_reasons() {
+    let env = Env::standard();
+    let reason = |query: &str, backends: bool, min: usize| {
+        let config = InjectConfig {
+            min_prompt_chars: min,
+            ..CONFIG
+        };
+        let backends = if backends { env.backends() } else { None };
+        match plan_injection(&env.records, backends, query, None, config, None).unwrap() {
+            InjectionPlan::Skipped { reason } => Some(reason),
+            InjectionPlan::Planned { .. } => None,
+        }
+    };
+    assert_eq!(reason("   ", true, 0), Some(SkipReason::EmptyPrompt));
+    assert_eq!(
+        reason(
+            "<task-notification>done</task-notification> 긴 문장입니다",
+            true,
+            0
+        ),
+        Some(SkipReason::TaskNotification)
+    );
+    assert_eq!(reason("짧은말", true, 11), Some(SkipReason::TooShort));
+    assert_eq!(
+        reason(RELEVANT, false, 0),
+        Some(SkipReason::VectorUnavailable)
+    );
+    assert_eq!(reason(RELEVANT, true, 11), None);
+}
+
+#[test]
+fn turn_views_hold_show_with_results_content() {
+    let (mut ex, events) = run_fixture("s2_tools.jsonl");
+    let mut its = iterations(&events);
+    its.extend(iterations(&ex.finish_turn()));
+    let prompt_id = its[0].prompt_id.clone().unwrap();
+    let mut records = RecordStore::open_in_memory().unwrap();
+    records
+        .apply(&Batch {
+            session_id: its[0].session_id.clone(),
+            transcript_path: "/t".into(),
+            iterations: its
+                .into_iter()
+                .map(|i| {
+                    let embed_text = build_embed_text(&i, 500, &[]);
+                    NewIteration {
+                        iteration: i,
+                        embed_text,
+                    }
+                })
+                .collect(),
+            completions: vec![],
+            state: ExtractorState::default(),
+            bulk: false,
+        })
+        .unwrap();
+    let views = turn_views(&records, &prompt_id).unwrap();
+    let shown = render_turn(&records, &prompt_id, true, Lang::En).unwrap();
+    assert_eq!(views.len(), shown.matches("\n## [").count());
+    for it in &views {
+        assert!(shown.contains(&it.id));
+        for tool in &it.tools {
+            assert!(shown.contains(&format!("{}({})", tool.name, tool.input)));
+            if let Some(result) = &tool.result {
+                let first = result.lines().next().unwrap_or_default();
+                assert!(shown.contains(&format!("    | {first}")), "{first}");
+            }
+        }
+    }
+    assert!(
+        views
+            .iter()
+            .flat_map(|i| &i.tools)
+            .any(|t| t.result.is_some())
+    );
+    assert!(turn_views(&records, "nope").unwrap().is_empty());
+}

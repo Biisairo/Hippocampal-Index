@@ -35,9 +35,9 @@ use crate::queue::{EmbedQueue, Lane, LaneQueue};
 use crate::redact::Redactor;
 use crate::registry::{GIT_DIR_NAME, Registry, RegistryError, is_project_id};
 use crate::search::{
-    InjectConfig, ProjectSearch, SearchError, SearchKind, SearchRequest, VectorBackends,
-    build_injection, escape_control, missing_turn, render_hits, render_project_hits, render_turn,
-    search, search_projects,
+    InjectConfig, InjectionPlan, ProjectSearch, SearchError, SearchKind, SearchRequest, SkipReason,
+    VectorBackends, build_injection, escape_control, hit_views, missing_turn, plan_injection,
+    render_hits, render_project_hits, render_turn, search, search_projects, turn_views,
 };
 use crate::spool;
 use crate::store::{EmbedJob, ForgetCounts, ForgetTarget, RecordStore};
@@ -1477,8 +1477,57 @@ fn handle_request(shared: &Arc<Shared>, req: Request) -> Response {
             limit,
             scope,
             cwd,
+            structured: true,
+        } => search_hits(shared, query, kind, limit, &scope, &cwd),
+        Request::Search {
+            query,
+            kind,
+            limit,
+            scope,
+            cwd,
+            structured: false,
         } => search_scope(shared, query, kind, limit, &scope, &cwd)
             .map(|text| Response::Text { text }),
+        Request::SessionList {
+            scope,
+            cwd,
+            filter,
+            offset,
+            limit,
+        } => browse_project(shared, &scope, &cwd).and_then(|(_, records)| {
+            records
+                .session_page(&filter, offset, limit)
+                .map(Response::Sessions)
+                .map_err(|e| e.to_string())
+        }),
+        Request::TurnList {
+            scope,
+            cwd,
+            session_id,
+            filter,
+            offset,
+            limit,
+        } => browse_project(shared, &scope, &cwd).and_then(|(_, records)| {
+            records
+                .turn_page(&session_id, &filter, offset, limit)
+                .map(Response::Turns)
+                .map_err(|e| e.to_string())
+        }),
+        Request::TurnDetail {
+            scope,
+            cwd,
+            prompt_id,
+        } => browse_project(shared, &scope, &cwd).and_then(|(project_id, records)| {
+            turn_views(&records, &prompt_id)
+                .map(|iterations| Response::Turn {
+                    project_id,
+                    iterations,
+                })
+                .map_err(|e| e.to_string())
+        }),
+        Request::InjectPreview { scope, cwd, prompt } => {
+            inject_preview(shared, &scope, &cwd, &prompt)
+        }
         Request::Show {
             prompt_id,
             with_results,
@@ -1524,13 +1573,7 @@ fn inject(
     };
     let handle = shared.project(&id)?;
     let records = shared.records(&id)?;
-    let c = &shared.config.inject;
-    let config = InjectConfig {
-        threshold: c.threshold,
-        top_k: c.top_k,
-        total_chars: c.total_chars,
-        min_prompt_chars: c.min_prompt_chars,
-    };
+    let config = inject_config(shared);
     let budget = Duration::from_millis(budget_ms);
     let deadline = Instant::now() + budget;
     let result = build_injection(
@@ -1556,6 +1599,150 @@ fn inject(
         ));
     }
     result
+}
+
+/// 기록 탭이 다루는 프로젝트. 없으면 오류이다. (FR-GUI-13)
+fn browse_project(
+    shared: &Shared,
+    scope: &Scope,
+    cwd: &str,
+) -> Result<(String, RecordStore), String> {
+    let Some(id) = shared.scope_projects(scope, cwd)?.into_iter().next() else {
+        return Err(no_project(shared.lang()).trim_end().to_string());
+    };
+    let records = shared.records(&id)?;
+    Ok((id, records))
+}
+
+fn inject_config(shared: &Shared) -> InjectConfig {
+    let c = &shared.config.inject;
+    InjectConfig {
+        threshold: c.threshold,
+        top_k: c.top_k,
+        total_chars: c.total_chars,
+        min_prompt_chars: c.min_prompt_chars,
+    }
+}
+
+/// 자동 주입과 같은 설정과 계산으로 후보와 판정을 돌려준다. 세션 제외와 시간 예산은 적용하지 않는다. (FR-GUI-16)
+fn inject_preview(
+    shared: &Shared,
+    scope: &Scope,
+    cwd: &str,
+    prompt: &str,
+) -> Result<Response, String> {
+    let started = Instant::now();
+    let _active = shared.inject_gate.enter();
+    let elapsed_ms =
+        |started: Instant| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let Some(id) = shared.scope_projects(scope, cwd)?.into_iter().next() else {
+        return Ok(Response::InjectPreview {
+            plan: InjectionPlan::Skipped {
+                reason: SkipReason::NoProject,
+            },
+            elapsed_ms: elapsed_ms(started),
+        });
+    };
+    let handle = shared.project(&id)?;
+    let records = shared.records(&id)?;
+    let plan = plan_injection(
+        &records,
+        handle.backends(
+            shared.embedder.as_ref(),
+            shared.query_chars(),
+            &shared.config.embedder.query_prefix,
+        ),
+        prompt,
+        None,
+        inject_config(shared),
+        None,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(Response::InjectPreview {
+        plan,
+        elapsed_ms: elapsed_ms(started),
+    })
+}
+
+/// 구조화 검색 결과. 범위가 프로젝트 하나면 `search`의 점수를, `all`이면 합친 점수를 쓴다.
+/// 벡터 검색이 실패한 프로젝트는 FTS 결과만 쓰고 `notes`에 안내한다. (FR-GUI-16, FR-GUI-17, FR-RET-8)
+fn search_hits(
+    shared: &Shared,
+    query: String,
+    kind: SearchKind,
+    limit: usize,
+    scope: &Scope,
+    cwd: &str,
+) -> Result<Response, String> {
+    let req = SearchRequest {
+        query,
+        kind,
+        exclude_session: None,
+        limit,
+    };
+    let lang = shared.lang();
+    let mut opened = Vec::new();
+    for id in shared.scope_projects(scope, cwd)? {
+        let handle = shared.project(&id)?;
+        let records = shared.records(&id)?;
+        opened.push((id, records, handle));
+    }
+    let mut hits = Vec::new();
+    let mut notes = Vec::new();
+    if *scope != Scope::All {
+        let Some((id, records, handle)) = opened.first() else {
+            notes.push(no_project(lang).trim_end().to_string());
+            return Ok(Response::Hits { hits, notes });
+        };
+        let backends = handle.backends(
+            shared.embedder.as_ref(),
+            shared.query_chars(),
+            &shared.config.embedder.query_prefix,
+        );
+        let found = match search(records, backends, &req, None) {
+            Ok(found) => found,
+            Err(e @ (SearchError::Embed(_) | SearchError::Vector(_))) => {
+                notes.push(fallback_note(id, &e.to_string(), lang));
+                search(records, None, &req, None).map_err(|e| e.to_string())?
+            }
+            Err(e) => return Err(e.to_string()),
+        };
+        hits = hit_views(records, &found, id).map_err(|e| e.to_string())?;
+        return Ok(Response::Hits { hits, notes });
+    }
+    let projects: Vec<ProjectSearch> = opened
+        .iter()
+        .map(|(id, records, handle)| ProjectSearch {
+            id,
+            records,
+            backends: handle.backends(
+                shared.embedder.as_ref(),
+                shared.query_chars(),
+                &shared.config.embedder.query_prefix,
+            ),
+        })
+        .collect();
+    let result = search_projects(&projects, &req).map_err(|e| e.to_string())?;
+    for (id, reason) in &result.fallbacks {
+        notes.push(fallback_note(id, reason, lang));
+    }
+    for found in &result.hits {
+        if let Some(p) = projects.iter().find(|p| p.id == found.project) {
+            hits.extend(
+                hit_views(p.records, std::slice::from_ref(&found.hit), p.id)
+                    .map_err(|e| e.to_string())?,
+            );
+        }
+    }
+    Ok(Response::Hits { hits, notes })
+}
+
+fn fallback_note(id: &str, reason: &str, lang: Lang) -> String {
+    tr!(
+        lang,
+        "project {id}: vector search unavailable, using keyword results only: {reason}",
+        "프로젝트 {id}: 벡터 검색을 쓰지 못해 키워드 검색 결과만 사용합니다: {reason}"
+    )
 }
 
 fn search_scope(

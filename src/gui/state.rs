@@ -1,4 +1,4 @@
-//! 화면과 분리한 GUI 상태 로직. (FR-GUI-7, FR-GUI-8, FR-GUI-10)
+//! 화면과 분리한 GUI 상태 로직. (FR-GUI-7, FR-GUI-8, FR-GUI-10, FR-GUI-13~17)
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6,8 +6,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::commands::{ImportTally, absolute, session_line};
 use crate::i18n::Lang;
 use crate::import::{Candidate, ImportStatus};
-use crate::protocol::{Request, Response};
+use crate::protocol::{Request, Response, Scope};
 use crate::registry::is_project_id;
+use crate::search::{SkipReason, Verdict};
+use crate::store::ForgetTarget;
+use crate::tr;
 
 /// 가져오기 탭의 입력과 미리 보기 결과. (FR-GUI-7)
 #[derive(Debug, Clone, Default)]
@@ -244,5 +247,227 @@ impl InstallForm {
 
     pub fn can_run(&self, action: InstallAction) -> bool {
         self.previewed.as_ref() == Some(&self.key(action))
+    }
+}
+
+/// 기록 탭의 한 페이지 크기. (FR-GUI-13)
+pub const PAGE_SIZE: usize = 50;
+
+/// 기록 탭에서 지울 대상. (FR-GUI-15)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteTarget {
+    Project(String),
+    Session { project: String, session_id: String },
+    Turn { project: String, prompt_id: String },
+}
+
+impl DeleteTarget {
+    pub fn request(&self, cwd: &str, dry_run: bool) -> Request {
+        let forget = |project: &str, target: ForgetTarget| Request::Forget {
+            target,
+            scope: Some(Scope::Id(project.to_string())),
+            cwd: cwd.to_string(),
+            dry_run,
+        };
+        match self {
+            Self::Project(id) => Request::ProjectRemove {
+                project: id.clone(),
+                cwd: cwd.to_string(),
+                dry_run,
+            },
+            Self::Session {
+                project,
+                session_id,
+            } => forget(project, ForgetTarget::Session(session_id.clone())),
+            Self::Turn { project, prompt_id } => {
+                forget(project, ForgetTarget::Prompt(prompt_id.clone()))
+            }
+        }
+    }
+}
+
+/// 다시 불러올 목록.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Reload {
+    pub sessions: bool,
+    pub turns: bool,
+    pub detail: bool,
+}
+
+/// 기록 탭의 선택, 필터, 페이지. 위 단계를 바꾸면 아래 단계의 선택을 지운다. (FR-GUI-13~17)
+#[derive(Debug, Clone, Default)]
+pub struct RecordsView {
+    pub project: Option<String>,
+    pub session: Option<String>,
+    pub prompt: Option<String>,
+    pub session_filter: String,
+    pub turn_filter: String,
+    pub session_page: usize,
+    pub turn_page: usize,
+    pub reload: Reload,
+}
+
+impl RecordsView {
+    pub fn select_project(&mut self, id: &str) {
+        if self.project.as_deref() == Some(id) {
+            return;
+        }
+        self.project = Some(id.to_string());
+        self.session = None;
+        self.prompt = None;
+        self.session_page = 0;
+        self.turn_page = 0;
+        self.reload = Reload {
+            sessions: true,
+            ..Reload::default()
+        };
+    }
+
+    pub fn select_session(&mut self, id: &str) {
+        self.session = Some(id.to_string());
+        self.prompt = None;
+        self.turn_page = 0;
+        self.reload.turns = true;
+    }
+
+    pub fn select_turn(&mut self, prompt_id: &str) {
+        self.prompt = Some(prompt_id.to_string());
+        self.reload.detail = true;
+    }
+
+    pub fn set_session_filter(&mut self, filter: &str) {
+        self.session_filter = filter.to_string();
+        self.session_page = 0;
+        self.reload.sessions = true;
+    }
+
+    pub fn set_turn_filter(&mut self, filter: &str) {
+        self.turn_filter = filter.to_string();
+        self.turn_page = 0;
+        self.reload.turns = true;
+    }
+
+    /// 마지막 페이지를 넘지 않게 바꾼다.
+    pub fn session_page_to(&mut self, page: usize, total: u64) {
+        self.session_page = page.min(page_count(total) - 1);
+        self.reload.sessions = true;
+    }
+
+    pub fn turn_page_to(&mut self, page: usize, total: u64) {
+        self.turn_page = page.min(page_count(total) - 1);
+        self.reload.turns = true;
+    }
+
+    pub fn session_request(&self, cwd: &str) -> Option<Request> {
+        Some(Request::SessionList {
+            scope: Scope::Id(self.project.clone()?),
+            cwd: cwd.to_string(),
+            filter: self.session_filter.clone(),
+            offset: self.session_page * PAGE_SIZE,
+            limit: PAGE_SIZE,
+        })
+    }
+
+    pub fn turn_request(&self, cwd: &str) -> Option<Request> {
+        Some(Request::TurnList {
+            scope: Scope::Id(self.project.clone()?),
+            cwd: cwd.to_string(),
+            session_id: self.session.clone()?,
+            filter: self.turn_filter.clone(),
+            offset: self.turn_page * PAGE_SIZE,
+            limit: PAGE_SIZE,
+        })
+    }
+
+    pub fn detail_request(&self, cwd: &str) -> Option<Request> {
+        Some(Request::TurnDetail {
+            scope: Scope::Id(self.project.clone()?),
+            cwd: cwd.to_string(),
+            prompt_id: self.prompt.clone()?,
+        })
+    }
+
+    /// 지운 대상의 선택을 지우고, 수가 바뀐 목록을 다시 불러오게 한다. (FR-GUI-15)
+    pub fn after_delete(&mut self, target: &DeleteTarget) {
+        match target {
+            DeleteTarget::Project(id) => {
+                if self.project.as_deref() == Some(id) {
+                    *self = Self {
+                        session_filter: std::mem::take(&mut self.session_filter),
+                        turn_filter: std::mem::take(&mut self.turn_filter),
+                        ..Self::default()
+                    };
+                }
+            }
+            DeleteTarget::Session { session_id, .. } => {
+                if self.session.as_deref() == Some(session_id) {
+                    self.session = None;
+                    self.prompt = None;
+                }
+                self.reload.sessions = true;
+            }
+            DeleteTarget::Turn { prompt_id, .. } => {
+                if self.prompt.as_deref() == Some(prompt_id) {
+                    self.prompt = None;
+                }
+                self.reload.sessions = true;
+                self.reload.turns = self.session.is_some();
+            }
+        }
+    }
+
+    /// 검색 결과의 턴을 연다. 세션 선택은 지운다. (FR-GUI-17)
+    pub fn open_turn(&mut self, project: &str, prompt_id: &str) {
+        self.project = None;
+        self.select_project(project);
+        self.select_turn(prompt_id);
+    }
+}
+
+/// 전체 개수에 필요한 페이지 수. 최소 1.
+pub fn page_count(total: u64) -> usize {
+    usize::try_from(total.div_ceil(PAGE_SIZE as u64))
+        .unwrap_or(usize::MAX)
+        .max(1)
+}
+
+/// 턴의 임베딩 상태. (FR-GUI-13)
+pub fn embed_state(pending: u64, lang: Lang) -> String {
+    if pending == 0 {
+        tr!(lang, "done", "완료")
+    } else {
+        tr!(lang, "pending {pending}", "대기 {pending}")
+    }
+}
+
+pub fn verdict_label(verdict: Verdict, lang: Lang) -> &'static str {
+    match (verdict, lang) {
+        (Verdict::Selected, Lang::En) => "selected",
+        (Verdict::BelowThreshold, Lang::En) => "below threshold",
+        (Verdict::FtsOnly, Lang::En) => "FTS only",
+        (Verdict::SameTurn, Lang::En) => "same turn",
+        (Verdict::OverLength, Lang::En) => "over length limit",
+        (Verdict::OverCount, Lang::En) => "over count",
+        (Verdict::Selected, Lang::Ko) => "선택",
+        (Verdict::BelowThreshold, Lang::Ko) => "임계값 미만",
+        (Verdict::FtsOnly, Lang::Ko) => "FTS 전용",
+        (Verdict::SameTurn, Lang::Ko) => "같은 턴",
+        (Verdict::OverLength, Lang::Ko) => "길이 한도 초과",
+        (Verdict::OverCount, Lang::Ko) => "개수 초과",
+    }
+}
+
+pub fn skip_label(reason: SkipReason, lang: Lang) -> &'static str {
+    match (reason, lang) {
+        (SkipReason::EmptyPrompt, Lang::En) => "empty prompt",
+        (SkipReason::TaskNotification, Lang::En) => "task notification",
+        (SkipReason::TooShort, Lang::En) => "shorter than min_prompt_chars",
+        (SkipReason::NoProject, Lang::En) => "no project",
+        (SkipReason::VectorUnavailable, Lang::En) => "vector search unavailable",
+        (SkipReason::EmptyPrompt, Lang::Ko) => "빈 프롬프트",
+        (SkipReason::TaskNotification, Lang::Ko) => "완료 알림",
+        (SkipReason::TooShort, Lang::Ko) => "min_prompt_chars 미만",
+        (SkipReason::NoProject, Lang::Ko) => "프로젝트 없음",
+        (SkipReason::VectorUnavailable, Lang::Ko) => "벡터 검색 불가",
     }
 }

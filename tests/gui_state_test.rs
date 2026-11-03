@@ -257,3 +257,241 @@ fn apply_and_remove_need_a_preview_with_the_same_inputs() {
         "실행 뒤에는 다시 미리 보기"
     );
 }
+
+// ---- FR-GUI-13~17 기록 탭 ----
+
+use hippo::gui::state::{
+    DeleteTarget, PAGE_SIZE, RecordsView, Reload, embed_state, page_count, skip_label,
+    verdict_label,
+};
+use hippo::protocol::Scope;
+use hippo::search::{SkipReason, Verdict};
+use hippo::store::ForgetTarget;
+
+fn browsing() -> RecordsView {
+    let mut v = RecordsView::default();
+    v.select_project("p1");
+    v.select_session("s1");
+    v.select_turn("t1");
+    v.reload = Reload::default();
+    v
+}
+
+#[test]
+fn selecting_a_level_resets_the_levels_below() {
+    let mut v = browsing();
+    v.select_session("s2");
+    assert_eq!(
+        (v.session.as_deref(), v.prompt.as_deref()),
+        (Some("s2"), None)
+    );
+    assert_eq!(
+        v.reload,
+        Reload {
+            sessions: false,
+            turns: true,
+            detail: false
+        }
+    );
+    v.select_project("p2");
+    assert_eq!(v.project.as_deref(), Some("p2"));
+    assert_eq!((v.session.clone(), v.prompt.clone()), (None, None));
+    assert_eq!(
+        v.reload,
+        Reload {
+            sessions: true,
+            turns: false,
+            detail: false
+        }
+    );
+    let mut same = browsing();
+    same.select_project("p1");
+    assert_eq!(
+        same.session.as_deref(),
+        Some("s1"),
+        "같은 프로젝트는 그대로"
+    );
+}
+
+#[test]
+fn requests_use_project_id_scope_and_page_offsets() {
+    let mut v = browsing();
+    v.set_session_filter("abc");
+    v.session_page_to(2, 500);
+    let Some(Request::SessionList {
+        scope,
+        filter,
+        offset,
+        limit,
+        ..
+    }) = v.session_request("/cwd")
+    else {
+        panic!()
+    };
+    assert_eq!(scope, Scope::Id("p1".into()));
+    assert_eq!(
+        (filter.as_str(), offset, limit),
+        ("abc", 2 * PAGE_SIZE, PAGE_SIZE)
+    );
+    v.session_page_to(99, 120);
+    assert_eq!(v.session_page, 2, "마지막 페이지로 제한");
+    v.set_session_filter("x");
+    assert_eq!(v.session_page, 0, "필터를 바꾸면 첫 페이지");
+    v.turn_page_to(1, 60);
+    let Some(Request::TurnList {
+        session_id, offset, ..
+    }) = v.turn_request("/cwd")
+    else {
+        panic!()
+    };
+    assert_eq!((session_id.as_str(), offset), ("s1", PAGE_SIZE));
+    let Some(Request::TurnDetail { prompt_id, .. }) = v.detail_request("/cwd") else {
+        panic!()
+    };
+    assert_eq!(prompt_id, "t1");
+    let empty = RecordsView::default();
+    assert!(empty.session_request("/").is_none());
+    assert!(empty.turn_request("/").is_none());
+    assert!(empty.detail_request("/").is_none());
+}
+
+#[test]
+fn page_count_has_at_least_one_page() {
+    assert_eq!(page_count(0), 1);
+    assert_eq!(page_count(50), 1);
+    assert_eq!(page_count(51), 2);
+}
+
+#[test]
+fn delete_targets_build_dry_run_and_real_requests() {
+    let session = DeleteTarget::Session {
+        project: "p1".into(),
+        session_id: "s1".into(),
+    };
+    assert_eq!(
+        session.request("/cwd", true),
+        Request::Forget {
+            target: ForgetTarget::Session("s1".into()),
+            scope: Some(Scope::Id("p1".into())),
+            cwd: "/cwd".into(),
+            dry_run: true,
+        }
+    );
+    let turn = DeleteTarget::Turn {
+        project: "p1".into(),
+        prompt_id: "t1".into(),
+    };
+    assert!(matches!(
+        turn.request("/cwd", false),
+        Request::Forget {
+            target: ForgetTarget::Prompt(_),
+            dry_run: false,
+            ..
+        }
+    ));
+    assert_eq!(
+        DeleteTarget::Project("p1".into()).request("/cwd", true),
+        Request::ProjectRemove {
+            project: "p1".into(),
+            cwd: "/cwd".into(),
+            dry_run: true,
+        }
+    );
+}
+
+#[test]
+fn after_delete_clears_the_deleted_selection_and_reloads_lists() {
+    let mut v = browsing();
+    v.after_delete(&DeleteTarget::Turn {
+        project: "p1".into(),
+        prompt_id: "t1".into(),
+    });
+    assert_eq!(
+        (v.session.as_deref(), v.prompt.as_deref()),
+        (Some("s1"), None)
+    );
+    assert_eq!(
+        v.reload,
+        Reload {
+            sessions: true,
+            turns: true,
+            detail: false
+        }
+    );
+
+    let mut v = browsing();
+    v.after_delete(&DeleteTarget::Session {
+        project: "p1".into(),
+        session_id: "s1".into(),
+    });
+    assert_eq!((v.session.clone(), v.prompt.clone()), (None, None));
+    assert_eq!(
+        v.reload,
+        Reload {
+            sessions: true,
+            turns: false,
+            detail: false
+        }
+    );
+
+    let mut v = browsing();
+    v.after_delete(&DeleteTarget::Project("p1".into()));
+    assert_eq!(
+        (v.project.clone(), v.session.clone(), v.prompt.clone()),
+        (None, None, None)
+    );
+}
+
+#[test]
+fn open_turn_from_search_selects_project_and_detail() {
+    let mut v = browsing();
+    v.open_turn("p2", "t9");
+    assert_eq!(v.project.as_deref(), Some("p2"));
+    assert_eq!(v.session, None);
+    assert_eq!(v.prompt.as_deref(), Some("t9"));
+    assert_eq!(
+        v.reload,
+        Reload {
+            sessions: true,
+            turns: false,
+            detail: true
+        }
+    );
+}
+
+#[test]
+fn labels_follow_the_srs_wording() {
+    assert_eq!(embed_state(0, Lang::Ko), "완료");
+    assert_eq!(embed_state(3, Lang::Ko), "대기 3");
+    assert_eq!(embed_state(3, Lang::En), "pending 3");
+    let ko: Vec<_> = [
+        Verdict::Selected,
+        Verdict::BelowThreshold,
+        Verdict::FtsOnly,
+        Verdict::SameTurn,
+        Verdict::OverLength,
+        Verdict::OverCount,
+    ]
+    .into_iter()
+    .map(|v| verdict_label(v, Lang::Ko))
+    .collect();
+    assert_eq!(
+        ko,
+        [
+            "선택",
+            "임계값 미만",
+            "FTS 전용",
+            "같은 턴",
+            "길이 한도 초과",
+            "개수 초과"
+        ]
+    );
+    assert_eq!(
+        skip_label(SkipReason::TooShort, Lang::Ko),
+        "min_prompt_chars 미만"
+    );
+    assert_eq!(
+        skip_label(SkipReason::VectorUnavailable, Lang::Ko),
+        "벡터 검색 불가"
+    );
+}

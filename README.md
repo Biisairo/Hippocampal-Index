@@ -351,14 +351,33 @@ Opens a native window (egui, no browser or web view). The command returns when y
 | Tab | What it does |
 |-----|--------------|
 | Status | Asks the daemon for its status every 2 seconds: spool, reindex state, and a table per project with pending embeddings, rate, and time left. While the window is open, the daemon stays up. |
+| Records | Browse the records of one project: sessions (newest first), then the turns of a session (oldest first), then the turn detail. Lists come 50 at a time. A filter box above each list keeps only the sessions or turns whose iterations contain the text (3 or more characters: full-text search; fewer: plain substring). Each turn shows `done` or `pending n` for embedding. The detail shows the same content as `show --with-results`, split by iteration, with tool outputs folded. The query box above the lists runs a hybrid search in this project (click a result to open its turn) or an **injection preview**: it applies the same settings and rules as automatic injection, without excluding a session or applying the time budget, and shows each candidate's RRF rank, similarity, and verdict (`selected`, `below threshold`, `FTS only`, `same turn`, `over length limit`, `over count`), the text that would be injected, and the time it took. If nothing would be injected, it shows why. Each level has a **Delete** button that shows the preview of [4.7](#47-deleting-records) and asks for confirmation. |
 | Settings | Every `config.toml` key with its description and whether it is the default. Saving changes only the keys you changed and keeps your comments. A key set back to its default is removed from the file. The result is checked first, and an invalid file is not written. If the daemon must restart, a **Restart daemon** button appears. If the change needs a reindex, the window tells you. |
 | Import | **Preview** shows what would happen and a table of candidate sessions (the same as `--dry-run`). `new` and `live-only` sessions are selected first. **Import selected** sends only the checked sessions. **Stop** stops after the current session. Embedding progress comes from the status poll. |
-| Search | `search` and `show` |
+| Search | `search` and `show`. Each iteration result has **Open in records**, which opens its project and turn in the Records tab. |
 | Projects | `project list` and `reindex` |
 | Claude setup | Shows whether hippo is applied for the user or project scope. **Preview apply/remove** shows the same diff as `--dry-run`. **Apply** and **Remove** work only after a preview with the same inputs, and ask for confirmation. |
 | About | Version, README, and LICENSE |
 
 The window uses `[ui] language`. Korean text uses a macOS system font.
+
+### 4.7 Deleting records
+
+```bash
+hippo forget --session <session_id>       # one session
+hippo forget --prompt <prompt_id>         # one turn: every iteration with that prompt id, in every session of the project
+hippo project remove <project id or path> # a whole project
+```
+
+Each command first prints what it would delete: the project id and location, and the number of sessions, turns, iterations, and results. Every vector of those iterations and results is deleted too, however many chunks it has. Then it asks `Delete? [y/N]`, and only `y` deletes.
+
+- `--dry-run` prints the preview and stops.
+- `--yes` deletes without asking. If stdin is not a terminal (a script, a pipe) and `--yes` is missing, nothing is deleted and the command exits with code 1.
+- `forget` takes `--scope project|<path>`. Without it, it looks in the current project first, then in the others, as `show` does. If nothing matches, it prints `Nothing to delete.`
+- A result (tool output) is deleted only when no remaining record refers to it. The same output may be stored once for several sessions.
+- Deleting a session also forgets where its capture stopped. If the session is still open, the next hook stores it again from that turn. Past sessions come back if you import them again. Nothing records what you deleted, and deleted records cannot be restored.
+- After `project remove`, a new session in the same folder starts a new project.
+- Deleting is refused while a reindex runs. If an embedding batch is in progress, the delete waits for it to finish (a batch of long tool outputs can take tens of seconds).
 
 ---
 
@@ -561,7 +580,7 @@ Ingest, search, and the daemon do not change.
 - Not yet checked in interactive sessions: whether a hook fires after a background notice (OPEN-1), the Esc interrupt (OPEN-2), compaction (OPEN-3), and whether the last line is written before `Stop` fires (OPEN-6).
 - Hooks always use the default data root (`~/.hippo`). `--root` is not written into hook commands.
 - When the daemon stops with a signal, the socket file stays. It is removed at the next start.
-- There is no retention policy yet. Memory grows until you delete it.
+- There is no retention policy yet. Memory grows until you delete it with `forget` or `project remove` ([4.7](#47-deleting-records)).
 - Results (tool outputs) are deduplicated only within a project. The same output in two projects is stored twice.
 - A moved folder without git is not followed automatically. Use `hippo import --from <old path>`.
 - Live capture stores from the turn the hook reports. Use `hippo import` for the history before it.

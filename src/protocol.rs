@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::i18n::Lang;
 use crate::import::Candidate;
 use crate::ingest::{ImportOutcome, IngestRequest};
-use crate::search::{SearchKind, escape_control};
-use crate::store::{ForgetCounts, ForgetTarget};
+use crate::search::{HitView, InjectionPlan, IterationView, SearchKind, escape_control};
+use crate::store::{ForgetCounts, ForgetTarget, Page, SessionSummary, TurnSummary};
 use crate::tr;
 
 /// 요청이 다룰 프로젝트. `Project`는 요청의 `cwd`가 속한 프로젝트, `Path`는 그 경로가 속한 프로젝트,
@@ -40,6 +40,9 @@ pub enum Request {
         limit: usize,
         scope: Scope,
         cwd: String,
+        /// 참이면 텍스트 대신 결과 목록(`hits`)을 돌려준다. (FR-GUI-16, FR-GUI-17)
+        #[serde(default)]
+        structured: bool,
     },
     /// `scope`가 없으면 현재 프로젝트를 먼저 찾고 나머지를 찾는다. (FR-RET-7)
     Show {
@@ -84,6 +87,35 @@ pub enum Request {
         cwd: String,
         #[serde(default)]
         dry_run: bool,
+    },
+    /// 프로젝트의 세션 목록 한 페이지. (FR-GUI-13, FR-GUI-14)
+    SessionList {
+        scope: Scope,
+        cwd: String,
+        filter: String,
+        offset: usize,
+        limit: usize,
+    },
+    /// 세션의 턴 목록 한 페이지. (FR-GUI-13, FR-GUI-14)
+    TurnList {
+        scope: Scope,
+        cwd: String,
+        session_id: String,
+        filter: String,
+        offset: usize,
+        limit: usize,
+    },
+    /// 턴 상세. (FR-GUI-13)
+    TurnDetail {
+        scope: Scope,
+        cwd: String,
+        prompt_id: String,
+    },
+    /// 주입 미리 보기. 세션 제외와 시간 예산을 적용하지 않는다. (FR-GUI-16)
+    InjectPreview {
+        scope: Scope,
+        cwd: String,
+        prompt: String,
     },
 }
 
@@ -152,6 +184,23 @@ pub enum Response {
     /// 삭제 미리 보기 또는 결과. 대상이 없으면 `None`. (FR-DEL-4)
     Delete {
         report: Option<DeleteReport>,
+    },
+    /// 구조화 검색 결과. `notes`는 벡터 검색을 쓰지 못한 안내이다. (FR-GUI-16, FR-RET-8)
+    Hits {
+        hits: Vec<HitView>,
+        notes: Vec<String>,
+    },
+    Sessions(Page<SessionSummary>),
+    Turns(Page<TurnSummary>),
+    /// 턴 상세. 반복이 없으면 `iterations`가 비어 있다. (FR-GUI-13)
+    Turn {
+        project_id: String,
+        iterations: Vec<IterationView>,
+    },
+    /// 주입 미리 보기와 걸린 시간. (FR-GUI-16)
+    InjectPreview {
+        plan: InjectionPlan,
+        elapsed_ms: u64,
     },
     Error {
         message: String,

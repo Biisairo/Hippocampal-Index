@@ -214,6 +214,7 @@ fn main() -> ExitCode {
                     limit,
                     scope,
                     cwd,
+                    structured: false,
                 },
             )
         }

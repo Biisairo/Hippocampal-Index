@@ -189,6 +189,36 @@ pub struct ForgetPlan {
     pub vector_refs: Vec<(RecordKind, String)>,
 }
 
+/// 기록 탭의 세션 한 줄. (FR-GUI-13)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub session_id: String,
+    /// 첫 반복의 `ts`.
+    pub started_at: String,
+    /// 공백을 한 칸으로 줄이고 80자로 자른 첫 프롬프트.
+    pub first_prompt: String,
+    pub turns: u64,
+    pub iterations: u64,
+}
+
+/// 기록 탭의 턴 한 줄. (FR-GUI-13)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnSummary {
+    pub prompt_id: Option<String>,
+    pub ts: String,
+    pub prompt: String,
+    pub iterations: u64,
+    /// 이 턴의 반복과 연결 결과 중 남은 임베딩 작업 수.
+    pub pending: u64,
+}
+
+/// 전체 개수와 한 페이지. (FR-GUI-13)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Page<T> {
+    pub total: u64,
+    pub items: Vec<T>,
+}
+
 pub struct RecordStore {
     conn: Connection,
 }
@@ -236,6 +266,7 @@ const DIR_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
 const UNKNOWN_BG_TOOL: &str = "background";
 const MIN_FTS_TOKEN_CHARS: usize = 3;
+const SUMMARY_CHARS: usize = 80;
 
 #[derive(Serialize, Deserialize)]
 struct ToolCallRow {
@@ -598,6 +629,167 @@ impl RecordStore {
             tx.commit()?;
         }
         Ok(plan)
+    }
+
+    /// 세션을 시작 시각 내림차순으로 한 페이지 돌려준다. 필터가 있으면 그 글자가 든 반복을 가진 세션만. (FR-GUI-13, FR-GUI-14)
+    pub fn session_page(
+        &self,
+        filter: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Page<SessionSummary>> {
+        let matched = filter_matches(filter);
+        let scope = match &matched {
+            Some((sql, _)) => format!(
+                "WHERE session_id IN (SELECT session_id FROM iterations WHERE id IN ({sql}))"
+            ),
+            None => String::new(),
+        };
+        let filter_param = matched.as_ref().map(|(_, p)| p.as_str());
+        let total = self.count_named(
+            &format!("SELECT COUNT(DISTINCT session_id) FROM iterations {scope}"),
+            filter_param,
+            None,
+        )?;
+        let sql = format!(
+            "SELECT session_id, MIN(ts) AS started, COUNT(DISTINCT COALESCE(prompt_id, id)), COUNT(*)
+             FROM iterations {scope}
+             GROUP BY session_id ORDER BY started DESC, session_id LIMIT :limit OFFSET :offset"
+        );
+        let rows: Vec<(String, String, i64, i64)> =
+            self.query_named(&sql, filter_param, None, offset, limit, |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?;
+        let mut items = Vec::with_capacity(rows.len());
+        for (session_id, started_at, turns, iterations) in rows {
+            let first_prompt = self.first_prompt("session_id = ?1", &[&session_id])?;
+            items.push(SessionSummary {
+                session_id,
+                started_at,
+                first_prompt,
+                turns: turns.unsigned_abs(),
+                iterations: iterations.unsigned_abs(),
+            });
+        }
+        Ok(Page { total, items })
+    }
+
+    /// 세션의 턴을 시각 오름차순으로 한 페이지 돌려준다. 필터는 `session_page`와 같다. (FR-GUI-13, FR-GUI-14)
+    pub fn turn_page(
+        &self,
+        session_id: &str,
+        filter: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Page<TurnSummary>> {
+        let matched = filter_matches(filter);
+        let scope = match &matched {
+            Some((sql, _)) => format!(
+                "AND COALESCE(prompt_id, id) IN (SELECT COALESCE(prompt_id, id) FROM iterations
+                 WHERE session_id = :session AND id IN ({sql}))"
+            ),
+            None => String::new(),
+        };
+        let filter_param = matched.as_ref().map(|(_, p)| p.as_str());
+        let total = self.count_named(
+            &format!(
+                "SELECT COUNT(DISTINCT COALESCE(prompt_id, id)) FROM iterations
+                 WHERE session_id = :session {scope}"
+            ),
+            filter_param,
+            Some(session_id),
+        )?;
+        let sql = format!(
+            "SELECT COALESCE(prompt_id, id) AS turn, MAX(prompt_id), MIN(ts) AS at, COUNT(*)
+             FROM iterations WHERE session_id = :session {scope}
+             GROUP BY turn ORDER BY at, turn LIMIT :limit OFFSET :offset"
+        );
+        let rows: Vec<(String, Option<String>, String, i64)> =
+            self.query_named(&sql, filter_param, Some(session_id), offset, limit, |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?;
+        let in_turn = "session_id = ?1 AND COALESCE(prompt_id, id) = ?2";
+        let mut items = Vec::with_capacity(rows.len());
+        for (turn, prompt_id, ts, iterations) in rows {
+            let prompt = self.first_prompt(in_turn, &[&session_id, &turn])?;
+            let pending: i64 = self.conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM embed_jobs
+                     WHERE (kind = ?3 AND ref_id IN (SELECT id FROM iterations WHERE {in_turn}))
+                        OR (kind = ?4 AND ref_id IN (SELECT result_id FROM iteration_results
+                            WHERE iteration_id IN (SELECT id FROM iterations WHERE {in_turn})))"
+                ),
+                params![
+                    session_id,
+                    turn,
+                    job_kind_str(RecordKind::Iteration),
+                    job_kind_str(RecordKind::Result)
+                ],
+                |r| r.get(0),
+            )?;
+            items.push(TurnSummary {
+                prompt_id,
+                ts,
+                prompt,
+                iterations: iterations.unsigned_abs(),
+                pending: pending.unsigned_abs(),
+            });
+        }
+        Ok(Page { total, items })
+    }
+
+    /// 조건에 맞는 반복 중 가장 이른 프롬프트 입력. 없으면 빈 문자열. (FR-GUI-13)
+    fn first_prompt(&self, condition: &str, args: &[&dyn rusqlite::ToSql]) -> Result<String> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT inputs FROM iterations WHERE {condition} ORDER BY ts, iteration_index"
+        ))?;
+        let mut rows = stmt.query(args)?;
+        while let Some(row) = rows.next()? {
+            let inputs: Vec<IterationInput> = serde_json::from_str(&row.get::<_, String>(0)?)?;
+            if let Some(text) = inputs.iter().find_map(|i| match i {
+                IterationInput::Prompt { text } => Some(text),
+                _ => None,
+            }) {
+                return Ok(summary_line(text));
+            }
+        }
+        Ok(String::new())
+    }
+
+    fn count_named(&self, sql: &str, filter: Option<&str>, session: Option<&str>) -> Result<u64> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut args: Vec<(&str, &dyn rusqlite::ToSql)> = Vec::new();
+        if let Some(f) = &filter {
+            args.push((":filter", f));
+        }
+        if let Some(s) = &session {
+            args.push((":session", s));
+        }
+        let n: i64 = stmt.query_row(args.as_slice(), |r| r.get(0))?;
+        Ok(n.unsigned_abs())
+    }
+
+    fn query_named<T>(
+        &self,
+        sql: &str,
+        filter: Option<&str>,
+        session: Option<&str>,
+        offset: usize,
+        limit: usize,
+        map: impl FnMut(&rusqlite::Row) -> rusqlite::Result<T>,
+    ) -> Result<Vec<T>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let (limit, offset) = (limit as i64, offset as i64);
+        let mut args: Vec<(&str, &dyn rusqlite::ToSql)> =
+            vec![(":limit", &limit), (":offset", &offset)];
+        if let Some(f) = &filter {
+            args.push((":filter", f));
+        }
+        if let Some(s) = &session {
+            args.push((":session", s));
+        }
+        let rows = stmt.query_map(args.as_slice(), map)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     fn search_fts(
@@ -1109,6 +1301,36 @@ fn fts_query(query: &str) -> Option<String> {
         .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
         .collect();
     (!terms.is_empty()).then(|| terms.join(" OR "))
+}
+
+/// 기록 탭 필터에 맞는 반복 id를 고르는 SQL과 `:filter` 값. 3자 이상은 FTS 구절, 미만은 부분 문자열. (FR-GUI-14)
+fn filter_matches(filter: &str) -> Option<(&'static str, String)> {
+    let filter = filter.trim();
+    if filter.is_empty() {
+        return None;
+    }
+    Some(if filter.chars().count() >= MIN_FTS_TOKEN_CHARS {
+        (
+            "SELECT i.id FROM iterations_fts JOIN iterations i ON i.rowid = iterations_fts.rowid
+             WHERE iterations_fts MATCH :filter",
+            format!("\"{}\"", filter.replace('"', "\"\"")),
+        )
+    } else {
+        (
+            "SELECT id FROM iterations WHERE instr(embed_text, :filter) > 0",
+            filter.to_string(),
+        )
+    })
+}
+
+/// 공백을 한 칸으로 줄이고 `SUMMARY_CHARS`자로 자른다. (FR-GUI-13)
+fn summary_line(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(SUMMARY_CHARS)
+        .collect()
 }
 
 fn kind_str(kind: BackgroundKind) -> &'static str {

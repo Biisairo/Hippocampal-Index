@@ -122,6 +122,7 @@ fn search_req(query: &str, scope: Scope, cwd: &str) -> Request {
         limit: 5,
         scope,
         cwd: cwd.into(),
+        structured: false,
     }
 }
 
@@ -2542,5 +2543,220 @@ fn in_flight_embedding_batch_does_not_store_vectors_of_forgotten_records() {
         0,
         "지운 레코드의 벡터가 남지 않음"
     );
+    handle.shutdown();
+}
+
+// ---- FR-GUI-13~17 (데몬 요청 단위) ----
+
+use hippo::search::{InjectionPlan, SkipReason, Verdict};
+
+fn ask(paths: &Paths, req: Request) -> Response {
+    request(&paths.socket(), &req, TIMEOUT).unwrap()
+}
+
+#[test]
+fn browse_requests_list_sessions_turns_and_turn_detail() {
+    let e = env();
+    let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
+    ingest(&e.paths, &e.transcript, HookEvent::Stop);
+    wait_until(|| totals(&status(&e.paths)).1 == 0);
+    let id = only_project(&e.paths);
+    let scope = Scope::Id(id.clone());
+    let sessions = |filter: &str| match ask(
+        &e.paths,
+        Request::SessionList {
+            scope: scope.clone(),
+            cwd: "/".into(),
+            filter: filter.into(),
+            offset: 0,
+            limit: 50,
+        },
+    ) {
+        Response::Sessions(page) => page,
+        other => panic!("{other:?}"),
+    };
+    let page = sessions("");
+    assert_eq!(page.total, 1);
+    assert_eq!(page.items[0].session_id, S2);
+    assert_eq!(page.items[0].iterations, 2);
+    assert_eq!(sessions("병렬로").total, 1, "FTS 필터");
+    assert_eq!(sessions("없는글자열입니다").total, 0);
+
+    let turns = match ask(
+        &e.paths,
+        Request::TurnList {
+            scope: scope.clone(),
+            cwd: "/".into(),
+            session_id: S2.into(),
+            filter: String::new(),
+            offset: 0,
+            limit: 50,
+        },
+    ) {
+        Response::Turns(page) => page,
+        other => panic!("{other:?}"),
+    };
+    let turn = turns
+        .items
+        .iter()
+        .find(|t| t.prompt_id.as_deref() == Some(S2_PROMPT))
+        .unwrap();
+    assert_eq!(turn.pending, 0, "임베딩 완료");
+
+    let (project_id, iterations) = match ask(
+        &e.paths,
+        Request::TurnDetail {
+            scope: scope.clone(),
+            cwd: "/".into(),
+            prompt_id: S2_PROMPT.into(),
+        },
+    ) {
+        Response::Turn {
+            project_id,
+            iterations,
+        } => (project_id, iterations),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(project_id, id);
+    let shown = text(ask(
+        &e.paths,
+        Request::Show {
+            prompt_id: S2_PROMPT.into(),
+            with_results: true,
+            scope: Some(scope.clone()),
+            cwd: "/".into(),
+        },
+    ));
+    assert_eq!(iterations.len(), shown.matches("\n## [").count());
+    assert!(iterations.iter().all(|it| shown.contains(&it.id)));
+    assert!(
+        iterations
+            .iter()
+            .flat_map(|i| &i.tools)
+            .any(|t| t.result.is_some())
+    );
+
+    let unknown = Request::SessionList {
+        scope: Scope::Id("0".repeat(32)),
+        cwd: "/".into(),
+        filter: String::new(),
+        offset: 0,
+        limit: 50,
+    };
+    assert!(matches!(ask(&e.paths, unknown), Response::Error { .. }));
+    handle.shutdown();
+}
+
+#[test]
+fn inject_preview_selects_the_turn_that_inject_injects() {
+    let e = env();
+    let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
+    ingest(&e.paths, &e.transcript, HookEvent::Stop);
+    wait_until(|| totals(&status(&e.paths)).1 == 0);
+    let id = only_project(&e.paths);
+    let prompt = project_records(&e.paths)
+        .iterations_for_prompt(S2_PROMPT)
+        .unwrap()[1]
+        .embed_text
+        .clone();
+    let preview = |scope: Scope, prompt: &str| match ask(
+        &e.paths,
+        Request::InjectPreview {
+            scope,
+            cwd: "/".into(),
+            prompt: prompt.into(),
+        },
+    ) {
+        Response::InjectPreview { plan, .. } => plan,
+        other => panic!("{other:?}"),
+    };
+    let injected = match inject_with_budget(&e.paths, &prompt, Some(5_000)) {
+        Response::Inject { context: Some(c) } => c,
+        other => panic!("{other:?}"),
+    };
+    assert!(injected.contains(&format!("prompt=\"{S2_PROMPT}\"")));
+    match preview(Scope::Id(id.clone()), &prompt) {
+        InjectionPlan::Planned { candidates, text } => {
+            let selected: Vec<_> = candidates
+                .iter()
+                .filter(|c| c.verdict == Verdict::Selected)
+                .map(|c| c.prompt_id.clone())
+                .collect();
+            assert_eq!(selected, vec![Some(S2_PROMPT.to_string())]);
+            assert_eq!(text.as_deref(), Some(injected.as_str()));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        preview(Scope::Id(id), "짧은 질문"),
+        InjectionPlan::Skipped {
+            reason: SkipReason::TooShort
+        }
+    );
+    assert_eq!(
+        preview(Scope::Id("0".repeat(32)), &prompt),
+        InjectionPlan::Skipped {
+            reason: SkipReason::NoProject
+        }
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn structured_search_returns_project_and_prompt_of_each_hit() {
+    let (e, handle, a, _b) = two_project_env();
+    let ia = project_at(&status(&e.paths), &a).id.clone();
+    let hits = |scope: Scope| match ask(
+        &e.paths,
+        Request::Search {
+            query: "두 파일은 병렬로".into(),
+            kind: SearchKind::Iteration,
+            limit: 5,
+            scope,
+            cwd: "/".into(),
+            structured: true,
+        },
+    ) {
+        Response::Hits { hits, notes } => {
+            assert!(notes.is_empty(), "{notes:?}");
+            hits
+        }
+        other => panic!("{other:?}"),
+    };
+    let one = hits(Scope::Id(ia.clone()));
+    assert!(!one.is_empty());
+    assert!(
+        one.iter()
+            .all(|h| h.project_id == ia && h.kind == "iteration")
+    );
+    assert!(
+        one.iter()
+            .all(|h| h.prompt_id.as_deref() == Some(prompt_of("sa").as_str()))
+    );
+    assert!(one.iter().all(|h| h.similarity.is_some()));
+    match ask(
+        &e.paths,
+        Request::Search {
+            query: "병렬로".into(),
+            kind: SearchKind::Iteration,
+            limit: 5,
+            scope: Scope::Project,
+            cwd: "/no/such/project".into(),
+            structured: true,
+        },
+    ) {
+        Response::Hits { hits, notes } => {
+            assert!(hits.is_empty());
+            assert_eq!(
+                notes,
+                vec!["No project".to_string()],
+                "텍스트 검색처럼 안내"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    let all = hits(Scope::All);
+    let projects: std::collections::HashSet<_> = all.iter().map(|h| h.project_id.clone()).collect();
+    assert_eq!(projects.len(), 2, "all 범위는 두 프로젝트");
     handle.shutdown();
 }

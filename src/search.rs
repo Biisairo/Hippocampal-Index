@@ -186,6 +186,52 @@ pub fn search(
         .collect())
 }
 
+/// 자동 주입을 하지 않는 사유. (FR-RET-1, FR-SWP-6, FR-GUI-16)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    EmptyPrompt,
+    TaskNotification,
+    TooShort,
+    NoProject,
+    VectorUnavailable,
+}
+
+/// 후보 반복 하나의 판정. (FR-RET-3, FR-RET-4, FR-GUI-16)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    Selected,
+    BelowThreshold,
+    FtsOnly,
+    SameTurn,
+    OverLength,
+    OverCount,
+}
+
+/// 후보 반복. `rank`는 RRF 순위(1부터). (FR-GUI-16)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CandidateView {
+    pub rank: usize,
+    pub iteration_id: String,
+    pub prompt_id: Option<String>,
+    pub similarity: Option<f32>,
+    pub verdict: Verdict,
+}
+
+/// 주입 계산 결과. 실제 주입과 미리 보기가 같은 계산을 쓴다. (FR-RET-1~4, FR-GUI-16)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum InjectionPlan {
+    Skipped {
+        reason: SkipReason,
+    },
+    Planned {
+        candidates: Vec<CandidateView>,
+        text: Option<String>,
+    },
+}
+
 pub fn build_injection(
     records: &RecordStore,
     backends: Option<VectorBackends>,
@@ -194,82 +240,130 @@ pub fn build_injection(
     config: InjectConfig,
     deadline: Instant,
 ) -> Result<Option<String>, SearchError> {
-    if prompt.trim().chars().count() < config.min_prompt_chars.max(1)
-        || backends.is_none()
-        || prompt.contains(TASK_NOTIFICATION_TAG)
-    {
-        return Ok(None);
+    match plan_injection(
+        records,
+        backends,
+        prompt,
+        Some(session_id),
+        config,
+        Some(deadline),
+    ) {
+        Ok(InjectionPlan::Planned { text, .. }) => Ok(text),
+        Ok(InjectionPlan::Skipped { .. }) | Err(SearchError::DeadlineExceeded) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// 후보마다 판정을 매기고 주입 텍스트를 만든다. `exclude_session`이 없으면 세션을 제외하지 않고,
+/// `deadline`이 없으면 시간 예산을 적용하지 않는다. (FR-RET-1~4, FR-GUI-16)
+pub fn plan_injection(
+    records: &RecordStore,
+    backends: Option<VectorBackends>,
+    prompt: &str,
+    exclude_session: Option<&str>,
+    config: InjectConfig,
+    deadline: Option<Instant>,
+) -> Result<InjectionPlan, SearchError> {
+    let skip = |reason| Ok(InjectionPlan::Skipped { reason });
+    let chars = prompt.trim().chars().count();
+    if chars == 0 {
+        return skip(SkipReason::EmptyPrompt);
+    }
+    if prompt.contains(TASK_NOTIFICATION_TAG) {
+        return skip(SkipReason::TaskNotification);
+    }
+    if chars < config.min_prompt_chars {
+        return skip(SkipReason::TooShort);
+    }
+    if backends.is_none() {
+        return skip(SkipReason::VectorUnavailable);
     }
     let req = SearchRequest {
         query: prompt.to_string(),
         kind: SearchKind::Iteration,
-        exclude_session: Some(session_id.to_string()),
+        exclude_session: exclude_session.map(str::to_string),
         limit: config.top_k.saturating_mul(CANDIDATE_FACTOR),
     };
-    let hits = match search(records, backends, &req, Some(deadline)) {
-        Ok(hits) => hits,
-        Err(SearchError::DeadlineExceeded) => return Ok(None),
-        Err(e) => return Err(e),
-    };
+    let hits = search(records, backends, &req, deadline)?;
     let budget = config
         .total_chars
         .saturating_sub(INJECTION_HEADER.chars().count() + INJECTION_TRAILER.chars().count() + 1);
     let mut used = 0;
     let mut seen: HashSet<(String, String)> = HashSet::new();
     let mut blocks: Vec<(String, String)> = Vec::new();
-    for hit in hits
-        .iter()
-        .filter(|h| h.similarity.is_some_and(|s| s >= config.threshold))
-    {
-        if blocks.len() >= config.top_k {
-            break;
-        }
+    let mut candidates = Vec::new();
+    for (n, hit) in hits.iter().enumerate() {
         let Some(it) = records.iteration(&hit.id)? else {
             continue;
         };
-        let key = (
-            it.session_id.clone(),
-            it.prompt_id.clone().unwrap_or_else(|| it.id.clone()),
-        );
-        if !seen.insert(key) {
-            continue;
-        }
-        let turn = match &it.prompt_id {
-            Some(prompt_id) => records
-                .iterations_for_prompt(prompt_id)?
-                .into_iter()
-                .filter(|t| t.session_id == it.session_id)
-                .collect(),
-            None => vec![it.clone()],
+        let verdict = match hit.similarity {
+            None => Verdict::FtsOnly,
+            Some(s) if s < config.threshold => Verdict::BelowThreshold,
+            Some(_) if blocks.len() >= config.top_k => Verdict::OverCount,
+            Some(_) => {
+                let key = (
+                    it.session_id.clone(),
+                    it.prompt_id.clone().unwrap_or_else(|| it.id.clone()),
+                );
+                if seen.insert(key) {
+                    match memory_block(records, &it)? {
+                        Some((ts, block)) if used + block.chars().count() <= budget => {
+                            used += block.chars().count();
+                            blocks.push((ts, block));
+                            Verdict::Selected
+                        }
+                        _ => Verdict::OverLength,
+                    }
+                } else {
+                    Verdict::SameTurn
+                }
+            }
         };
-        let Some(first) = turn.first() else {
-            continue;
-        };
-        let body: Vec<String> = turn.iter().flat_map(turn_lines).collect();
-        let block = format!(
-            "\n<memory ts=\"{}\" prompt=\"{}\">\n{}\n</memory>",
-            escape_markup(&first.ts),
-            escape_markup(it.prompt_id.as_deref().unwrap_or("-")),
-            escape_markup(&body.join("\n"))
-        );
-        let size = block.chars().count();
-        if used + size > budget {
-            continue;
-        }
-        used += size;
-        blocks.push((first.ts.clone(), block));
+        candidates.push(CandidateView {
+            rank: n + 1,
+            iteration_id: it.id.clone(),
+            prompt_id: it.prompt_id.clone(),
+            similarity: hit.similarity,
+            verdict,
+        });
     }
-    if blocks.is_empty() {
+    let text = (!blocks.is_empty()).then(|| {
+        blocks.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut out = String::from(INJECTION_HEADER);
+        for (_, block) in &blocks {
+            out.push_str(block);
+        }
+        out.push('\n');
+        out.push_str(INJECTION_TRAILER);
+        escape_control(&out)
+    });
+    Ok(InjectionPlan::Planned { candidates, text })
+}
+
+/// 반복이 속한 턴(같은 세션의 같은 prompt_id) 전체를 `<memory>` 블록 하나로 만든다. (FR-RET-4)
+fn memory_block(
+    records: &RecordStore,
+    it: &StoredIteration,
+) -> Result<Option<(String, String)>, StoreError> {
+    let turn = match &it.prompt_id {
+        Some(prompt_id) => records
+            .iterations_for_prompt(prompt_id)?
+            .into_iter()
+            .filter(|t| t.session_id == it.session_id)
+            .collect(),
+        None => vec![it.clone()],
+    };
+    let Some(first) = turn.first() else {
         return Ok(None);
-    }
-    blocks.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut out = String::from(INJECTION_HEADER);
-    for (_, block) in &blocks {
-        out.push_str(block);
-    }
-    out.push('\n');
-    out.push_str(INJECTION_TRAILER);
-    Ok(Some(escape_control(&out)))
+    };
+    let body: Vec<String> = turn.iter().flat_map(turn_lines).collect();
+    let block = format!(
+        "\n<memory ts=\"{}\" prompt=\"{}\">\n{}\n</memory>",
+        escape_markup(&first.ts),
+        escape_markup(it.prompt_id.as_deref().unwrap_or("-")),
+        escape_markup(&body.join("\n"))
+    );
+    Ok(Some((first.ts.clone(), block)))
 }
 
 /// 반복 하나의 주입 줄: 입력, 응답, 질문과 답. 그 밖의 도구 호출과 결과는 넣지 않는다. (FR-RET-4)
@@ -505,6 +599,50 @@ fn render_hit(
     Ok(true)
 }
 
+/// GUI용 검색 결과 한 건. (FR-GUI-16, FR-GUI-17)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HitView {
+    pub project_id: String,
+    /// `iteration` 또는 `result`
+    pub kind: String,
+    pub id: String,
+    pub score: f64,
+    pub similarity: Option<f32>,
+    pub prompt_id: Option<String>,
+    pub preview: String,
+}
+
+/// 원본 저장소에 없는 결과는 뺀다. 결과 원문의 미리 보기는 도구 이름으로 시작한다. (FR-GUI-16)
+pub fn hit_views(
+    records: &RecordStore,
+    hits: &[SearchHit],
+    project_id: &str,
+) -> Result<Vec<HitView>, StoreError> {
+    let mut views = Vec::with_capacity(hits.len());
+    for hit in hits {
+        let (prompt_id, body) = match hit.kind {
+            RecordKind::Iteration => match records.iteration(&hit.id)? {
+                Some(it) => (it.prompt_id, it.embed_text),
+                None => continue,
+            },
+            RecordKind::Result => match records.result(&hit.id)? {
+                Some(r) => (None, format!("{}: {}", r.tool_name, r.text)),
+                None => continue,
+            },
+        };
+        views.push(HitView {
+            project_id: project_id.to_string(),
+            kind: hit.kind.as_str().to_string(),
+            id: hit.id.clone(),
+            score: hit.score,
+            similarity: hit.similarity,
+            prompt_id,
+            preview: escape_control(&truncate(&body, PREVIEW_CHARS).replace('\n', " ")),
+        });
+    }
+    Ok(views)
+}
+
 /// 어느 프로젝트에도 `prompt_id`가 없을 때의 `hippo show` 출력.
 pub fn missing_turn(prompt_id: &str, lang: Lang) -> String {
     escape_control(&tr!(
@@ -514,6 +652,88 @@ pub fn missing_turn(prompt_id: &str, lang: Lang) -> String {
     ))
 }
 
+/// 백그라운드 작업 완료 기록 하나. (FR-RET-7)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionView {
+    pub seq: u32,
+    pub status: String,
+    pub summary: String,
+    pub result_id: Option<String>,
+    pub result: Option<String>,
+}
+
+/// 도구 호출 하나와 그 결과 원문. (FR-RET-7, FR-GUI-13)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolView {
+    pub name: String,
+    /// 입력 JSON.
+    pub input: String,
+    pub is_error: bool,
+    pub result_id: Option<String>,
+    pub result: Option<String>,
+    pub completions: Vec<CompletionView>,
+}
+
+/// 반복 하나. `show --with-results`와 같은 내용이다. (FR-RET-7, FR-GUI-13)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IterationView {
+    pub id: String,
+    pub session_id: String,
+    pub iteration_index: u32,
+    pub ts: String,
+    pub inputs: Vec<String>,
+    pub tools: Vec<ToolView>,
+    pub response: String,
+}
+
+/// 턴의 반복을 `iteration_index` 순서로 결과 원문과 함께 읽는다. 없으면 빈 목록. (FR-RET-7, FR-GUI-13)
+pub fn turn_views(
+    records: &RecordStore,
+    prompt_id: &str,
+) -> Result<Vec<IterationView>, StoreError> {
+    let result_text = |id: Option<&str>| -> Result<Option<String>, StoreError> {
+        Ok(id
+            .map(|id| records.result(id))
+            .transpose()?
+            .flatten()
+            .map(|r| r.text))
+    };
+    let mut views = Vec::new();
+    for it in records.iterations_for_prompt(prompt_id)? {
+        let mut tools = Vec::with_capacity(it.tool_calls.len());
+        for call in &it.tool_calls {
+            let mut completions = Vec::new();
+            for done in records.bg_completions(&call.id)? {
+                completions.push(CompletionView {
+                    seq: done.seq,
+                    status: done.status,
+                    summary: done.summary,
+                    result: result_text(done.result_id.as_deref())?,
+                    result_id: done.result_id,
+                });
+            }
+            tools.push(ToolView {
+                name: call.name.clone(),
+                input: call.input.to_string(),
+                is_error: call.is_error,
+                result: result_text(call.result_id.as_deref())?,
+                result_id: call.result_id.clone(),
+                completions,
+            });
+        }
+        views.push(IterationView {
+            inputs: it.inputs.iter().map(input_text).collect(),
+            id: it.id,
+            session_id: it.session_id,
+            iteration_index: it.iteration_index,
+            ts: it.ts,
+            tools,
+            response: it.response_text,
+        });
+    }
+    Ok(views)
+}
+
 /// `hippo show` 출력. (FR-RET-7)
 pub fn render_turn(
     records: &RecordStore,
@@ -521,45 +741,39 @@ pub fn render_turn(
     with_results: bool,
     lang: Lang,
 ) -> Result<String, StoreError> {
-    let turn = records.iterations_for_prompt(prompt_id)?;
+    let turn = turn_views(records, prompt_id)?;
     if turn.is_empty() {
         return Ok(missing_turn(prompt_id, lang));
     }
     let mut out = format!("# prompt {prompt_id}\n");
     for it in &turn {
-        render_iteration(records, it, with_results, lang, &mut out)?;
+        render_iteration(it, with_results, lang, &mut out);
     }
     Ok(escape_control(&out))
 }
 
-fn render_iteration(
-    records: &RecordStore,
-    it: &StoredIteration,
-    with_results: bool,
-    lang: Lang,
-    out: &mut String,
-) -> Result<(), StoreError> {
+fn render_iteration(it: &IterationView, with_results: bool, lang: Lang, out: &mut String) {
     let (input_label, tool_label, response_label) = match lang {
         Lang::En => ("[input]", "[tool]", "[response]"),
         Lang::Ko => ("[입력]", "[툴]", "[응답]"),
     };
     let _ = writeln!(out, "## [{}] {}  {}", it.iteration_index, it.ts, it.id);
     for input in &it.inputs {
-        let _ = writeln!(out, "{input_label} {}", input_text(input));
+        let _ = writeln!(out, "{input_label} {input}");
     }
-    for call in &it.tool_calls {
-        let error = if call.is_error { " (error)" } else { "" };
+    for tool in &it.tools {
+        let error = if tool.is_error { " (error)" } else { "" };
         let _ = writeln!(
             out,
             "{tool_label} {}({}) -> result {}{error}",
-            call.name,
-            call.input,
-            call.result_id.as_deref().unwrap_or("-")
+            tool.name,
+            tool.input,
+            tool.result_id.as_deref().unwrap_or("-")
         );
         if with_results {
-            write_result(records, call.result_id.as_deref(), out)?;
+            write_result(tool.result.as_deref(), out);
         }
-        for done in records.bg_completions(&call.id)? {
+        for done in &tool.completions {
             let _ = writeln!(
                 out,
                 "    bg #{} {}: {} -> result {}",
@@ -569,32 +783,19 @@ fn render_iteration(
                 done.result_id.as_deref().unwrap_or("-")
             );
             if with_results {
-                write_result(records, done.result_id.as_deref(), out)?;
+                write_result(done.result.as_deref(), out);
             }
         }
     }
-    if !it.response_text.is_empty() {
-        let _ = writeln!(out, "{response_label} {}", it.response_text);
+    if !it.response.is_empty() {
+        let _ = writeln!(out, "{response_label} {}", it.response);
     }
-    Ok(())
 }
 
-fn write_result(
-    records: &RecordStore,
-    result_id: Option<&str>,
-    out: &mut String,
-) -> Result<(), StoreError> {
-    let Some(result) = result_id
-        .map(|id| records.result(id))
-        .transpose()?
-        .flatten()
-    else {
-        return Ok(());
-    };
-    for line in result.text.lines() {
+fn write_result(result: Option<&str>, out: &mut String) {
+    for line in result.unwrap_or_default().lines() {
         let _ = writeln!(out, "    | {line}");
     }
-    Ok(())
 }
 
 fn check(deadline: Option<Instant>) -> Result<(), SearchError> {

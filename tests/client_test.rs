@@ -142,6 +142,7 @@ fn protocol_roundtrip() {
             limit: 5,
             scope: Scope::Path("/w".into()),
             cwd: "/w".into(),
+            structured: false,
         },
         Request::Show {
             prompt_id: "p".into(),
