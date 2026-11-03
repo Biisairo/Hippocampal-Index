@@ -55,6 +55,9 @@ pub enum Request {
     ImportPrepare {
         from: String,
         to: String,
+        /// 목록 DB와 원본 저장소를 바꾸지 않고 결과만 돌려준다. (FR-IMP-9)
+        #[serde(default)]
+        dry_run: bool,
     },
     /// 세션 하나를 가져온다. (FR-IMP-3)
     ImportSession {
@@ -62,6 +65,8 @@ pub enum Request {
         session_id: String,
         transcript_path: PathBuf,
     },
+    /// 데몬을 유휴 종료와 같은 경로로 끝낸다. (FR-DMN-11)
+    Shutdown,
 }
 
 /// `import_session`의 응답. (FR-IMP-7)
@@ -111,6 +116,9 @@ pub enum Response {
     Status(StatusInfo),
     ImportPlan {
         project_id: String,
+        /// 미리 보기에서 원본 프로젝트. (FR-IMP-9)
+        #[serde(default)]
+        source_id: Option<String>,
         summary: String,
         sessions: Vec<Candidate>,
     },

@@ -219,6 +219,27 @@ pub fn is_hippo_command(command: &str) -> bool {
     })
 }
 
+/// 설정 파일에 hippo hook 항목이 있는지. 파일이 없거나 해석되지 않으면 false. (FR-GUI-10)
+pub fn is_installed(settings: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(settings) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    value
+        .get("hooks")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|events| events.values())
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(|group| group.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|hook| hook.get("command").and_then(Value::as_str))
+        .any(is_hippo_command)
+}
+
 pub fn merge_install(settings: &mut Value, hooks: &Value) -> Result<(), InstallError> {
     let mut next = settings.clone();
     remove_hippo_hooks(&mut next)?;

@@ -24,6 +24,7 @@ All data stays on your machine. Embeddings come from a local Ollama model, and v
 8. [Troubleshooting](#8-troubleshooting)
 9. [Development: modify and build](#9-development-modify-and-build)
 10. [Known limitations](#10-known-limitations)
+11. [License](#11-license)
 
 ---
 
@@ -309,6 +310,7 @@ hippo import                             # past sessions of the current folder (
 hippo import --from ~/old/app            # sessions you ran at an old path into the current folder's project
 hippo import --from <project id> --to ~/work/app
 hippo import --wait                      # after importing, show progress until embedding is done
+hippo import --dry-run                   # list the candidate sessions and what would happen; change nothing
 ```
 
 `import` reads the past transcripts that Claude Code keeps (`~/.claude/projects/*/*.jsonl`) and adds their records to the project of the `--to` folder. An argument you leave out is the current folder. Subagent transcripts are not read.
@@ -319,6 +321,8 @@ hippo import --wait                      # after importing, show progress until 
 - **The iteration at the end of a transcript**: stored if every tool call has its result. If a tool call has no result yet, it is held. A held iteration is processed when the session is reopened or when you run `import` again.
 - **Copies from branched sessions**: an iteration is skipped if an iteration with the same `message.id` already exists under another session.
 - **Sessions fixed to another project**: skipped and reported as "other project".
+
+`--dry-run` changes nothing. It prints what `import` would do (create, move, or merge a project), then one line per candidate session: start time, session id, import state, file size, start path, and the first prompt (secrets masked, first 80 characters). The import state is `new`, `live-only` (only the part after live capture started is stored), `imported`, or `other project`.
 
 Progress is printed one line per session:
 
@@ -336,11 +340,31 @@ You can stop with Ctrl-C at any time. Run the same command again and finished se
 
 Automatic injection gives Claude only the best few matches. For more, Claude can call the CLI. `hippo install` puts a guide block that tells Claude how into the memory file (see [3.5](#35-register-the-hooks)), so you do not need to write it yourself.
 
+### 4.6 GUI
+
+```bash
+hippo gui
+```
+
+Opens a native window (egui, no browser or web view). The command returns when you close the window. The folder you run it from is the current folder for every request, and the default for path fields.
+
+| Tab | What it does |
+|-----|--------------|
+| Status | Asks the daemon for its status every 2 seconds: spool, reindex state, and a table per project with pending embeddings, rate, and time left. While the window is open, the daemon stays up. |
+| Settings | Every `config.toml` key with its description and whether it is the default. Saving changes only the keys you changed and keeps your comments. A key set back to its default is removed from the file. The result is checked first, and an invalid file is not written. If the daemon must restart, a **Restart daemon** button appears. If the change needs a reindex, the window tells you. |
+| Import | **Preview** shows what would happen and a table of candidate sessions (the same as `--dry-run`). `new` and `live-only` sessions are selected first. **Import selected** sends only the checked sessions. **Stop** stops after the current session. Embedding progress comes from the status poll. |
+| Search | `search` and `show` |
+| Projects | `project list` and `reindex` |
+| Claude setup | Shows whether hippo is applied for the user or project scope. **Preview apply/remove** shows the same diff as `--dry-run`. **Apply** and **Remove** work only after a preview with the same inputs, and ask for confirmation. |
+| About | Version, README, and LICENSE |
+
+The window uses `[ui] language`. Korean text uses a macOS system font.
+
 ---
 
 ## 5. Configuration
 
-File: `~/.hippo/config.toml`. Every key is optional. Unknown keys are an error, so typos are caught. Restart the daemon after you change it. Only `[ui] language` takes effect from the next command without a restart.
+File: `~/.hippo/config.toml`. Every key is optional. Unknown keys are an error, so typos are caught. Restart the daemon after you change it. Only `[ui] language` takes effect from the next command without a restart. You can also edit the file in the Settings tab of `hippo gui` ([4.6](#46-gui)), which can restart the daemon for you.
 
 ```toml
 [embedder]
@@ -484,7 +508,7 @@ Security measures:
 | `store.rs` | SQLite source store, deduplication, FTS5, project merge |
 | `project.rs` | path normalization, git information, project location |
 | `registry.rs` | registry: project resolution, session binding, relocation, absorption |
-| `import.rs` | candidate selection for importing past records |
+| `import.rs` | candidate selection and preview for importing past records |
 | `queue.rs` | two-lane queues that take live work before import work |
 | `embedder.rs`, `vector.rs` | `Embedder` and `VectorStore` traits |
 | `ollama.rs`, `lance.rs` | Real backends |
@@ -497,6 +521,9 @@ Security measures:
 | `daemon.rs`, `client.rs`, `protocol.rs`, `spool.rs` | Daemon, hook client, socket protocol, spool |
 | `install.rs`, `setup.rs` | Settings merge, hook JSON, launchd plist |
 | `config.rs` | `config.toml` and data paths |
+| `config_edit.rs` | Settings for the GUI: key list, saving only changed keys (`toml_edit`), restart and reindex checks |
+| `commands.rs` | Work shared by the CLI and the GUI: install, import result lines, daemon requests |
+| `gui/` | `hippo gui`: `state.rs` (logic without the screen, tested), `app.rs` (egui screen), `text.rs` (key descriptions) |
 
 ### 9.3 Build and test
 
@@ -536,3 +563,9 @@ Ingest, search, and the daemon do not change.
 - For past sessions whose old path is gone, `hippo` cannot tell which project they belong to. Give the old path with `--from`.
 - Data in the single-store layout of v0.1 (`~/.hippo/records.sqlite`) is not migrated to the new layout.
 - macOS only for now.
+
+---
+
+## 11. License
+
+MIT. See [LICENSE](LICENSE).

@@ -519,6 +519,20 @@ fn project_commands_and_scopes_use_current_directory() {
             &work.join("sub").to_string_lossy(),
         );
     fs::write(past_dir.join("old-session.jsonl"), past).unwrap();
+    let dry = stdout(&hippo_in(
+        &root,
+        &work,
+        &["import", "--dry-run", "--wait"],
+        "",
+    ));
+    assert!(
+        dry.contains("[1] ") && dry.contains("old-sess  new") && dry.contains("new 1"),
+        "--dry-run: {dry}"
+    );
+    assert!(
+        !dry.contains("[1/1]") && !dry.contains("Embedding complete"),
+        "{dry}"
+    );
     let imported = stdout(&hippo_in(&root, &work, &["import", "--wait"], ""));
     assert!(
         imported.contains("Embedding complete"),

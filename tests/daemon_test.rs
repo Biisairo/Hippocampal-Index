@@ -12,7 +12,7 @@ use hippo::config::{Config, Paths};
 use hippo::daemon::{DaemonError, DaemonHandle, start};
 use hippo::embedder::Embedder;
 use hippo::i18n::Lang;
-use hippo::import::Candidate;
+use hippo::import::{Candidate, ImportStatus};
 use hippo::ingest::{HookEvent, ImportOutcome, IngestRequest};
 use hippo::protocol::{ImportSessionReport, Request, Response, Scope, StatusInfo};
 use hippo::search::SearchKind;
@@ -1067,6 +1067,7 @@ fn prepare(paths: &Paths, from: &str, to: &Path) -> (String, String, Vec<Candida
         &Request::ImportPrepare {
             from: from.into(),
             to: s(to),
+            dry_run: false,
         },
         TIMEOUT,
     )
@@ -1076,6 +1077,7 @@ fn prepare(paths: &Paths, from: &str, to: &Path) -> (String, String, Vec<Candida
             project_id,
             summary,
             sessions,
+            ..
         } => (project_id, summary, sessions),
         other => panic!("{other:?}"),
     }
@@ -1865,5 +1867,235 @@ fn daemon_uses_cold_budget_when_model_is_not_loaded() {
         out.is_some_and(|o| o.contains("<memory ")),
         "데몬이 떠 있어도 클라이언트는 콜드 예산까지 기다린다"
     );
+    handle.shutdown();
+}
+
+// ---- FR-DMN-11 ----
+
+#[test]
+fn shutdown_request_stops_daemon_and_removes_socket() {
+    let e = env();
+    let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
+    assert_eq!(
+        request(&e.paths.socket(), &Request::Shutdown, TIMEOUT).unwrap(),
+        Response::Done
+    );
+    assert!(exits_within(handle, Duration::from_secs(6)));
+    assert!(!e.paths.socket().exists());
+    let log = fs::read_to_string(e.paths.logs().join("hippo.log")).unwrap();
+    assert!(log.contains("shutdown requested"), "{log}");
+}
+
+#[test]
+fn shutdown_is_rejected_during_reindex() {
+    let e = env();
+    let embedder: Arc<dyn Embedder> = Arc::new(VerySlowEmbedder(HashEmbedder::new(256, 8_000)));
+    let handle = start(
+        e.paths.clone(),
+        config(),
+        embedder,
+        memory_source(&e.paths, Arc::new(MemoryVectorStore::default())),
+    )
+    .unwrap();
+    ingest(&e.paths, &e.transcript, HookEvent::Stop);
+    assert_eq!(
+        request(&e.paths.socket(), &reindex_all(), TIMEOUT).unwrap(),
+        Response::Done
+    );
+    let resp = request(&e.paths.socket(), &Request::Shutdown, TIMEOUT).unwrap();
+    assert!(matches!(resp, Response::Error { .. }), "{resp:?}");
+    assert_eq!(status(&e.paths).reindex, "running");
+    handle.shutdown();
+}
+
+#[test]
+fn pending_jobs_survive_shutdown_request() {
+    let e = env();
+    let embedder: Arc<dyn Embedder> = Arc::new(VerySlowEmbedder(HashEmbedder::new(256, 8_000)));
+    let handle = start(
+        e.paths.clone(),
+        config_with("[chunking]\nmax_tokens = 8000\n[index]\njob_batch = 1\n[import]\ntranscripts_dir = \"/nonexistent/hippo-test-transcripts\"\n"),
+        embedder,
+        memory_source(&e.paths, Arc::new(MemoryVectorStore::default())),
+    )
+    .unwrap();
+    ingest(&e.paths, &e.transcript, HookEvent::Stop);
+    let records = project_records(&e.paths);
+    assert!(totals(&status(&e.paths)).1 > 1);
+    assert_eq!(
+        request(&e.paths.socket(), &Request::Shutdown, TIMEOUT).unwrap(),
+        Response::Done
+    );
+    assert!(exits_within(handle, Duration::from_secs(10)));
+    assert!(
+        !records.embed_jobs(100).unwrap().is_empty(),
+        "남은 작업은 원본 저장소에 남음"
+    );
+
+    let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
+    wait_until(|| {
+        let (_, jobs, vectors) = totals(&status(&e.paths));
+        jobs == 0 && vectors > 0
+    });
+    handle.shutdown();
+}
+
+// ---- FR-IMP-8, FR-IMP-9 ----
+
+struct Preview {
+    project_id: String,
+    source_id: Option<String>,
+    summary: String,
+    sessions: Vec<Candidate>,
+}
+
+fn preview(paths: &Paths, from: &str, to: &Path) -> Preview {
+    match request(
+        &paths.socket(),
+        &Request::ImportPrepare {
+            from: from.into(),
+            to: s(to),
+            dry_run: true,
+        },
+        TIMEOUT,
+    )
+    .unwrap()
+    {
+        Response::ImportPlan {
+            project_id,
+            source_id,
+            summary,
+            sessions,
+        } => Preview {
+            project_id,
+            source_id,
+            summary,
+            sessions,
+        },
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn preview_of_merge_changes_nothing_and_matches_real_prepare() {
+    let (e, handle, a, b) = two_project_env();
+    let st = status(&e.paths);
+    let source = project_at(&st, &a).id.clone();
+    let target = project_at(&st, &b).id.clone();
+    let before = project_list(&e.paths);
+    let p = preview(&e.paths, &source, &b);
+    assert!(p.summary.contains("Would merge"), "{}", p.summary);
+    assert_eq!(
+        (p.project_id.as_str(), p.source_id.as_deref()),
+        (target.as_str(), Some(source.as_str()))
+    );
+    assert_eq!(project_list(&e.paths), before, "목록 DB 그대로");
+    assert!(e.paths.project_dir(&source).exists());
+    let (real, _, _) = prepare(&e.paths, &source, &b);
+    assert_eq!(real, target);
+    handle.shutdown();
+}
+
+#[test]
+fn preview_of_move_and_create_changes_nothing() {
+    let e = env();
+    let handle = launch_with(
+        &e.paths,
+        Arc::new(MemoryVectorStore::default()),
+        import_config(&e),
+    )
+    .unwrap();
+    let fresh = mkdir(&e, "fresh");
+    let p = preview(&e.paths, &s(&fresh), &fresh);
+    assert!(p.summary.contains("Would create"), "{}", p.summary);
+    assert_eq!((p.project_id.as_str(), p.source_id.as_deref()), ("", None));
+    assert!(
+        status(&e.paths).projects.is_empty(),
+        "프로젝트를 만들지 않음"
+    );
+
+    let a = mkdir(&e, "a");
+    ingest_session(&e.paths, "sa", &past(&e, "slug-a", "sa", &a));
+    let id = only_project(&e.paths);
+    let b = e._dir.path().join("b");
+    fs::rename(&a, &b).unwrap();
+    let b = fs::canonicalize(&b).unwrap();
+    let p = preview(&e.paths, &s(&a), &b);
+    assert!(p.summary.contains("Would move"), "{}", p.summary);
+    assert_eq!(p.project_id, id);
+    assert_eq!(
+        status(&e.paths).projects[0].location,
+        s(&a),
+        "위치를 바꾸지 않음"
+    );
+    assert_eq!(p.sessions.len(), 1);
+    assert_ne!(
+        p.sessions[0].status,
+        ImportStatus::New,
+        "원본 프로젝트의 세션 상태를 봄"
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn preview_lists_status_and_info_of_each_candidate() {
+    let e = env();
+    let handle = launch_with(
+        &e.paths,
+        Arc::new(MemoryVectorStore::default()),
+        import_config(&e),
+    )
+    .unwrap();
+    let x = mkdir(&e, "x");
+    let sub = mkdir(&e, "x/sub");
+    let b = mkdir(&e, "b");
+    ingest_session(&e.paths, "sx", &past(&e, "slug-x", "sx", &sub));
+    past(&e, "slug-x", "s1", &x);
+    let p = preview(&e.paths, &s(&x), &b);
+    let by_id = |id: &str| {
+        p.sessions
+            .iter()
+            .find(|c| c.session_id == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(by_id("sx").status, ImportStatus::OtherProject);
+    let s1 = by_id("s1");
+    assert_eq!(s1.status, ImportStatus::New);
+    assert_eq!(s1.start_cwd, s(&x));
+    assert!(
+        s1.size > 0 && !s1.started_at.is_empty() && !s1.first_prompt.is_empty(),
+        "{s1:?}"
+    );
+
+    run_import(&e.paths, &s(&x), &b);
+    let again = preview(&e.paths, &s(&x), &b);
+    let s1 = again
+        .sessions
+        .iter()
+        .find(|c| c.session_id == "s1")
+        .unwrap();
+    assert_eq!(s1.status, ImportStatus::Imported);
+    handle.shutdown();
+}
+
+#[test]
+fn preview_is_allowed_during_reindex() {
+    let e = env();
+    let embedder: Arc<dyn Embedder> = Arc::new(VerySlowEmbedder(HashEmbedder::new(256, 8_000)));
+    let handle = start(
+        e.paths.clone(),
+        config(),
+        embedder,
+        memory_source(&e.paths, Arc::new(MemoryVectorStore::default())),
+    )
+    .unwrap();
+    ingest(&e.paths, &e.transcript, HookEvent::Stop);
+    assert_eq!(
+        request(&e.paths.socket(), &reindex_all(), TIMEOUT).unwrap(),
+        Response::Done
+    );
+    let p = preview(&e.paths, &s2_cwd(), Path::new(&s2_cwd()));
+    assert!(p.summary.contains("No change"), "{}", p.summary);
     handle.shutdown();
 }

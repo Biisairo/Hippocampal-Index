@@ -18,7 +18,7 @@ use crate::embedder::{Embedder, InjectGate, YieldingEmbedder};
 use crate::fsutil::{ensure_private_dir, open_private_append, set_private_file};
 use crate::generations::{activate, active_dir, cleanup_inactive, new_generation};
 use crate::i18n::{Lang, local_time};
-use crate::import::candidates;
+use crate::import::{Candidate, candidates, import_status};
 use crate::indexer::{ChunkConfig, Compatibility, compatibility, process_jobs_until, reindex};
 use crate::ingest::{
     ImportOutcome, ImportReport, IngestOptions, IngestRequest, import_session, ingest,
@@ -86,6 +86,14 @@ fn reindex_busy(lang: Lang) -> String {
         lang,
         "Cannot import while reindexing",
         "재색인 중에는 가져올 수 없습니다"
+    )
+}
+
+fn shutdown_busy(lang: Lang) -> String {
+    tr!(
+        lang,
+        "Cannot shut down while reindexing",
+        "재색인 중에는 데몬을 종료할 수 없습니다"
     )
 }
 
@@ -695,12 +703,10 @@ fn import_origin(shared: &Shared, from: &str) -> Result<(PathBuf, String), Strin
     })
 }
 
-/// 원본·대상 프로젝트를 정해 위치를 바꾸거나 병합한다. 후보 세션은 연결 스레드가 찾는다. (FR-PRJ-7)
-fn import_prepare(shared: &Shared, from: &str, to: &str) -> Result<Response, String> {
-    if shared.reindexing.load(Ordering::SeqCst) {
-        return Err(reindex_busy(shared.lang()));
-    }
-    let lang = shared.lang();
+/// 원본·대상 프로젝트와 대상 위치를 정한다. 목록 DB를 바꾸지 않는다. (FR-PRJ-7, FR-IMP-9)
+type ImportTargets = (Option<String>, Option<String>, Location);
+
+fn import_targets(shared: &Shared, from: &str, to: &str) -> Result<ImportTargets, String> {
     let to_loc = shared.locate(to);
     let found = lock(&shared.registry)?
         .find_source(from)
@@ -718,6 +724,16 @@ fn import_prepare(shared: &Shared, from: &str, to: &str) -> Result<Response, Str
     let target = lock(&shared.registry)?
         .lookup(&to_loc)
         .map_err(|e| e.to_string())?;
+    Ok((source, target, to_loc))
+}
+
+/// 원본·대상 프로젝트를 정해 위치를 바꾸거나 병합한다. 후보 세션은 연결 스레드가 찾는다. (FR-PRJ-7)
+fn import_prepare(shared: &Shared, from: &str, to: &str) -> Result<Response, String> {
+    if shared.reindexing.load(Ordering::SeqCst) {
+        return Err(reindex_busy(shared.lang()));
+    }
+    let lang = shared.lang();
+    let (source, target, to_loc) = import_targets(shared, from, to)?;
     let (project_id, summary) = match (source, target) {
         (None, None) => {
             let id = lock(&shared.registry)?
@@ -751,6 +767,7 @@ fn import_prepare(shared: &Shared, from: &str, to: &str) -> Result<Response, Str
     };
     Ok(Response::ImportPlan {
         project_id,
+        source_id: None,
         summary,
         sessions: Vec::new(),
     })
@@ -772,18 +789,95 @@ fn import_plan(shared: &Shared, from: String, to: String) -> Result<Response, St
     else {
         return Ok(resp);
     };
-    let locate = |p: &Path| shared.locate(&p.to_string_lossy());
-    let sessions = candidates(
-        &shared.config.import.transcripts_dir,
-        &from_path,
-        &from_location,
-        &locate,
-    );
+    let sessions = annotated_candidates(shared, &from_path, &from_location, &[&project_id])?;
     Ok(Response::ImportPlan {
         project_id,
+        source_id: None,
         summary,
         sessions,
     })
+}
+
+/// 실행했을 때의 처리 경우와 후보를 돌려준다. 목록 DB와 원본 저장소를 바꾸지 않는다. (FR-IMP-9)
+fn import_preview(shared: &Shared, from: &str, to: &str) -> Result<Response, String> {
+    let (from_path, from_location) = import_origin(shared, from)?;
+    let (source, target, to_loc) = import_targets(shared, from, to)?;
+    let lang = shared.lang();
+    let path = &to_loc.path;
+    let (project_id, summary, owners) = match (&source, &target) {
+        (None, None) => (
+            String::new(),
+            tr!(
+                lang,
+                "Would create a project at {path}.\n",
+                "실행하면 {path}에 새 프로젝트를 만듭니다.\n"
+            ),
+            Vec::new(),
+        ),
+        (Some(s), None) => (
+            s.clone(),
+            tr!(
+                lang,
+                "Would move project {s} to {path}.\n",
+                "실행하면 프로젝트 {s}의 위치를 {path}(으)로 바꿉니다.\n"
+            ),
+            vec![s.as_str()],
+        ),
+        (Some(s), Some(t)) if s != t => (
+            t.clone(),
+            tr!(
+                lang,
+                "Would merge project {s} into {t}.\n",
+                "실행하면 프로젝트 {s}을(를) {t}에 병합합니다.\n"
+            ),
+            vec![t.as_str(), s.as_str()],
+        ),
+        (_, Some(t)) => (
+            t.clone(),
+            tr!(lang, "No change\n", "변경 없음\n"),
+            vec![t.as_str()],
+        ),
+    };
+    let sessions = annotated_candidates(shared, &from_path, &from_location, &owners)?;
+    Ok(Response::ImportPlan {
+        project_id,
+        source_id: source.clone(),
+        summary,
+        sessions,
+    })
+}
+
+/// 후보를 찾고, `owners`를 대상 프로젝트로 보아 가져오기 상태를 붙인다. (FR-IMP-8)
+fn annotated_candidates(
+    shared: &Shared,
+    from_path: &Path,
+    from_location: &str,
+    owners: &[&str],
+) -> Result<Vec<Candidate>, String> {
+    let redactor = Redactor::new(&shared.config.redact_patterns()).map_err(|e| format!("{e:?}"))?;
+    let locate = |p: &Path| shared.locate(&p.to_string_lossy());
+    let redact = |text: &str| redactor.redact(text);
+    let mut sessions = candidates(
+        &shared.config.import.transcripts_dir,
+        from_path,
+        from_location,
+        &locate,
+        &redact,
+    );
+    let stores: Vec<RecordStore> = owners
+        .iter()
+        .filter_map(|id| shared.records(id).ok())
+        .collect();
+    for c in &mut sessions {
+        let pin = lock(&shared.registry)?
+            .session_project(&c.session_id)
+            .map_err(|e| e.to_string())?;
+        let state = stores
+            .iter()
+            .find_map(|r| r.session_state(&c.session_id).ok().flatten());
+        c.status = import_status(pin.as_deref(), owners, state.as_ref());
+    }
+    Ok(sessions)
 }
 
 /// 세션 하나를 대상 프로젝트로 가져온다. 다른 프로젝트에 고정된 세션은 건너뛴다. (FR-IMP-3, FR-IMP-7)
@@ -1060,6 +1154,17 @@ fn reindex_project(shared: &Shared, id: &str) -> Result<(), String> {
     shared.install(id, target)
 }
 
+/// 새 연결을 받지 않게 하고 소켓 파일을 지운다. 스레드는 처리 중인 작업을 마친 뒤 멈춘다. (FR-DMN-11)
+fn request_shutdown(shared: &Shared) -> Result<Response, String> {
+    if shared.reindexing.load(Ordering::SeqCst) {
+        return Err(shutdown_busy(shared.lang()));
+    }
+    shared.log("shutdown requested");
+    shared.stop.store(true, Ordering::SeqCst);
+    let _ = fs::remove_file(shared.paths.socket());
+    Ok(Response::Done)
+}
+
 fn spawn_accept(shared: Arc<Shared>, listener: UnixListener) -> JoinHandle<()> {
     thread::spawn(move || {
         while !shared.stop.load(Ordering::SeqCst) {
@@ -1133,7 +1238,13 @@ fn handle_request(shared: &Arc<Shared>, req: Request) -> Response {
         Request::Ingest(ingest_req) => {
             return send_write(shared, |tx| WriteJob::Ingest(ingest_req, tx), "ingest");
         }
-        Request::ImportPrepare { from, to } => import_plan(shared, from, to),
+        Request::ImportPrepare { from, to, dry_run } => {
+            if dry_run {
+                import_preview(shared, &from, &to)
+            } else {
+                import_plan(shared, from, to)
+            }
+        }
         Request::ImportSession {
             project_id,
             session_id,
@@ -1178,6 +1289,7 @@ fn handle_request(shared: &Arc<Shared>, req: Request) -> Response {
             .map(|text| Response::Text { text }),
         Request::Status => status(shared).map(Response::Status),
         Request::ProjectList => project_list(shared).map(|text| Response::Text { text }),
+        Request::Shutdown => request_shutdown(shared),
     };
     result.unwrap_or_else(|message| {
         shared.log(&format!("request failed: {message}"));

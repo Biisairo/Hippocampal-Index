@@ -2,8 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use hippo::install::{
-    Action, InstallError, Scope, apply, is_hippo_command, merge_install, merge_uninstall,
-    target_file,
+    Action, InstallError, Scope, apply, is_hippo_command, is_installed, merge_install,
+    merge_uninstall, target_file,
 };
 use hippo::setup::hooks_config;
 use serde_json::{Value, json};
@@ -642,4 +642,25 @@ fn hooks_and_guide_use_tilde_paths_under_home() {
     let block = guide_block(&exe);
     assert!(block.contains("`~/.hippo/bin/hippo search"), "{block}");
     assert!(!block.contains(&home));
+}
+
+// ---- FR-GUI-10 ----
+
+#[test]
+fn is_installed_detects_hippo_hooks_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    assert!(!is_installed(&path), "파일 없음");
+    fs::write(
+        &path,
+        json!({"hooks": {"Stop": [other_stop_hook()]}}).to_string(),
+    )
+    .unwrap();
+    assert!(!is_installed(&path));
+    let mut settings = json!({});
+    merge_install(&mut settings, &ours("/x/hippo")).unwrap();
+    fs::write(&path, settings.to_string()).unwrap();
+    assert!(is_installed(&path));
+    fs::write(&path, "not json").unwrap();
+    assert!(!is_installed(&path));
 }

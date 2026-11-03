@@ -7,7 +7,7 @@ use hippo::client::{HookAction, inject_output, launch_disabled, parse_hook, run_
 use hippo::config::{Config, Paths};
 use hippo::generations::active_dir;
 use hippo::i18n::Lang;
-use hippo::import::Candidate;
+use hippo::import::{Candidate, ImportStatus};
 use hippo::ingest::{HookEvent, ImportOutcome, IngestRequest};
 use hippo::protocol::{ImportSessionReport, ProjectStatus, Request, Response, Scope, StatusInfo};
 use hippo::search::SearchKind;
@@ -164,7 +164,9 @@ fn protocol_roundtrip() {
         Request::ImportPrepare {
             from: "/old".into(),
             to: "/w".into(),
+            dry_run: true,
         },
+        Request::Shutdown,
         Request::ImportSession {
             project_id: "0123".into(),
             session_id: "s".into(),
@@ -184,10 +186,16 @@ fn protocol_roundtrip() {
         status,
         Response::ImportPlan {
             project_id: "0123".into(),
+            source_id: Some("4567".into()),
             summary: "변경 없음".into(),
             sessions: vec![Candidate {
                 session_id: "s".into(),
                 transcript_path: PathBuf::from("/t/s.jsonl"),
+                started_at: "2026-10-01T00:00:00Z".into(),
+                start_cwd: "/w".into(),
+                size: 10,
+                first_prompt: "hi".into(),
+                status: ImportStatus::LiveOnly,
             }],
         },
         Response::ImportSession(ImportSessionReport {
@@ -540,5 +548,36 @@ fn inject_request_without_budget_still_parses() {
             session_id: "s".into(),
             budget_ms: None,
         }
+    );
+}
+
+#[test]
+fn older_import_messages_without_new_fields_still_parse() {
+    let req: Request =
+        serde_json::from_str(r#"{"type":"import_prepare","from":"/a","to":"/b"}"#).unwrap();
+    assert_eq!(
+        req,
+        Request::ImportPrepare {
+            from: "/a".into(),
+            to: "/b".into(),
+            dry_run: false
+        }
+    );
+    let resp: Response = serde_json::from_str(
+        r#"{"type":"import_plan","project_id":"p","summary":"s","sessions":[{"session_id":"x","transcript_path":"/t/x.jsonl"}]}"#,
+    )
+    .unwrap();
+    let Response::ImportPlan {
+        source_id,
+        sessions,
+        ..
+    } = resp
+    else {
+        panic!("{resp:?}");
+    };
+    assert_eq!(source_id, None);
+    assert_eq!(
+        (sessions[0].size, sessions[0].status),
+        (0, ImportStatus::New)
     );
 }

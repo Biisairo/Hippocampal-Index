@@ -1,12 +1,15 @@
 pub mod backends;
 pub mod bg;
 pub mod client;
+pub mod commands;
 pub mod config;
+pub mod config_edit;
 pub mod daemon;
 pub mod embed_text;
 pub mod embedder;
 pub mod fsutil;
 pub mod generations;
+pub mod gui;
 pub mod i18n;
 pub mod import;
 pub mod indexer;
