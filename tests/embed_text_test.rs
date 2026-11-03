@@ -236,7 +236,7 @@ fn hippo_calls_are_recognized_by_first_word() {
     assert!(is_hippo_call(&bash("hippo status")));
     assert!(is_hippo_call(&bash("  '/a b/hippo' show p1")));
     assert!(is_hippo_call(&bash("\"/x/hippo\" import --wait")));
-    assert!(!is_hippo_call(&bash("cd /x && hippo status")));
+    assert!(is_hippo_call(&bash("cd /x && hippo status")));
     assert!(!is_hippo_call(&bash("hippocampus run")));
     assert!(!is_hippo_call(&call("Read", json!({"file_path": "hippo"}))));
     assert!(!is_hippo_call(&call("Bash", json!({}))));
@@ -258,5 +258,81 @@ fn hippo_calls_are_left_out_of_embed_text() {
         build_embed_text(&with_prompt, 500, &[]),
         "[input] fork 중복 어떻게 했지\n[tool] Read({\"file_path\":\"a.rs\"})",
         "사용자 프롬프트는 남김"
+    );
+}
+
+fn structured_answer(input: serde_json::Value, structured: serde_json::Value) -> ToolCall {
+    ToolCall {
+        result: Some(ToolResultData {
+            text: "The user answered: \"long question\"=\"skip\". You can now continue.".into(),
+            is_error: false,
+            structured: Some(structured),
+        }),
+        ..call("AskUserQuestion", input)
+    }
+}
+
+#[test]
+fn answer_uses_structured_answers_in_question_order_with_notes() {
+    let it = iteration(
+        vec![],
+        vec![structured_answer(
+            json!({"q": 2}),
+            json!({
+                "questions": [{"question": "B?"}, {"question": "A?"}],
+                "answers": {"A?": "yes", "B?": "skip copies"},
+                "annotations": {"A?": {"notes": "only for import"}}
+            }),
+        )],
+        vec![],
+    );
+    assert_eq!(
+        build_embed_text(&it, 500, &answer_tools()),
+        "[tool] AskUserQuestion({\"q\":2})\n[answer] skip copies / yes (note: only for import)"
+    );
+    let no_answers = iteration(
+        vec![],
+        vec![structured_answer(json!({}), json!({"plan": "x"}))],
+        vec![],
+    );
+    assert!(
+        build_embed_text(&no_answers, 500, &answer_tools()).ends_with("You can now continue."),
+        "answers가 없으면 결과 텍스트"
+    );
+}
+
+#[test]
+fn hippo_calls_are_found_by_parsing_the_shell_command() {
+    let bash = |cmd: &str| call("Bash", json!({"command": cmd}));
+    for hit in [
+        "cd /x && /p/hippo search q",
+        "cargo build; hippo status",
+        "echo q | /p/hippo search --kind result",
+        "H=/p/target/release/hippo; $H show p1",
+        "H=/p/hippo\n\"$H\" import --wait",
+        "export H=/p/hippo && ${H} status",
+        "out=$(/p/hippo search fork); echo \"$out\"",
+        "echo `hippo status`",
+        "env RUST_LOG=1 hippo status",
+        "sudo -n /p/hippo status",
+        "X=1 Y=2 /p/hippo search q",
+        "(cd /x && hippo search q)",
+        "for i in 1 2; do hippo status; done",
+    ] {
+        assert!(is_hippo_call(&bash(hit)), "잡아야 함: {hit}");
+    }
+    for miss in [
+        "cargo test -p hippo",
+        "ls target/release/hippo",
+        "grep -rn hippo src",
+        "H=/p/hippo; echo $H",
+        "git commit -m 'hippo search fix'",
+        "echo \"hippo status\"",
+    ] {
+        assert!(!is_hippo_call(&bash(miss)), "잡지 않아야 함: {miss}");
+    }
+    assert!(
+        is_hippo_call(&bash("hippo search 'unterminated")),
+        "파싱 실패 시 첫 단어 규칙"
     );
 }

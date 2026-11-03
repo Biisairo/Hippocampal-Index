@@ -2,7 +2,7 @@
 
 | 항목 | 값 |
 |------|----|
-| 문서 버전 | 0.5 (사용자 답 저장, 자기 참조 제외, 설치 정리, 진행 표시) |
+| 문서 버전 | 0.6 (사용자 답 추출, hippo 호출 판정을 셸 파싱으로) |
 | 작성일 | 2026-11-02 |
 | 작성자 | biisairo |
 | 준거 표준 | ISO/IEC/IEEE 29148:2018 |
@@ -214,13 +214,13 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 | ID | 요구사항 | 우선순위 |
 |----|----------|----------|
 | FR-STO-1 | 원본 저장소의 `iterations` 테이블에 반복마다 행 1개를 저장해야 한다. 필드: `id`(`<session_id>:<message_id>`), `session_id`, `prompt_id`, `message_id`, `iteration_index`(턴 안 순번), `cwd`, `ts`, `inputs`(JSON), `tool_calls`(JSON: `id`, `name`, `input`, `is_error`. 결과 원문은 넣지 않는다), `response_text`, `embed_text`. 반복과 결과의 연결은 `iteration_results`(`iteration_id`, `tool_use_id`, `result_id`)에 저장한다. 벡터 저장소에는 `id`, `vector`, `embed_model`과 메타데이터(`cwd`, `session_id`, `ts`)를 저장한다. `ts`는 반복 시각(FR-EXT-11)이며 가져오기에서도 transcript의 원래 값을 쓴다. 자동 주입(FR-RET-4)과 `show` 출력에 이 시각을 표시해 같은 주제의 기록 사이 선후를 알 수 있게 한다. | M |
-| FR-STO-2 | `embed_text`는 다음 순서로 만든다. 비어 있는 섹션은 넣지 않는다.<br>`[input] <반복 입력>` (입력마다 1줄. 완료 알림은 `<status>: <summary>`)<br>`[tool] <name>(<input compact JSON>)` (호출마다 1줄. JSON이 설정 길이(기본 500자)를 넘으면 그 길이에서 자르고 `…`를 붙인다. 원문 입력은 `tool_calls`에 그대로 남는다. hippo 호출(FR-STO-11)은 넣지 않는다)<br>`[answer] <결과 텍스트>` (사용자 응답 도구 호출 바로 뒤에 1줄. 사용자 응답 도구는 설정 `[embed_text] answer_tools`(기본 `AskUserQuestion`, `ExitPlanMode`)에 있는 도구이며, 결과가 있을 때만 넣는다. 결과는 질문을 되풀이한 뒤 끝에 답을 붙이는 형태이므로 자르지 않는다. 긴 텍스트는 청크 분할(FR-STO-5)이 처리한다)<br>`[response] <text 블록을 개행으로 이어 붙임>` | M |
+| FR-STO-2 | `embed_text`는 다음 순서로 만든다. 비어 있는 섹션은 넣지 않는다.<br>`[input] <반복 입력>` (입력마다 1줄. 완료 알림은 `<status>: <summary>`)<br>`[tool] <name>(<input compact JSON>)` (호출마다 1줄. JSON이 설정 길이(기본 500자)를 넘으면 그 길이에서 자르고 `…`를 붙인다. 원문 입력은 `tool_calls`에 그대로 남는다. hippo 호출(FR-STO-11)은 넣지 않는다)<br>`[answer] <결과 텍스트>` (사용자 응답 도구 호출 바로 뒤에 1줄. 사용자 응답 도구는 설정 `[embed_text] answer_tools`(기본 `AskUserQuestion`, `ExitPlanMode`)에 있는 도구이며, 결과가 있을 때만 넣는다. 결과 라인의 `toolUseResult`에 `answers` 객체(질문 → 답)가 있으면 답만 넣는다. 질문 순서는 `toolUseResult.questions[].question` 순서를 따르고, 여러 개면 ` / `로 잇는다. `annotations[질문].notes`가 있으면 그 답 뒤에 ` (note: <메모>)`를 붙인다. `answers`가 없으면 결과 텍스트를 넣는다. 질문은 `[tool]` 줄에 있으므로 되풀이하지 않는다. 자르지 않으며, 긴 텍스트는 청크 분할(FR-STO-5)이 처리한다)<br>`[response] <text 블록을 개행으로 이어 붙임>` | M |
 | FR-STO-3 | 원본 저장소의 `results` 테이블에 결과 원문을 원문 단위로 저장해야 한다. 필드: `id`(원문의 SHA-256 hex), `tool_name`(처음 저장한 도구), `text`, `first_seen_ts`. 빈 원문은 저장하지 않는다. 벡터는 벡터 저장소에 청크 단위로 저장한다. | M |
 | FR-STO-4 | 같은 프로젝트 저장소에 같은 `content_hash`가 이미 있으면 결과를 새로 저장하거나 임베딩하지 않고 기존 결과 id를 반복에 연결해야 한다. | M |
 | FR-STO-5 | 결과 원문이나 반복의 `embed_text`가 청크 한도를 넘으면 여러 청크로 나눠 청크마다 벡터를 만들어야 한다. 청크 한도(문자 수)는 임베더의 `max_input_tokens()`와 설정값(기본 8,000) 중 작은 값에 `chars_per_token`(기본 1.0)을 곱한 값이다. 청크는 한도 안에서 마지막 개행 위치에서 나누고, 개행이 없으면 한도에서 나눈다. 청크를 순서대로 이어 붙이면 원문과 같아야 한다. | M |
 | FR-STO-6 | 저장과 임베딩 전에 비밀값 패턴을 `[REDACTED:<종류>]`로 치환해야 한다. 기본 패턴: API 키(`sk-` 뒤 20자 이상, `gh[pousr]_` 뒤 36자 이상, `xox[abprs]-`, `AKIA` 뒤 16자), `Bearer <토큰 16자 이상>`, PEM 개인 키 블록(END 마커가 없으면 BEGIN부터 원문 끝까지), 이름이 `KEY`/`TOKEN`/`SECRET`/`PASSWORD`로 끝나는(대소문자 무시) `이름=값` 또는 `이름: 값`의 값(8자 이상, 이름은 남김). 마스킹은 반복 입력, 응답 텍스트, 도구 입력 JSON의 모든 문자열, 결과 원문에 적용한다. 패턴은 설정 파일로 추가할 수 있어야 하며, 잘못된 패턴은 시작 시 오류로 보고한다. | M |
 | FR-STO-7 | 임베딩은 반복 저장과 분리된 작업 큐로 처리해야 한다. 작업은 반복 저장과 같은 트랜잭션으로 프로젝트 원본 저장소의 `embed_jobs`(`kind`, `ref_id`, `enqueued_at`, `bulk`)에 등록한다. `bulk`는 가져오기(FR-IMP-5)와 병합(FR-PRJ-9)으로 등록한 작업이면 1, 그 밖에는 0이다. 작업 1건의 처리 순서: 원본 저장소에서 대상 텍스트(반복은 `embed_text`, 결과는 `text`)를 읽고 → 청크로 나누고(FR-STO-5) → 임베딩하고 → 기존 청크 벡터를 지운 뒤 새 벡터를 저장하고 → 작업을 완료 처리한다. 대상 텍스트가 비어 있으면 벡터 없이 완료 처리한다. 임베딩이나 벡터 저장이 실패하면 해당 작업을 큐에 남기고 다음 처리 때 재시도해야 한다. | M |
-| FR-STO-11 | hippo 호출은 도구 이름이 `Bash`이고 `command`의 첫 단어(따옴표를 벗긴 값)의 파일 이름이 `hippo`인 호출이다. hippo 호출은 `embed_text`에 넣지 않는다(FR-STO-2). 그 결과 `embed_text`가 비면 반복은 원본 저장소에만 저장되고 벡터와 FTS 결과에 나오지 않는다. hippo 호출의 결과 원문을 처음 저장할 때는 `results.indexed`를 0으로 저장하고 임베딩 작업과 FTS 행을 만들지 않는다. 재색인(FR-SWP-5)과 병합(FR-PRJ-9)도 `indexed`가 0인 결과를 색인하지 않는다. `hippo show`는 이 반복과 결과를 그대로 보여 준다. 자기 참조(기억을 찾던 장면)가 검색 결과에 다시 나오지 않게 하기 위한 규칙이다. | M |
+| FR-STO-11 | hippo 호출은 도구 이름이 `Bash`이고, `command`를 bash 문법으로 파싱했을 때 실행되는 명령 중 하나라도 hippo인 호출이다. 파서는 `brush-parser`를 쓴다. 명령은 `;`, `&&`, `||`, `|`, 줄바꿈, 서브셸, 명령 치환(`$( )`, 백틱) 안의 명령까지 모두 본다. 명령의 실행 단어는 앞의 `이름=값` 할당과 래퍼(`env`, `time`, `sudo`, `nohup`, `exec`, `command`)를 건너뛴 첫 단어이며, 따옴표를 벗긴 값의 파일 이름이 `hippo`이거나, `$이름`·`${이름}` 형태이고 같은 명령 줄에서 그 이름에 파일 이름이 `hippo`인 값을 할당했으면 hippo 실행이다. 인자 자리의 `hippo`(예: `cargo test -p hippo`)는 실행이 아니다. 파싱에 실패하면 첫 단어 규칙(따옴표를 벗긴 첫 단어의 파일 이름)으로 판정한다. hippo 호출은 `embed_text`에 넣지 않는다(FR-STO-2). 그 결과 `embed_text`가 비면 반복은 원본 저장소에만 저장되고 벡터와 FTS 결과에 나오지 않는다. hippo 호출의 결과 원문을 처음 저장할 때는 `results.indexed`를 0으로 저장하고 임베딩 작업과 FTS 행을 만들지 않는다. 재색인(FR-SWP-5)과 병합(FR-PRJ-9)도 `indexed`가 0인 결과를 색인하지 않는다. `hippo show`는 이 반복과 결과를 그대로 보여 준다. 자기 참조(기억을 찾던 장면)가 검색 결과에 다시 나오지 않게 하기 위한 규칙이다. | M |
 | FR-STO-8 | 원본 저장소에서 `iterations.embed_text`와 `results.text`에 SQLite FTS5 인덱스(trigram 토크나이저)를 만들어야 한다. FTS 검색어는 공백으로 나눈 토큰 중 3자 이상인 것을 OR로 묶는다. 해당 토큰이 없으면 FTS 결과는 비어 있다. | M |
 | FR-STO-10 | 반복, 결과, 반복-결과 연결, 백그라운드 기록, 임베딩 작업, 세션 해석기 상태의 변경은 한 처리 단위마다 하나의 트랜잭션으로 반영해야 한다. | M |
 | FR-STO-9 | 프로젝트 벡터 저장소의 행 수가 설정된 기준(기본 10만)을 넘으면 그 저장소의 `VectorStore::ensure_index`를 호출해야 한다. | S |
@@ -341,7 +341,7 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 | IF-HK-*, FR-CAP-* | 테스트 | 부록 A의 실측 hook 입력을 fixture로 사용해 이벤트별 동작과 `agent_id` 필터를 확인 |
 | FR-EXT-* | 테스트 | 실측 transcript fixture(s1~s5)로 반복 분리, 입력 연결, 완료 판정, 멱등성 확인. 처음 보는 세션이 기준 턴부터 저장되는지, `prompt_id`가 없거나 찾지 못하면 아무것도 저장하지 않는지, 파일이 다시 쓰이면 기준 턴부터 다시 읽는지 확인 |
 | FR-BG-* | 테스트 | s4, s5 fixture로 대기 기록 생성, 알림 파싱, 결과 연결, 반복 알림 순번 확인. output-file이 없는 경우 포함 |
-| FR-STO-11 | 테스트 | hippo 호출 판정(절대 경로, 따옴표, 다른 첫 단어), `embed_text` 제외, hippo 호출 결과의 FTS·임베딩·재색인·병합 제외, `show` 표시 확인 |
+| FR-STO-11 | 테스트 | hippo 호출 판정(절대 경로, 따옴표, `&&`·`;`·`|` 뒤, 변수 할당 후 `$H`·`"$H"`, `$( )`·백틱 안, env·sudo 래퍼, 인자 자리의 hippo, 파싱 실패 시 첫 단어 규칙), `embed_text` 제외, hippo 호출 결과의 FTS·임베딩·재색인·병합 제외, `show` 표시 확인 |
 | FR-STO-1~5, 7~9 | 테스트 | 임시 원본 저장소와 메모리 벡터 저장소에 저장 후 행, 해시 중복 제거, 청크 분할 확인. 임베딩은 테스트용 결정론적 임베더로 대체 |
 | FR-STO-6, QA-4 | 테스트 | 패턴별 비밀값이 DB에 남지 않는지 확인 |
 | FR-RET-* | 테스트 | 고정 데이터셋으로 필터, 임계값, 길이 제한, 시간 예산 초과 시 무주입 확인 |

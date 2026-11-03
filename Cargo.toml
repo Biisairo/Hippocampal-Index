@@ -7,6 +7,7 @@ edition = "2024"
 [dependencies]
 arrow-array = "58.4.1"
 arrow-schema = "58.4.1"
+brush-parser = "0.4"
 clap = { version = "4.6.7", features = ["derive"] }
 futures = "0.3.34"
 lancedb = "0.41.0"

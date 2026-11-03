@@ -21,6 +21,7 @@ pub mod redact;
 pub mod registry;
 pub mod search;
 pub mod setup;
+pub mod shell;
 pub mod spool;
 pub mod store;
 pub mod testing;

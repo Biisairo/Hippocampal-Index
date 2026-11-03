@@ -46,9 +46,9 @@ Your prompt
 - **Tool calls**: the name and input of each tool call
 - **Response**: the model's text (`thinking` blocks are not stored)
 - **Results**: the full tool output, stored separately and deduplicated by content hash
-- **User answers**: for tools that ask you something, such as `AskUserQuestion`, the result (your answer) is also added to the iteration record as `[answer]`. So "what did we decide" can be found
+- **User answers**: for tools that ask you something, such as `AskUserQuestion`, the answer you chose (and your note, if any) is added to the iteration record as `[answer]`. Only the answer is added, because the question is already in the tool call. So "what did we decide" can be found and shows up in automatic injection
 
-Tool calls that run `hippo` (`hippo search` and so on) are stored, but they are kept out of the search index. This stops past lookups from coming back in the next search. `hippo show` still shows them in the turn.
+Tool calls that run `hippo` (`hippo search` and so on) are stored, but they are kept out of the search index. The Bash command is parsed with bash syntax and judged by the commands it actually runs, so `cd x && hippo …`, `H=…/hippo; $H …`, and `$(hippo …)` are caught, while `cargo test -p hippo`, which only uses hippo as an argument, is not. This stops past lookups from coming back in the next search. `hippo show` still shows them in the turn.
 
 ### 1.2 How iterations are captured (hooks)
 
@@ -480,6 +480,7 @@ Security measures:
 | `bg.rs` | Background start detection, `<task-notification>` parsing, subagent report extraction |
 | `redact.rs` | Secret redaction |
 | `embed_text.rs` | Text to embed (`[input]`/`[tool]`/`[response]` lines), chunking |
+| `shell.rs` | Parses Bash commands (brush-parser) to tell whether hippo is run |
 | `store.rs` | SQLite source store, deduplication, FTS5, project merge |
 | `project.rs` | path normalization, git information, project location |
 | `registry.rs` | registry: project resolution, session binding, relocation, absorption |

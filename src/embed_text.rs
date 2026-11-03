@@ -2,15 +2,14 @@
 
 use std::num::NonZeroUsize;
 
-use std::path::Path;
-
 use serde_json::Value;
 
-use crate::transcript::{Iteration, IterationInput, ToolCall};
+use crate::shell::runs_hippo;
+use crate::transcript::{Iteration, IterationInput, ToolCall, ToolResultData};
 
 const TRUNCATION_MARK: char = '…';
 const BASH_TOOL: &str = "Bash";
-const HIPPO_EXE: &str = "hippo";
+const ANSWER_SEPARATOR: &str = " / ";
 
 /// 반복 입력의 표시 텍스트. 완료 알림은 `<status>: <summary>`.
 pub fn input_text(input: &IterationInput) -> String {
@@ -20,20 +19,52 @@ pub fn input_text(input: &IterationInput) -> String {
     }
 }
 
-/// `command`의 첫 단어(따옴표를 벗긴 값)의 파일 이름이 `hippo`인 Bash 호출. (FR-STO-11)
+/// 실행되는 명령 중 하나라도 hippo인 Bash 호출. (FR-STO-11)
 pub fn is_hippo_call(call: &ToolCall) -> bool {
-    if call.name != BASH_TOOL {
-        return false;
-    }
-    let Some(command) = call.input.get("command").and_then(Value::as_str) else {
-        return false;
+    call.name == BASH_TOOL
+        && call
+            .input
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(runs_hippo)
+}
+
+/// 사용자 응답 도구의 답. 구조화 결과의 `answers`가 있으면 질문 순서대로 답(과 메모)만 쓴다. (FR-STO-2)
+fn answer_text(result: &ToolResultData) -> String {
+    let Some(structured) = &result.structured else {
+        return result.text.clone();
     };
-    let command = command.trim_start();
-    let first = match command.chars().next() {
-        Some(q @ ('\'' | '"')) => command[1..].split(q).next().unwrap_or(""),
-        _ => command.split_whitespace().next().unwrap_or(""),
+    let Some(answers) = structured.get("answers").and_then(Value::as_object) else {
+        return result.text.clone();
     };
-    Path::new(first).file_name().is_some_and(|n| n == HIPPO_EXE)
+    let ordered: Vec<&String> = structured
+        .get("questions")
+        .and_then(Value::as_array)
+        .map(|qs| {
+            qs.iter()
+                .filter_map(|q| q.get("question").and_then(Value::as_str))
+                .filter_map(|q| answers.get_key_value(q).map(|(k, _)| k))
+                .collect()
+        })
+        .filter(|v: &Vec<&String>| !v.is_empty())
+        .unwrap_or_else(|| answers.keys().collect());
+    ordered
+        .into_iter()
+        .filter_map(|question| {
+            let answer = answers.get(question)?.as_str()?;
+            let note = structured
+                .get("annotations")
+                .and_then(|a| a.get(question))
+                .and_then(|a| a.get("notes"))
+                .and_then(Value::as_str)
+                .filter(|n| !n.trim().is_empty());
+            Some(match note {
+                Some(note) => format!("{answer} (note: {note})"),
+                None => answer.to_string(),
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(ANSWER_SEPARATOR)
 }
 
 fn truncate(text: &str, max_chars: usize) -> String {
@@ -69,7 +100,7 @@ pub fn build_embed_text(
                 .result
                 .as_ref()
                 .filter(|_| answer_tools.contains(&call.name))
-                .map(|r| format!("[answer] {}", r.text));
+                .map(|r| format!("[answer] {}", answer_text(r)));
             std::iter::once(line).chain(answer)
         });
     let response = (!it.texts.is_empty()).then(|| format!("[response] {}", it.texts.join("\n")));
