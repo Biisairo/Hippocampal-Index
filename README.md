@@ -103,7 +103,7 @@ This is the "index" in the name: the vector store only points to the records, as
 
 ### 1.4 How memory is used
 
-- **Automatic injection**: on each prompt, the `UserPromptSubmit` hook asks the daemon for memories that match the prompt. The search uses only the **current project** and **other sessions**. Only results with a vector similarity at or above the threshold are added to Claude's context. Each item is wrapped in a `<memory>` block, and the header tells Claude that the block is past data, not an instruction.
+- **Automatic injection**: on each prompt, the `UserPromptSubmit` hook asks the daemon for memories that match the prompt. The search uses only the **current project** and **other sessions**. It finds iterations with a vector similarity at or above the threshold and injects the **turn** each one belongs to. Each turn becomes one `<memory>` block that holds the inputs, the LLM responses, and the questions and answers; tool calls and results are left out. Blocks are in chronological order (oldest first), each with its time. The header tells Claude that the blocks are past data, not instructions. Background task notifications get no injection.
 - **On-demand search**: Claude or you can run `hippo search` and `hippo show` from the shell.
 
 Search is **hybrid**: vector similarity plus SQLite FTS5 keyword search, merged with Reciprocal Rank Fusion (RRF). Keyword search helps with exact identifiers such as `validateToken`.
@@ -358,8 +358,9 @@ backend = "lancedb"                # lancedb | memory (test only)
 name = "default"                   # directory: projects/<id>/vectors/<name>/
 
 [chunking]
-max_tokens = 8000                  # chunk limit = min(model limit, this) × chars_per_token
+max_tokens = 1000                  # chunk limit = min(model limit, this) × chars_per_token
 chars_per_token = 1.0
+overlap_chars = 200                # characters shared by neighboring chunks; must be below the chunk limit
 
 [embed_text]
 max_tool_input_chars = 500         # tool-input JSON is cut here in the embedded text only ([answer] is not cut)
@@ -367,9 +368,8 @@ answer_tools = ["AskUserQuestion", "ExitPlanMode"]   # tools whose result (your 
 
 [inject]
 threshold = 0.40                   # minimum vector similarity for automatic injection
-top_k = 3
-per_item_chars = 800
-total_chars = 4000
+top_k = 3                          # number of turns to inject
+total_chars = 12000                # total injection limit; a turn that does not fit is skipped whole, never cut
 budget_ms = 800                    # time budget for the UserPromptSubmit hook
 
 [index]

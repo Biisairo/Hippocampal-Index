@@ -10,6 +10,12 @@ use crate::transcript::{Iteration, IterationInput, ToolCall, ToolResultData};
 const TRUNCATION_MARK: char = '…';
 const BASH_TOOL: &str = "Bash";
 const ANSWER_SEPARATOR: &str = " / ";
+pub const INPUT_PREFIX: &str = "[input] ";
+pub const TOOL_PREFIX: &str = "[tool] ";
+pub const ANSWER_PREFIX: &str = "[answer] ";
+pub const RESPONSE_PREFIX: &str = "[response] ";
+/// 자동 주입에서만 쓴다. (FR-RET-4)
+pub const QUESTION_PREFIX: &str = "[question] ";
 
 /// 반복 입력의 표시 텍스트. 완료 알림은 `<status>: <summary>`.
 pub fn input_text(input: &IterationInput) -> String {
@@ -21,9 +27,12 @@ pub fn input_text(input: &IterationInput) -> String {
 
 /// 실행되는 명령 중 하나라도 hippo인 Bash 호출. (FR-STO-11)
 pub fn is_hippo_call(call: &ToolCall) -> bool {
-    call.name == BASH_TOOL
-        && call
-            .input
+    is_hippo_tool(&call.name, &call.input)
+}
+
+pub fn is_hippo_tool(name: &str, input: &Value) -> bool {
+    name == BASH_TOOL
+        && input
             .get("command")
             .and_then(Value::as_str)
             .is_some_and(runs_hippo)
@@ -85,14 +94,14 @@ pub fn build_embed_text(
     let inputs = it
         .inputs
         .iter()
-        .map(|input| format!("[input] {}", input_text(input)));
+        .map(|input| format!("{INPUT_PREFIX}{}", input_text(input)));
     let tools = it
         .tool_calls
         .iter()
         .filter(|call| !is_hippo_call(call))
         .flat_map(|call| {
             let line = format!(
-                "[tool] {}({})",
+                "{TOOL_PREFIX}{}({})",
                 call.name,
                 truncate(&call.input.to_string(), max_tool_input_chars)
             );
@@ -100,10 +109,11 @@ pub fn build_embed_text(
                 .result
                 .as_ref()
                 .filter(|_| answer_tools.contains(&call.name))
-                .map(|r| format!("[answer] {}", answer_text(r)));
+                .map(|r| format!("{ANSWER_PREFIX}{}", answer_text(r)));
             std::iter::once(line).chain(answer)
         });
-    let response = (!it.texts.is_empty()).then(|| format!("[response] {}", it.texts.join("\n")));
+    let response =
+        (!it.texts.is_empty()).then(|| format!("{RESPONSE_PREFIX}{}", it.texts.join("\n")));
     inputs
         .chain(tools)
         .chain(response)
@@ -121,17 +131,20 @@ pub fn chunk_limit(
     NonZeroUsize::new(chars).unwrap_or(NonZeroUsize::MIN)
 }
 
-pub fn chunk(text: &str, max_chars: NonZeroUsize) -> Vec<String> {
+/// `max_chars`자 창을 `max_chars - overlap`자씩 옮기며 나눈다. 이웃 청크는 `overlap`자를 공유한다. (FR-STO-5)
+pub fn chunk(text: &str, max_chars: NonZeroUsize, overlap: usize) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let size = max_chars.get();
+    let step = size - overlap.min(size - 1);
     let mut chunks = Vec::new();
-    let mut rest = text;
-    while !rest.is_empty() {
-        let Some((limit, _)) = rest.char_indices().nth(max_chars.get()) else {
-            chunks.push(rest.to_string());
+    let mut start = 0;
+    while start < chars.len() {
+        let end = (start + size).min(chars.len());
+        chunks.push(chars[start..end].iter().collect());
+        if end == chars.len() {
             break;
-        };
-        let cut = rest[..limit].rfind('\n').map_or(limit, |i| i + 1);
-        chunks.push(rest[..cut].to_string());
-        rest = &rest[cut..];
+        }
+        start += step;
     }
     chunks
 }

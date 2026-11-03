@@ -20,12 +20,13 @@ use serde_json::json;
 const CHUNKING: ChunkConfig = ChunkConfig {
     max_tokens: 8_000,
     chars_per_token: 1.0,
+    overlap_chars: 0,
 };
+const QUERY_CHARS: usize = 8_000;
 const RELEVANT: &str = "토큰 만료 비교가 반대여서 validateToken 수정";
 const CONFIG: InjectConfig = InjectConfig {
     threshold: 0.55,
     top_k: 3,
-    per_item_chars: 800,
     total_chars: 4_000,
 };
 
@@ -115,6 +116,7 @@ impl Env {
         Some(VectorBackends {
             embedder: &self.embedder,
             vectors: &self.vectors,
+            query_chars: QUERY_CHARS,
         })
     }
 }
@@ -375,22 +377,6 @@ fn injection_respects_top_k_and_lengths() {
     .unwrap()
     .unwrap();
     assert_eq!(one.matches("<memory ").count(), 1);
-
-    let short = build_injection(
-        &env.records,
-        env.backends(),
-        RELEVANT,
-        "s-cur",
-        InjectConfig {
-            per_item_chars: 10,
-            ..CONFIG
-        },
-        far_deadline(),
-    )
-    .unwrap()
-    .unwrap();
-    assert!(short.contains('…'));
-    assert!(!short.contains("validateToken"));
 
     let tight = InjectConfig {
         total_chars: 200,
@@ -725,6 +711,7 @@ fn all_scope_falls_back_to_keywords_per_project() {
             backends: Some(VectorBackends {
                 embedder: &failing,
                 vectors: &b.vectors,
+                query_chars: QUERY_CHARS,
             }),
         },
     ];
@@ -753,5 +740,369 @@ fn all_scope_without_projects_reports_no_results() {
     assert_eq!(
         render_project_hits(&[], &out, Lang::En).unwrap(),
         "No results\n"
+    );
+}
+
+// ---- FR-RET-3, FR-RET-4: 턴 단위 주입 ----
+
+const ASK: &str = "AskUserQuestion";
+
+fn turn_it(
+    session: &str,
+    prompt: &str,
+    index: u32,
+    ts: &str,
+    inputs: Vec<IterationInput>,
+    texts: &[&str],
+    tool_calls: Vec<ToolCall>,
+) -> NewIteration {
+    let iteration = Iteration {
+        session_id: session.into(),
+        prompt_id: Some(prompt.into()),
+        message_id: format!("{prompt}-{index}"),
+        iteration_index: index,
+        cwd: "/proj/a".into(),
+        ts: ts.into(),
+        inputs,
+        texts: texts.iter().map(|t| t.to_string()).collect(),
+        tool_calls,
+    };
+    let embed_text = build_embed_text(&iteration, 500, &[ASK.to_string()]);
+    NewIteration {
+        iteration,
+        embed_text,
+    }
+}
+
+fn prompt(text: &str) -> Vec<IterationInput> {
+    vec![IterationInput::Prompt { text: text.into() }]
+}
+
+fn read_call(id: &str) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        name: "Read".into(),
+        input: json!({"file_path": "secret_path.rs"}),
+        result: Some(ToolResultData {
+            text: "FILE BODY SHOULD NOT APPEAR".into(),
+            is_error: false,
+            structured: None,
+        }),
+    }
+}
+
+fn ask_call(id: &str, question: &str, answer: &str) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        name: ASK.into(),
+        input: json!({"questions": [{"question": question, "header": "h", "options": []}]}),
+        result: Some(ToolResultData {
+            text: format!("User has answered: \"{question}\"=\"{answer}\""),
+            is_error: false,
+            structured: Some(json!({
+                "questions": [{"question": question}],
+                "answers": {question: answer}
+            })),
+        }),
+    }
+}
+
+fn inject(env: &Env, query: &str, config: InjectConfig) -> Option<String> {
+    build_injection(
+        &env.records,
+        env.backends(),
+        query,
+        "s-cur",
+        config,
+        far_deadline(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn injection_renders_whole_turn_without_tools_or_truncation() {
+    let long_input = format!("저장 방식 질문 {}", "본문".repeat(300));
+    let env = Env::new(
+        vec![
+            turn_it(
+                "s-old",
+                "p-t1",
+                0,
+                "2026-11-01T00:00:00Z",
+                prompt(&long_input),
+                &["파일을 확인하겠습니다"],
+                vec![read_call("c1")],
+            ),
+            turn_it(
+                "s-old",
+                "p-t1",
+                1,
+                "2026-11-01T00:00:05Z",
+                vec![],
+                &[],
+                vec![ask_call("c2", "결과도 저장할까요?", "전체 저장")],
+            ),
+            turn_it(
+                "s-old",
+                "p-t1",
+                2,
+                "2026-11-01T00:00:09Z",
+                vec![],
+                &[RELEVANT],
+                vec![],
+            ),
+        ],
+        HashEmbedder::new(256, 8_000),
+    );
+    let text = inject(&env, RELEVANT, CONFIG).unwrap();
+    assert_eq!(text.matches("<memory ").count(), 1, "{text}");
+    assert!(text.contains("prompt=\"p-t1\""));
+    assert!(
+        text.contains("ts=\"2026-11-01T00:00:00Z\""),
+        "턴 첫 반복의 시각"
+    );
+    let expected = format!(
+        "[input] {long_input}\n[response] 파일을 확인하겠습니다\n[question] 결과도 저장할까요?\n[answer] 전체 저장\n[response] {RELEVANT}"
+    );
+    assert!(text.contains(&expected), "{text}");
+    assert!(!text.contains("[tool]"));
+    assert!(!text.contains("secret_path"));
+    assert!(!text.contains("FILE BODY"));
+    assert!(!text.contains('…'), "자르지 않는다");
+}
+
+#[test]
+fn injection_groups_hits_by_turn_and_counts_top_k_in_turns() {
+    let env = Env::new(
+        vec![
+            turn_it(
+                "s-old",
+                "p-a",
+                0,
+                "2026-10-01T00:00:00Z",
+                prompt("q"),
+                &[RELEVANT],
+                vec![],
+            ),
+            turn_it(
+                "s-old",
+                "p-a",
+                1,
+                "2026-10-01T00:00:01Z",
+                vec![],
+                &[RELEVANT],
+                vec![],
+            ),
+            turn_it(
+                "s-old",
+                "p-b",
+                0,
+                "2026-10-02T00:00:00Z",
+                prompt("q"),
+                &[RELEVANT],
+                vec![],
+            ),
+            turn_it(
+                "s-old",
+                "p-c",
+                0,
+                "2026-10-03T00:00:00Z",
+                prompt("q"),
+                &[RELEVANT],
+                vec![],
+            ),
+        ],
+        HashEmbedder::new(256, 8_000),
+    );
+    let all = inject(&env, RELEVANT, CONFIG).unwrap();
+    assert_eq!(all.matches("<memory ").count(), 3, "{all}");
+    assert_eq!(
+        all.matches("prompt=\"p-a\"").count(),
+        1,
+        "같은 턴은 한 블록"
+    );
+
+    let two = inject(&env, RELEVANT, InjectConfig { top_k: 2, ..CONFIG }).unwrap();
+    assert_eq!(two.matches("<memory ").count(), 2, "{two}");
+}
+
+#[test]
+fn injection_blocks_are_in_chronological_order() {
+    let env = Env::new(
+        vec![
+            turn_it(
+                "s-old",
+                "p-new",
+                0,
+                "2026-11-02T00:00:00Z",
+                prompt("q"),
+                &[RELEVANT],
+                vec![],
+            ),
+            turn_it(
+                "s-old",
+                "p-old",
+                0,
+                "2026-10-01T00:00:00Z",
+                prompt("q"),
+                &[&format!("{RELEVANT} 조금 다른 문장")],
+                vec![],
+            ),
+        ],
+        HashEmbedder::new(256, 8_000),
+    );
+    let text = inject(
+        &env,
+        RELEVANT,
+        InjectConfig {
+            threshold: 0.1,
+            ..CONFIG
+        },
+    )
+    .unwrap();
+    let old = text.find("prompt=\"p-old\"").unwrap();
+    let new = text.find("prompt=\"p-new\"").unwrap();
+    assert!(old < new, "오래된 턴이 먼저: {text}");
+    assert!(text.contains("chronological"), "머리말에 시간순임을 밝힌다");
+}
+
+#[test]
+fn turn_over_total_limit_is_skipped_whole_and_next_turn_used() {
+    let huge = "긴입력".repeat(1_000);
+    let env = Env::new(
+        vec![
+            turn_it(
+                "s-old",
+                "p-huge",
+                0,
+                "2026-10-01T00:00:00Z",
+                prompt(&huge),
+                &[],
+                vec![],
+            ),
+            turn_it(
+                "s-old",
+                "p-huge",
+                1,
+                "2026-10-01T00:00:01Z",
+                vec![],
+                &[RELEVANT],
+                vec![],
+            ),
+            turn_it(
+                "s-old",
+                "p-small",
+                0,
+                "2026-10-02T00:00:00Z",
+                prompt("q"),
+                &[RELEVANT],
+                vec![],
+            ),
+        ],
+        HashEmbedder::new(256, 8_000),
+    );
+    let text = inject(
+        &env,
+        RELEVANT,
+        InjectConfig {
+            total_chars: 1_500,
+            ..CONFIG
+        },
+    )
+    .unwrap();
+    assert!(!text.contains("p-huge"), "{text}");
+    assert!(text.contains("prompt=\"p-small\""));
+    assert!(!text.contains('…'));
+    assert!(text.chars().count() <= 1_500);
+}
+
+#[test]
+fn turn_content_comes_only_from_the_hit_session() {
+    let env = Env::new(
+        vec![
+            turn_it(
+                "s-old",
+                "p-fork",
+                0,
+                "2026-10-01T00:00:00Z",
+                prompt("q"),
+                &[RELEVANT],
+                vec![],
+            ),
+            turn_it(
+                "s-cur",
+                "p-fork",
+                1,
+                "2026-10-01T00:00:09Z",
+                vec![],
+                &["현재 세션에서 이어진 내용"],
+                vec![],
+            ),
+        ],
+        HashEmbedder::new(256, 8_000),
+    );
+    let text = inject(&env, RELEVANT, CONFIG).unwrap();
+    assert!(text.contains("prompt=\"p-fork\""));
+    assert!(!text.contains("현재 세션에서 이어진 내용"), "{text}");
+}
+
+#[test]
+fn task_notification_prompt_is_not_injected() {
+    let env = Env::standard();
+    let notification = format!(
+        "<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n<summary>{RELEVANT}</summary>\n</task-notification>"
+    );
+    assert_eq!(inject(&env, &notification, CONFIG), None);
+}
+
+// ---- FR-STO-5: 검색 질의는 첫 L자만 임베딩 ----
+
+struct QueryRecorder {
+    inner: HashEmbedder,
+    seen: std::sync::Mutex<Vec<String>>,
+}
+
+impl Embedder for QueryRecorder {
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+    fn dimension(&self) -> usize {
+        self.inner.dimension()
+    }
+    fn max_input_tokens(&self) -> usize {
+        self.inner.max_input_tokens()
+    }
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.seen.lock().unwrap().extend(texts.iter().cloned());
+        self.inner.embed(texts)
+    }
+}
+
+#[test]
+fn long_query_embeds_only_first_query_chars_but_fts_uses_all() {
+    let env = Env::standard();
+    let recorder = QueryRecorder {
+        inner: HashEmbedder::new(256, 8_000),
+        seen: std::sync::Mutex::new(Vec::new()),
+    };
+    let backends = Some(VectorBackends {
+        embedder: &recorder,
+        vectors: &env.vectors,
+        query_chars: 10,
+    });
+    let query = format!("{} validateToken", "가".repeat(30));
+    let hits = search(
+        &env.records,
+        backends,
+        &req(&query, SearchKind::Iteration, None, 10),
+        None,
+    )
+    .unwrap();
+    let seen = recorder.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0], "가".repeat(10));
+    assert!(
+        hit_ids(&hits).iter().any(|id| id == "s-old:m1"),
+        "FTS는 질의 전체(validateToken)로 찾는다: {hits:?}"
     );
 }

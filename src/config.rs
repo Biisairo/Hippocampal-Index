@@ -15,6 +15,8 @@ pub enum ConfigError {
     Parse(#[from] toml::de::Error),
     #[error("embedder url must point to localhost: {0}")]
     NonLocalUrl(String),
+    #[error("chunking overlap_chars ({overlap}) must be smaller than the chunk limit ({limit})")]
+    ChunkOverlap { overlap: usize, limit: usize },
     #[error("HOME is not set")]
     NoHome,
 }
@@ -46,6 +48,8 @@ pub struct VectorConfig {
 pub struct ChunkingConfig {
     pub max_tokens: usize,
     pub chars_per_token: f64,
+    /// 이웃한 청크가 공유하는 문자 수. (FR-STO-5)
+    pub overlap_chars: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -61,7 +65,6 @@ pub struct EmbedTextConfig {
 pub struct InjectSection {
     pub threshold: f32,
     pub top_k: usize,
-    pub per_item_chars: usize,
     pub total_chars: usize,
     pub budget_ms: u64,
 }
@@ -147,6 +150,14 @@ impl Config {
         let config: Self = toml::from_str(text)?;
         if !is_local_url(&config.embedder.url) {
             return Err(ConfigError::NonLocalUrl(config.embedder.url));
+        }
+        let c = &config.chunking;
+        let limit = (c.max_tokens as f64 * c.chars_per_token).floor() as usize;
+        if c.overlap_chars >= limit {
+            return Err(ConfigError::ChunkOverlap {
+                overlap: c.overlap_chars,
+                limit,
+            });
         }
         Ok(config)
     }
@@ -264,8 +275,9 @@ impl Default for VectorConfig {
 impl Default for ChunkingConfig {
     fn default() -> Self {
         Self {
-            max_tokens: 8_000,
+            max_tokens: 1_000,
             chars_per_token: 1.0,
+            overlap_chars: 200,
         }
     }
 }
@@ -282,8 +294,7 @@ impl Default for InjectSection {
         Self {
             threshold: 0.40,
             top_k: 3,
-            per_item_chars: 800,
-            total_chars: 4_000,
+            total_chars: 12_000,
             budget_ms: 800,
         }
     }

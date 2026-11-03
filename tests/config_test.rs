@@ -10,18 +10,18 @@ fn defaults_match_srs() {
     assert_eq!(c.embedder.dimension, 1024);
     assert_eq!(c.embedder.url, "http://127.0.0.1:11434");
     assert_eq!(c.vector.backend, "lancedb");
-    assert_eq!(c.chunking.max_tokens, 8_000);
+    assert_eq!(c.chunking.max_tokens, 1_000);
     assert_eq!(c.chunking.chars_per_token, 1.0);
+    assert_eq!(c.chunking.overlap_chars, 200);
     assert_eq!(c.embed_text.max_tool_input_chars, 500);
     assert_eq!(
         (
             c.inject.threshold,
             c.inject.top_k,
-            c.inject.per_item_chars,
             c.inject.total_chars,
             c.inject.budget_ms
         ),
-        (0.40, 3, 800, 4_000, 800)
+        (0.40, 3, 12_000, 800)
     );
     assert_eq!(c.index.vector_index_threshold, 100_000);
     assert!(c.redact.patterns.is_empty());
@@ -154,4 +154,29 @@ fn ui_language_defaults_to_english_and_accepts_korean() {
         Lang::Ko
     );
     assert!(Config::parse("[ui]\nlanguage = \"fr\"\n").is_err());
+}
+
+// ---- FR-STO-5 겹침, FR-RET-4 ----
+
+#[test]
+fn rejects_overlap_not_smaller_than_chunk_limit() {
+    for text in [
+        "[chunking]\nmax_tokens = 100\noverlap_chars = 100\n",
+        "[chunking]\nmax_tokens = 100\nchars_per_token = 0.5\noverlap_chars = 50\n",
+    ] {
+        assert!(
+            matches!(Config::parse(text), Err(ConfigError::ChunkOverlap { .. })),
+            "{text}"
+        );
+    }
+    let ok = Config::parse("[chunking]\nmax_tokens = 100\noverlap_chars = 99\n").unwrap();
+    assert_eq!(ok.chunking.overlap_chars, 99);
+}
+
+#[test]
+fn per_item_chars_is_no_longer_accepted() {
+    assert!(matches!(
+        Config::parse("[inject]\nper_item_chars = 800\n"),
+        Err(ConfigError::Parse(_))
+    ));
 }

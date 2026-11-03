@@ -134,43 +134,61 @@ fn chunk_limit_never_zero() {
 
 #[test]
 fn short_text_is_single_chunk() {
-    assert_eq!(chunk("짧은 글", nz(100)), vec!["짧은 글".to_string()]);
-}
-
-#[test]
-fn empty_text_has_no_chunks() {
-    assert!(chunk("", nz(10)).is_empty());
-}
-
-#[test]
-fn splits_at_last_newline_within_limit() {
-    let text = "aaaa\nbbbb\ncccc";
+    assert_eq!(chunk("짧은 글", nz(100), 20), vec!["짧은 글".to_string()]);
+    let exact = "가".repeat(10);
     assert_eq!(
-        chunk(text, nz(10)),
-        vec!["aaaa\nbbbb\n".to_string(), "cccc".to_string()]
+        chunk(&exact, nz(10), 2),
+        vec![exact.clone()],
+        "길이가 L과 같으면 1청크"
     );
 }
 
 #[test]
-fn hard_split_when_no_newline_and_multibyte_safe() {
-    let text = "가나다라마바사";
-    let chunks = chunk(text, nz(3));
-    assert_eq!(chunks, vec!["가나다", "라마바", "사"]);
+fn empty_text_has_no_chunks() {
+    assert!(chunk("", nz(10), 2).is_empty());
 }
 
 #[test]
-fn chunks_are_lossless_and_within_limit() {
+fn neighbors_share_overlap_and_windows_advance_by_l_minus_o() {
+    let text: String = "0123456789abcdefghij".into();
+    let chunks = chunk(&text, nz(10), 2);
+    assert_eq!(chunks, vec!["0123456789", "89abcdefgh", "ghij"]);
+}
+
+#[test]
+fn multibyte_safe_with_overlap() {
+    let chunks = chunk("가나다라마바사", nz(3), 1);
+    assert_eq!(chunks, vec!["가나다", "다라마", "마바사"]);
+}
+
+#[test]
+fn removing_overlap_restores_original_and_respects_limit() {
     let text = (0..500)
         .map(|i| format!("줄 {i} {}\n", "x".repeat(i % 37)))
         .collect::<String>();
-    let limit = nz(64);
-    let chunks = chunk(&text, limit);
-    assert_eq!(chunks.concat(), text);
+    let (limit, overlap) = (nz(64), 16);
+    let chunks = chunk(&text, limit, overlap);
+    assert!(chunks.len() > 1);
     assert!(
         chunks
             .iter()
             .all(|c| !c.is_empty() && c.chars().count() <= limit.get())
     );
+    let mut restored = chunks[0].clone();
+    for pair in chunks.windows(2) {
+        let prev_tail: String = pair[0].chars().skip(limit.get() - overlap).collect();
+        let head: String = pair[1].chars().take(overlap).collect();
+        assert_eq!(prev_tail, head, "이웃 청크는 O자를 공유");
+        restored.extend(pair[1].chars().skip(overlap));
+    }
+    assert_eq!(restored, text);
+}
+
+#[test]
+fn last_chunk_ends_at_text_end_without_tiny_duplicate() {
+    let chunks = chunk(&"a".repeat(18), nz(10), 2);
+    assert_eq!(chunks.len(), 2, "8자 진행: [0,10) [8,18)");
+    assert_eq!(chunks[1].len(), 10);
 }
 
 // ---- FR-STO-2 [answer], FR-STO-11 ----

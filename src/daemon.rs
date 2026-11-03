@@ -13,12 +13,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::backends::VectorSource;
 use crate::config::{Config, Paths};
-use crate::embedder::Embedder;
+use crate::embed_text::chunk_limit;
+use crate::embedder::{Embedder, InjectGate, YieldingEmbedder};
 use crate::fsutil::{ensure_private_dir, open_private_append, set_private_file};
 use crate::generations::{activate, active_dir, cleanup_inactive, new_generation};
 use crate::i18n::{Lang, local_time};
 use crate::import::candidates;
-use crate::indexer::{ChunkConfig, Compatibility, compatibility, process_jobs, reindex};
+use crate::indexer::{ChunkConfig, Compatibility, compatibility, process_jobs_until, reindex};
 use crate::ingest::{
     ImportOutcome, ImportReport, IngestOptions, IngestRequest, import_session, ingest,
     session_start_cwd,
@@ -136,10 +137,15 @@ impl ProjectHandle {
     }
 
     /// 호환되지 않으면 벡터 검색을 끄고 FTS 전용으로 동작한다. (FR-SWP-6)
-    fn backends<'a>(&'a self, embedder: &'a dyn Embedder) -> Option<VectorBackends<'a>> {
+    fn backends<'a>(
+        &'a self,
+        embedder: &'a dyn Embedder,
+        query_chars: usize,
+    ) -> Option<VectorBackends<'a>> {
         (!self.is_mismatch()).then(|| VectorBackends {
             embedder,
             vectors: self.vectors.as_ref(),
+            query_chars,
         })
     }
 
@@ -188,6 +194,8 @@ struct Shared {
     registry: Mutex<Registry>,
     open: Mutex<OpenProjects>,
     queue: Mutex<EmbedQueue>,
+    /// 처리 중인 자동 주입. 임베딩 스레드는 이것이 비어야 청크 요청을 보낸다. (FR-DMN-6 (a))
+    inject_gate: InjectGate,
     /// 프로젝트별 최근 임베딩 처리 기록 (완료 시각, 작업 수). (IF-CLI-5)
     embed_log: Mutex<HashMap<String, VecDeque<(Instant, usize)>>>,
     /// 임베딩 처리와 프로젝트 병합을 서로 막는다. 병합이 지운 프로젝트를 임베딩 스레드가 다시 만들지 않게 한다.
@@ -362,7 +370,19 @@ impl Shared {
         ChunkConfig {
             max_tokens: self.config.chunking.max_tokens,
             chars_per_token: self.config.chunking.chars_per_token,
+            overlap_chars: self.config.chunking.overlap_chars,
         }
+    }
+
+    /// 검색 질의에서 임베딩할 최대 문자 수. 청크 한도와 같다. (FR-STO-5)
+    fn query_chars(&self) -> usize {
+        let c = &self.config.chunking;
+        chunk_limit(
+            self.embedder.max_input_tokens(),
+            c.max_tokens,
+            c.chars_per_token,
+        )
+        .get()
     }
 
     fn set_reindex_state(&self, state: &str) {
@@ -474,6 +494,7 @@ pub fn start(
             entries: VecDeque::new(),
         }),
         queue: Mutex::new(EmbedQueue::default()),
+        inject_gate: InjectGate::default(),
         embed_log: Mutex::new(HashMap::new()),
         embed_lock: Mutex::new(()),
         write_tx,
@@ -879,16 +900,17 @@ fn spawn_embed(shared: Arc<Shared>, notify: Receiver<()>) -> JoinHandle<()> {
                 if shared.stop.load(Ordering::SeqCst) || shared.reindexing.load(Ordering::SeqCst) {
                     break;
                 }
-                let Some((project, jobs)) =
-                    shared.queue.lock().ok().and_then(|q| q.front_batch(batch))
-                else {
+                let Some((project, jobs, from_bulk)) = shared.queue.lock().ok().and_then(|q| {
+                    let from_bulk = q.lane_counts().0 == 0;
+                    q.front_batch(batch).map(|(p, j)| (p, j, from_bulk))
+                }) else {
                     break;
                 };
-                match embed_batch(&shared, &project, &jobs, &mut next_index_at) {
-                    Ok(()) => {
-                        shared.record_embedded(&project, jobs.len());
+                match embed_batch(&shared, &project, &jobs, from_bulk, &mut next_index_at) {
+                    Ok(done) => {
+                        shared.record_embedded(&project, done);
                         if let Ok(mut q) = shared.queue.lock() {
-                            q.remove(&project, &jobs);
+                            q.remove(&project, &jobs[..done]);
                         }
                     }
                     Err(EmbedFailure::Incompatible) => {
@@ -916,12 +938,14 @@ fn spawn_embed(shared: Arc<Shared>, notify: Receiver<()>) -> JoinHandle<()> {
     })
 }
 
+/// 처리한 작업 수를 돌려준다. `bulk` 작업을 처리하는 중에 일반 작업이 들어오면 작업 1건 뒤 멈춘다. (FR-DMN-6 (b))
 fn embed_batch(
     shared: &Shared,
     project: &str,
     jobs: &[EmbedJob],
+    from_bulk: bool,
     next_index_at: &mut HashMap<String, u64>,
-) -> Result<(), EmbedFailure> {
+) -> Result<usize, EmbedFailure> {
     let failed = EmbedFailure::Failed;
     let _embedding = lock(&shared.embed_lock).map_err(failed)?;
     let handle = shared.project(project).map_err(failed)?;
@@ -929,12 +953,18 @@ fn embed_batch(
         return Err(EmbedFailure::Incompatible);
     }
     let mut records = shared.records(project).map_err(failed)?;
-    process_jobs(
+    let embedder = YieldingEmbedder {
+        inner: shared.embedder.as_ref(),
+        gate: &shared.inject_gate,
+    };
+    let live_waiting = || from_bulk && shared.queue.lock().is_ok_and(|q| q.lane_counts().0 > 0);
+    let done = process_jobs_until(
         &mut records,
-        shared.embedder.as_ref(),
+        &embedder,
         handle.vectors.as_ref(),
         shared.chunking(),
         jobs,
+        &live_waiting,
     )
     .map_err(|e| failed(e.to_string()))?;
     handle.refresh(shared.embedder.as_ref());
@@ -950,7 +980,7 @@ fn embed_batch(
             Err(e) => shared.log(&format!("project {project}: vector index failed: {e}")),
         }
     }
-    Ok(())
+    Ok(done)
 }
 
 /// 범위의 프로젝트마다 새 세대에 전체를 다시 색인하고 ACTIVE를 바꿔 전환한다. (FR-SWP-5)
@@ -1148,6 +1178,7 @@ fn inject(
     session_id: &str,
 ) -> Result<Option<String>, String> {
     let started = Instant::now();
+    let _active = shared.inject_gate.enter();
     let bound = lock(&shared.registry)?
         .session_project(session_id)
         .map_err(|e| e.to_string())?;
@@ -1160,14 +1191,13 @@ fn inject(
     let config = InjectConfig {
         threshold: c.threshold,
         top_k: c.top_k,
-        per_item_chars: c.per_item_chars,
         total_chars: c.total_chars,
     };
     let budget = Duration::from_millis(c.budget_ms);
     let deadline = Instant::now() + budget;
     let result = build_injection(
         &records,
-        handle.backends(shared.embedder.as_ref()),
+        handle.backends(shared.embedder.as_ref(), shared.query_chars()),
         prompt,
         session_id,
         config,
@@ -1210,7 +1240,7 @@ fn search_scope(
         return search_with_fallback(
             shared,
             &records,
-            handle.backends(shared.embedder.as_ref()),
+            handle.backends(shared.embedder.as_ref(), shared.query_chars()),
             &req,
         );
     }
@@ -1225,7 +1255,7 @@ fn search_scope(
         .map(|(id, records, handle)| ProjectSearch {
             id,
             records,
-            backends: handle.backends(shared.embedder.as_ref()),
+            backends: handle.backends(shared.embedder.as_ref(), shared.query_chars()),
         })
         .collect();
     let result = search_projects(&projects, &req).map_err(|e| e.to_string())?;

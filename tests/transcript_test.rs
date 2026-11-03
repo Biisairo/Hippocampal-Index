@@ -367,3 +367,29 @@ fn replayed_notification_has_same_line_uuid() {
     assert_eq!(uuids(&first), uuids(&second));
     assert_eq!(uuids(&first).len(), 1);
 }
+
+// ---- FR-EXT-3: API 오류 안내문은 응답이 아니다 ----
+
+#[test]
+fn api_error_message_text_is_not_stored_as_response() {
+    let mut error_line: serde_json::Value = serde_json::from_str(&assistant_line(
+        "a1",
+        "m1",
+        json!([{"type": "text", "text": "API Error: safeguards flagged this message"}]),
+    ))
+    .unwrap();
+    error_line["isApiErrorMessage"] = json!(true);
+    error_line["message"]["model"] = json!("<synthetic>");
+    let content = joined(&[user_line("u1", "p1", json!("질문")), error_line.to_string()]);
+    let mut ex = Extractor::new(ExtractorState::default());
+    feed_all(&mut ex, &content);
+    let its = iterations(&ex.finish_turn());
+    assert_eq!(its.len(), 1, "반복 자체는 만든다");
+    assert!(its[0].texts.is_empty(), "{:?}", its[0].texts);
+    assert_eq!(
+        its[0].inputs,
+        vec![IterationInput::Prompt {
+            text: "질문".into()
+        }]
+    );
+}

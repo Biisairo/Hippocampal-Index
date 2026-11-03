@@ -51,9 +51,10 @@ fn env() -> Env {
 }
 
 /// 테스트 데몬이 실제 `~/.claude/projects`를 읽지 않도록 transcripts 디렉터리를 비워 둔다.
+/// 벡터 수를 세는 테스트가 청크 분할에 영향받지 않도록 청크 한도를 8,000자로 둔다.
 fn config() -> Config {
     Config::parse(
-        "[embedder]\nbackend = \"hash\"\ndimension = 256\n[vector]\nbackend = \"memory\"\n[import]\ntranscripts_dir = \"/nonexistent/hippo-test-transcripts\"\n",
+        "[embedder]\nbackend = \"hash\"\ndimension = 256\n[vector]\nbackend = \"memory\"\n[chunking]\nmax_tokens = 8000\n[import]\ntranscripts_dir = \"/nonexistent/hippo-test-transcripts\"\n",
     )
     .unwrap()
 }
@@ -503,7 +504,7 @@ fn concurrent_reindex_is_rejected() {
 fn lancedb_reindex_switches_generation_and_survives_restart() {
     let e = env();
     let config = Config::parse(
-        "[embedder]\nbackend = \"hash\"\ndimension = 256\n[vector]\nbackend = \"lancedb\"\n",
+        "[embedder]\nbackend = \"hash\"\ndimension = 256\n[vector]\nbackend = \"lancedb\"\n[chunking]\nmax_tokens = 8000\n",
     )
     .unwrap();
     let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(256, 8_000));

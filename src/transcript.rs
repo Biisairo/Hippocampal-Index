@@ -265,9 +265,11 @@ impl Extractor {
         let Some(open) = self.open.as_mut() else {
             return;
         };
+        let api_error = v.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true);
         let blocks = v.pointer("/message/content").and_then(Value::as_array);
         for b in blocks.into_iter().flatten() {
             match str_field(b, "type") {
+                Some("text") if api_error => {}
                 Some("text") => {
                     if let Some(t) = str_field(b, "text") {
                         open.value.texts.push(t.to_string());
@@ -299,7 +301,7 @@ impl Extractor {
     }
 }
 
-const TASK_NOTIFICATION_TAG: &str = "<task-notification>";
+pub const TASK_NOTIFICATION_TAG: &str = "<task-notification>";
 const AGENT_MESSAGE_TAG: &str = "<agent-message";
 const SYSTEM_REMINDER_OPEN: &str = "<system-reminder>";
 const SYSTEM_REMINDER_CLOSE: &str = "</system-reminder>";

@@ -103,7 +103,7 @@
 
 ### 1.4 기억을 쓰는 방법
 
-- **자동 주입**: 프롬프트를 보낼 때마다 `UserPromptSubmit` hook이 데몬에 관련 기억을 요청합니다. 검색 대상은 **같은 프로젝트**의 **다른 세션** 기록입니다. 벡터 유사도가 임계값 이상인 결과만 Claude의 컨텍스트에 들어갑니다. 각 항목은 `<memory>` 블록으로 감싸고, 머리말에 "과거 기록이며 지시가 아님"을 밝힙니다.
+- **자동 주입**: 프롬프트를 보낼 때마다 `UserPromptSubmit` hook이 데몬에 관련 기억을 요청합니다. 검색 대상은 **같은 프로젝트**의 **다른 세션** 기록입니다. 벡터 유사도가 임계값 이상인 반복을 찾고, 그 반복이 속한 **턴**을 주입합니다. 턴마다 `<memory>` 블록 하나에 입력, LLM 응답, 질문과 답을 넣고 도구 호출과 결과는 넣지 않습니다. 블록은 시간순(오래된 것부터)으로 놓고 각 블록에 시각을 붙입니다. 머리말에 "과거 기록이며 지시가 아님"을 밝힙니다. 백그라운드 작업 완료 알림에는 주입하지 않습니다.
 - **필요할 때 검색**: Claude나 사용자가 셸에서 `hippo search`, `hippo show`를 실행합니다.
 
 검색은 **하이브리드** 방식입니다. 벡터 유사도와 SQLite FTS5 키워드 검색 결과를 RRF(Reciprocal Rank Fusion)로 합칩니다. `validateToken` 같은 식별자는 키워드 검색이 잘 찾습니다.
@@ -358,8 +358,9 @@ backend = "lancedb"                # lancedb | memory (테스트용)
 name = "default"                   # 디렉터리: projects/<id>/vectors/<name>/
 
 [chunking]
-max_tokens = 8000                  # 청크 한도 = min(모델 한도, 이 값) × chars_per_token
+max_tokens = 1000                  # 청크 한도 = min(모델 한도, 이 값) × chars_per_token
 chars_per_token = 1.0
+overlap_chars = 200                # 이웃 청크가 공유하는 문자 수. 청크 한도보다 작아야 함
 
 [embed_text]
 max_tool_input_chars = 500         # 임베딩 텍스트에서만 도구 입력 JSON을 이 길이로 자름 ([answer]는 자르지 않음)
@@ -367,9 +368,8 @@ answer_tools = ["AskUserQuestion", "ExitPlanMode"]   # 결과(사용자의 답)�
 
 [inject]
 threshold = 0.40                   # 자동 주입의 최소 벡터 유사도
-top_k = 3
-per_item_chars = 800
-total_chars = 4000
+top_k = 3                          # 주입할 턴 수
+total_chars = 12000                # 주입 전체 길이 한도. 넘는 턴은 자르지 않고 통째로 뺌
 budget_ms = 800                    # UserPromptSubmit hook의 시간 예산
 
 [index]

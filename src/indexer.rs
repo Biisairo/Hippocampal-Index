@@ -9,6 +9,7 @@ use crate::vector::{VectorError, VectorRecord, VectorStore};
 pub struct ChunkConfig {
     pub max_tokens: usize,
     pub chars_per_token: f64,
+    pub overlap_chars: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -42,16 +43,18 @@ pub fn process_embed_jobs(
     limit: usize,
 ) -> Result<usize, IndexError> {
     let jobs = records.embed_jobs(limit)?;
-    process_jobs(records, embedder, vectors, chunking, &jobs)
+    process_jobs_until(records, embedder, vectors, chunking, &jobs, &|| false)
 }
 
-/// 주어진 작업을 차례로 처리한다. 실패하면 그때까지 끝난 작업만 완료 처리하고 오류를 돌려준다. (FR-DMN-6)
-pub fn process_jobs(
+/// 주어진 작업을 차례로 처리한다. 작업 1건을 마칠 때마다 `stop()`이 참이면 남은 작업을 두고 멈춘다.
+/// 실패하면 그때까지 끝난 작업만 완료 처리하고 오류를 돌려준다. (FR-DMN-6)
+pub fn process_jobs_until(
     records: &mut RecordStore,
     embedder: &dyn Embedder,
     vectors: &dyn VectorStore,
     chunking: ChunkConfig,
     jobs: &[EmbedJob],
+    stop: &dyn Fn() -> bool,
 ) -> Result<usize, IndexError> {
     let mut done: Vec<EmbedJob> = Vec::new();
     let mut failure = None;
@@ -62,6 +65,9 @@ pub fn process_jobs(
                 failure = Some(e);
                 break;
             }
+        }
+        if stop() {
+            break;
         }
     }
     records.complete_embed_jobs(&done)?;
@@ -162,15 +168,18 @@ fn index_one(
         chunking.max_tokens,
         chunking.chars_per_token,
     );
-    let chunks = chunk(&source.text, limit);
-    let embedded = embedder.embed(&chunks)?;
-    if embedded.len() != chunks.len() {
-        return Err(EmbedError::InvalidResponse(format!(
-            "expected {} vectors, got {}",
-            chunks.len(),
-            embedded.len()
-        ))
-        .into());
+    let chunks = chunk(&source.text, limit, chunking.overlap_chars);
+    let mut embedded = Vec::with_capacity(chunks.len());
+    for text in &chunks {
+        let mut vectors = embedder.embed(std::slice::from_ref(text))?;
+        if vectors.len() != 1 {
+            return Err(EmbedError::InvalidResponse(format!(
+                "expected 1 vector, got {}",
+                vectors.len()
+            ))
+            .into());
+        }
+        embedded.append(&mut vectors);
     }
     let new_records: Vec<VectorRecord> = embedded
         .into_iter()

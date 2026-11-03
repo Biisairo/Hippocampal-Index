@@ -1,10 +1,14 @@
 mod common;
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use hippo::embed_text::build_embed_text;
-use hippo::embedder::{EmbedError, Embedder};
-use hippo::indexer::{ChunkConfig, Compatibility, compatibility, process_embed_jobs, reindex};
+use hippo::embedder::{EmbedError, Embedder, InjectGate, YieldingEmbedder};
+use hippo::indexer::{
+    ChunkConfig, Compatibility, compatibility, process_embed_jobs, process_jobs_until, reindex,
+};
 use hippo::store::{Batch, NewIteration, RecordKind, RecordStore};
 use hippo::testing::{HashEmbedder, MemoryVectorStore};
 use hippo::transcript::{ExtractorState, Iteration, IterationInput, ToolCall, ToolResultData};
@@ -14,6 +18,7 @@ use serde_json::json;
 const CHUNKING: ChunkConfig = ChunkConfig {
     max_tokens: 8_000,
     chars_per_token: 1.0,
+    overlap_chars: 0,
 };
 
 fn iteration(mid: &str, response: &str, result: Option<&str>) -> NewIteration {
@@ -286,4 +291,154 @@ fn compatibility_detects_model_and_dimension() {
             store_dimension: Some(8)
         }
     );
+}
+
+// ---- FR-STO-5, FR-STO-7: 청크마다 요청 1개 ----
+
+struct RecordingEmbedder {
+    inner: HashEmbedder,
+    calls: Mutex<Vec<Vec<String>>>,
+}
+
+impl RecordingEmbedder {
+    fn new(max_input_tokens: usize) -> Self {
+        Self {
+            inner: HashEmbedder::new(8, max_input_tokens),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl Embedder for RecordingEmbedder {
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+    fn dimension(&self) -> usize {
+        self.inner.dimension()
+    }
+    fn max_input_tokens(&self) -> usize {
+        self.inner.max_input_tokens()
+    }
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.calls.lock().unwrap().push(texts.to_vec());
+        self.inner.embed(texts)
+    }
+}
+
+#[test]
+fn each_chunk_is_embedded_in_its_own_request_with_overlap() {
+    let long = "가나다라마바사아자차카타파하".repeat(2);
+    let mut store = store_with(vec![iteration("m1", "", Some(&long))]);
+    let v = MemoryVectorStore::default();
+    let embedder = RecordingEmbedder::new(10);
+    let chunking = ChunkConfig {
+        overlap_chars: 2,
+        ..CHUNKING
+    };
+    process_embed_jobs(&mut store, &embedder, &v, chunking, 10).unwrap();
+    let calls = embedder.calls.lock().unwrap();
+    assert!(calls.iter().all(|c| c.len() == 1), "{calls:?}");
+    let result_chunks: Vec<&String> = calls
+        .iter()
+        .map(|c| &c[0])
+        .filter(|t| long.contains(t.as_str()))
+        .collect();
+    assert_eq!(
+        result_chunks.len(),
+        4,
+        "28자, L=10, O=2: [0,10) [8,18) [16,26) [24,28)"
+    );
+    assert_eq!(v.count().unwrap() as usize, calls.len());
+}
+
+// ---- FR-DMN-6 (b): 작업 1건마다 중단 확인 ----
+
+#[test]
+fn processing_stops_after_the_job_when_asked() {
+    let mut store = store_with(vec![
+        iteration("m1", "a b c", None),
+        iteration("m2", "d e f", None),
+        iteration("m3", "g h i", None),
+    ]);
+    let jobs = store.embed_jobs(10).unwrap();
+    assert_eq!(jobs.len(), 3);
+    let v = MemoryVectorStore::default();
+    let checks = Mutex::new(0);
+    let stop = || {
+        let mut n = checks.lock().unwrap();
+        *n += 1;
+        true
+    };
+    let done = process_jobs_until(
+        &mut store,
+        &HashEmbedder::new(8, 8_000),
+        &v,
+        CHUNKING,
+        &jobs,
+        &stop,
+    )
+    .unwrap();
+    assert_eq!(done, 1, "첫 작업을 마친 뒤 멈춘다");
+    assert_eq!(*checks.lock().unwrap(), 1);
+    assert_eq!(
+        store.counts().unwrap().embed_jobs,
+        2,
+        "남은 작업은 큐에 남는다"
+    );
+
+    let rest = store.embed_jobs(10).unwrap();
+    let done = process_jobs_until(
+        &mut store,
+        &HashEmbedder::new(8, 8_000),
+        &v,
+        CHUNKING,
+        &rest,
+        &|| false,
+    )
+    .unwrap();
+    assert_eq!(done, 2);
+    assert_eq!(store.counts().unwrap().embed_jobs, 0);
+}
+
+// ---- FR-DMN-6 (a): 자동 주입 처리 중에는 청크 요청을 미룬다 ----
+
+#[test]
+fn yielding_embedder_waits_while_inject_is_active() {
+    let gate = InjectGate::default();
+    let inner = HashEmbedder::new(8, 8_000);
+    let yielding = YieldingEmbedder {
+        inner: &inner,
+        gate: &gate,
+    };
+    assert_eq!(yielding.model_id(), inner.model_id());
+    let done = AtomicBool::new(false);
+    let guard = gate.enter();
+    assert!(gate.is_busy());
+    std::thread::scope(|s| {
+        let worker = s.spawn(|| {
+            let out = yielding.embed(&["x".to_string()]).unwrap();
+            done.store(true, Ordering::SeqCst);
+            out
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "주입 중에는 요청을 보내지 않는다"
+        );
+        drop(guard);
+        assert_eq!(worker.join().unwrap().len(), 1);
+    });
+    assert!(done.load(Ordering::SeqCst));
+    assert!(!gate.is_busy());
+}
+
+#[test]
+fn inject_gate_counts_nested_entries() {
+    let gate = InjectGate::default();
+    let a = gate.enter();
+    let b = gate.enter();
+    drop(a);
+    assert!(gate.is_busy());
+    drop(b);
+    assert!(!gate.is_busy());
 }
