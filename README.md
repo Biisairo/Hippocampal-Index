@@ -104,7 +104,7 @@ This is the "index" in the name: the vector store only points to the records, as
 
 ### 1.4 How memory is used
 
-- **Automatic injection**: on each prompt, the `UserPromptSubmit` hook asks the daemon for memories that match the prompt. The search uses only the **current project** and **other sessions**. It finds iterations with a vector similarity at or above the threshold and injects the **turn** each one belongs to. Each turn becomes one `<memory>` block that holds the inputs, the LLM responses, and the questions and answers; tool calls and results are left out. Blocks are in chronological order (oldest first), each with its time. The header tells Claude that the blocks are past data, not instructions. Background task notifications get no injection.
+- **Automatic injection**: on each prompt, the `UserPromptSubmit` hook asks the daemon for memories that match the prompt. The search uses only the **current project** and **other sessions**. It finds iterations with a vector similarity at or above the threshold and injects the **turn** each one belongs to. Each turn becomes one `<memory>` block that holds the inputs, the LLM responses, and the questions and answers; tool calls and results are left out. Blocks are in chronological order (oldest first), each with its time. The header tells Claude that the blocks are past data, not instructions. Background task notifications get no injection, and neither do short prompts under 11 characters after trimming (such as "go on" or "show me that"). Search queries get the instruction the embedding model recommends as a prefix.
 - **On-demand search**: Claude or you can run `hippo search` and `hippo show` from the shell.
 
 Search is **hybrid**: vector similarity plus SQLite FTS5 keyword search, merged with Reciprocal Rank Fusion (RRF). Keyword search helps with exact identifiers such as `validateToken`.
@@ -376,6 +376,8 @@ url = "http://127.0.0.1:11434"     # must be localhost, 127.0.0.1, or ::1
 keep_alive = "30m"                 # keeps the model loaded to avoid a ~1 s cold start
 autostart = true                   # start `ollama serve` when the server is not reachable
 ollama_command = "ollama"          # path of the ollama executable
+query_prefix = "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"
+                                   # instruction put before search queries only (recommended for Qwen3-Embedding); empty for none; no reindex needed
 
 [vector]
 backend = "lancedb"                # lancedb | memory (test only)
@@ -391,11 +393,12 @@ max_tool_input_chars = 500         # tool-input JSON is cut here in the embedded
 answer_tools = ["AskUserQuestion", "ExitPlanMode"]   # tools whose result (your answer) is added as [answer]
 
 [inject]
-threshold = 0.40                   # minimum vector similarity for automatic injection
+threshold = 0.50                   # minimum vector similarity for automatic injection
 top_k = 3                          # number of turns to inject
 total_chars = 12000                # total injection limit; a turn that does not fit is skipped whole, never cut
 budget_ms = 800                    # time budget for the UserPromptSubmit hook
 cold_budget_ms = 2500              # budget when the hook has to start the daemon (cold start); at least budget_ms
+min_prompt_chars = 11              # prompts shorter than this after trimming get no injection
 
 [index]
 vector_index_threshold = 100000    # build an ANN index when the vector count reaches this
@@ -420,7 +423,7 @@ kind = "internal"
 pattern = 'HCI-\d{6}'
 ```
 
-**`inject.threshold` is a tuning value, not a final number.** In a small test with `qwen3-embedding:0.6b`, relevant memories scored 0.46–0.68 and unrelated ones 0.21–0.30. Change it based on your own data.
+**The defaults of `inject.threshold`, `min_prompt_chars`, and `query_prefix` come from measurements.** On an evaluation set built from this project's own history (60 questions with a known answer turn, 30 prompts that need no memory), they kept the same hit rate as 0.40 without a query instruction (53/60) and cut wrong injections from 28/30 to 16/30 (SRS appendix C). To cut wrong injections further, raise `threshold` to 0.55–0.60; some useful memories will then be missed too. If you change the embedding model, set `query_prefix` to the query format that model recommends.
 
 ---
 
@@ -551,7 +554,7 @@ Ingest, search, and the daemon do not change.
 
 ## 10. Known limitations
 
-- Automatic injection quality depends on `inject.threshold`. Tune it with real data (SRS OPEN-5).
+- Automatic injection quality depends on `inject.threshold`. Meta questions you have asked before, such as "was memory injected just now?", can still pull in unrelated memories (SRS appendix C).
 - Two-character Korean words (for example, "버그") are not found by keyword search (the FTS5 trigram tokenizer needs 3 or more characters). Vector search covers them.
 - Not yet checked in interactive sessions: whether a hook fires after a background notice (OPEN-1), the Esc interrupt (OPEN-2), compaction (OPEN-3), and whether the last line is written before `Stop` fires (OPEN-6).
 - Hooks always use the default data root (`~/.hippo`). `--root` is not written into hook commands.

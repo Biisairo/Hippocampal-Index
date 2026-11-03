@@ -150,11 +150,13 @@ impl ProjectHandle {
         &'a self,
         embedder: &'a dyn Embedder,
         query_chars: usize,
+        query_prefix: &'a str,
     ) -> Option<VectorBackends<'a>> {
         (!self.is_mismatch()).then(|| VectorBackends {
             embedder,
             vectors: self.vectors.as_ref(),
             query_chars,
+            query_prefix,
         })
     }
 
@@ -1327,12 +1329,17 @@ fn inject(
         threshold: c.threshold,
         top_k: c.top_k,
         total_chars: c.total_chars,
+        min_prompt_chars: c.min_prompt_chars,
     };
     let budget = Duration::from_millis(budget_ms);
     let deadline = Instant::now() + budget;
     let result = build_injection(
         &records,
-        handle.backends(shared.embedder.as_ref(), shared.query_chars()),
+        handle.backends(
+            shared.embedder.as_ref(),
+            shared.query_chars(),
+            &shared.config.embedder.query_prefix,
+        ),
         prompt,
         session_id,
         config,
@@ -1375,7 +1382,11 @@ fn search_scope(
         return search_with_fallback(
             shared,
             &records,
-            handle.backends(shared.embedder.as_ref(), shared.query_chars()),
+            handle.backends(
+                shared.embedder.as_ref(),
+                shared.query_chars(),
+                &shared.config.embedder.query_prefix,
+            ),
             &req,
         );
     }
@@ -1390,7 +1401,11 @@ fn search_scope(
         .map(|(id, records, handle)| ProjectSearch {
             id,
             records,
-            backends: handle.backends(shared.embedder.as_ref(), shared.query_chars()),
+            backends: handle.backends(
+                shared.embedder.as_ref(),
+                shared.query_chars(),
+                &shared.config.embedder.query_prefix,
+            ),
         })
         .collect();
     let result = search_projects(&projects, &req).map_err(|e| e.to_string())?;

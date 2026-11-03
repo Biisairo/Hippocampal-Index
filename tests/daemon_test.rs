@@ -54,7 +54,7 @@ fn env() -> Env {
 /// 벡터 수를 세는 테스트가 청크 분할에 영향받지 않도록 청크 한도를 8,000자로 둔다.
 fn config() -> Config {
     Config::parse(
-        "[embedder]\nbackend = \"hash\"\ndimension = 256\n[vector]\nbackend = \"memory\"\n[chunking]\nmax_tokens = 8000\n[import]\ntranscripts_dir = \"/nonexistent/hippo-test-transcripts\"\n",
+        "[embedder]\nbackend = \"hash\"\ndimension = 256\nquery_prefix = \"\"\n[vector]\nbackend = \"memory\"\n[chunking]\nmax_tokens = 8000\n[import]\ntranscripts_dir = \"/nonexistent/hippo-test-transcripts\"\n",
     )
     .unwrap()
 }
@@ -246,6 +246,37 @@ fn inject_returns_context_for_other_session() {
         "현재 세션은 제외"
     );
     handle.shutdown();
+}
+
+/// 데몬이 설정의 질의 접두사(FR-RET-11)와 최소 길이(FR-RET-1)를 주입 경로에 쓰는지 확인한다.
+#[test]
+fn inject_uses_configured_query_prefix_and_min_prompt_chars() {
+    let injected = |mutate: &dyn Fn(&mut Config)| {
+        let e = env();
+        let mut c = config();
+        mutate(&mut c);
+        let handle = launch_with(&e.paths, Arc::new(MemoryVectorStore::default()), c).unwrap();
+        ingest(&e.paths, &e.transcript, HookEvent::Stop);
+        wait_until(|| totals(&status(&e.paths)).1 == 0);
+        let prompt = project_records(&e.paths)
+            .iterations_for_prompt(S2_PROMPT)
+            .unwrap()[1]
+            .embed_text
+            .clone();
+        let out = inject_with_budget(&e.paths, &prompt, Some(5_000));
+        handle.shutdown();
+        matches!(out, Response::Inject { context: Some(_) })
+    };
+    assert!(injected(&|_| {}), "기본 설정에서는 주입");
+    let noise: String = (0..400).map(|i| format!("w{i} ")).collect();
+    assert!(
+        !injected(&|c| c.embedder.query_prefix = noise.clone()),
+        "긴 접두사가 질의 임베딩을 바꿔 임계값 아래로 떨어진다"
+    );
+    assert!(
+        !injected(&|c| c.inject.min_prompt_chars = 1_000_000),
+        "최소 길이 미만이면 주입하지 않는다"
+    );
 }
 
 #[test]
@@ -504,7 +535,7 @@ fn concurrent_reindex_is_rejected() {
 fn lancedb_reindex_switches_generation_and_survives_restart() {
     let e = env();
     let config = Config::parse(
-        "[embedder]\nbackend = \"hash\"\ndimension = 256\n[vector]\nbackend = \"lancedb\"\n[chunking]\nmax_tokens = 8000\n",
+        "[embedder]\nbackend = \"hash\"\ndimension = 256\nquery_prefix = \"\"\n[vector]\nbackend = \"lancedb\"\n[chunking]\nmax_tokens = 8000\n",
     )
     .unwrap();
     let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(256, 8_000));
@@ -554,7 +585,7 @@ fn lancedb_reindex_switches_generation_and_survives_restart() {
 
 fn config_with(extra: &str) -> Config {
     Config::parse(&format!(
-        "[embedder]\nbackend = \"hash\"\ndimension = 256\n[vector]\nbackend = \"memory\"\n{extra}"
+        "[embedder]\nbackend = \"hash\"\ndimension = 256\nquery_prefix = \"\"\n[vector]\nbackend = \"memory\"\n{extra}"
     ))
     .unwrap()
 }

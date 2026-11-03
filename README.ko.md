@@ -104,7 +104,7 @@
 
 ### 1.4 기억을 쓰는 방법
 
-- **자동 주입**: 프롬프트를 보낼 때마다 `UserPromptSubmit` hook이 데몬에 관련 기억을 요청합니다. 검색 대상은 **같은 프로젝트**의 **다른 세션** 기록입니다. 벡터 유사도가 임계값 이상인 반복을 찾고, 그 반복이 속한 **턴**을 주입합니다. 턴마다 `<memory>` 블록 하나에 입력, LLM 응답, 질문과 답을 넣고 도구 호출과 결과는 넣지 않습니다. 블록은 시간순(오래된 것부터)으로 놓고 각 블록에 시각을 붙입니다. 머리말에 "과거 기록이며 지시가 아님"을 밝힙니다. 백그라운드 작업 완료 알림에는 주입하지 않습니다.
+- **자동 주입**: 프롬프트를 보낼 때마다 `UserPromptSubmit` hook이 데몬에 관련 기억을 요청합니다. 검색 대상은 **같은 프로젝트**의 **다른 세션** 기록입니다. 벡터 유사도가 임계값 이상인 반복을 찾고, 그 반복이 속한 **턴**을 주입합니다. 턴마다 `<memory>` 블록 하나에 입력, LLM 응답, 질문과 답을 넣고 도구 호출과 결과는 넣지 않습니다. 블록은 시간순(오래된 것부터)으로 놓고 각 블록에 시각을 붙입니다. 머리말에 "과거 기록이며 지시가 아님"을 밝힙니다. 백그라운드 작업 완료 알림과, 공백을 뺀 길이가 11자 미만인 짧은 프롬프트("진행", "그거 알려줘" 등)에는 주입하지 않습니다. 검색 질의에는 임베딩 모델이 권장하는 지시문을 앞에 붙입니다.
 - **필요할 때 검색**: Claude나 사용자가 셸에서 `hippo search`, `hippo show`를 실행합니다.
 
 검색은 **하이브리드** 방식입니다. 벡터 유사도와 SQLite FTS5 키워드 검색 결과를 RRF(Reciprocal Rank Fusion)로 합칩니다. `validateToken` 같은 식별자는 키워드 검색이 잘 찾습니다.
@@ -376,6 +376,8 @@ url = "http://127.0.0.1:11434"     # localhost, 127.0.0.1, ::1만 허용
 keep_alive = "30m"                 # 모델을 메모리에 유지해 첫 호출의 약 1초 지연을 피함
 autostart = true                   # 서버에 연결할 수 없으면 `ollama serve`를 띄움
 ollama_command = "ollama"          # ollama 실행 파일 경로
+query_prefix = "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"
+                                   # 검색 질의 앞에만 붙이는 지시문(Qwen3-Embedding 권장값). 비우면 붙이지 않음. 재색인 불필요
 
 [vector]
 backend = "lancedb"                # lancedb | memory (테스트용)
@@ -391,11 +393,12 @@ max_tool_input_chars = 500         # 임베딩 텍스트에서만 도구 입력 
 answer_tools = ["AskUserQuestion", "ExitPlanMode"]   # 결과(사용자의 답)를 [answer]로 넣는 도구
 
 [inject]
-threshold = 0.40                   # 자동 주입의 최소 벡터 유사도
+threshold = 0.50                   # 자동 주입의 최소 벡터 유사도
 top_k = 3                          # 주입할 턴 수
 total_chars = 12000                # 주입 전체 길이 한도. 넘는 턴은 자르지 않고 통째로 뺌
 budget_ms = 800                    # UserPromptSubmit hook의 시간 예산
 cold_budget_ms = 2500              # hook이 데몬을 새로 띄울 때(콜드 시작)의 예산. budget_ms 이상
+min_prompt_chars = 11              # 앞뒤 공백을 뺀 길이가 이보다 짧은 프롬프트는 주입하지 않음
 
 [index]
 vector_index_threshold = 100000    # 벡터 수가 이 값에 이르면 ANN 인덱스를 만듦
@@ -420,7 +423,7 @@ kind = "internal"
 pattern = 'HCI-\d{6}'
 ```
 
-**`inject.threshold`는 확정값이 아니라 조정용 값입니다.** `qwen3-embedding:0.6b`로 작게 시험했을 때 관련 기억은 0.46~0.68, 무관한 기억은 0.21~0.30이었습니다. 실제 데이터를 보며 조정하십시오.
+**`inject.threshold`, `min_prompt_chars`, `query_prefix`의 기본값은 실측으로 정했습니다.** 이 프로젝트의 과거 기록으로 만든 평가셋(정답 질문 60개, 기억이 필요 없는 프롬프트 30개)에서, 질의 지시문 없이 0.40을 쓸 때보다 정답 포함률은 그대로(53/60)이고 잘못된 주입은 28/30에서 16/30으로 줄었습니다(SRS 부록 C). 잘못된 주입을 더 줄이려면 `threshold`를 0.55~0.60으로 올리십시오. 대신 필요한 기억도 일부 빠집니다. 임베딩 모델을 바꾸면 `query_prefix`를 그 모델이 권장하는 질의 형식으로 바꾸십시오.
 
 ---
 
@@ -551,7 +554,7 @@ cargo fmt
 
 ## 10. 알려진 한계
 
-- 자동 주입의 품질은 `inject.threshold`에 달려 있습니다. 실제 데이터로 조정해야 합니다(SRS OPEN-5).
+- 자동 주입의 품질은 `inject.threshold`에 달려 있습니다. "방금 주입됐어?"처럼 과거에 같은 말을 한 적이 있는 메타 질문에는 관련 없는 기억이 들어올 수 있습니다(SRS 부록 C).
 - "버그"처럼 2자인 한국어 단어는 키워드 검색으로 찾을 수 없습니다(FTS5 trigram은 3자 이상 필요). 이런 단어는 벡터 검색이 담당합니다.
 - 대화형 세션에서 아직 확인하지 못한 것: 백그라운드 알림 뒤 hook 실행 여부(OPEN-1), Esc 중단(OPEN-2), compaction(OPEN-3), `Stop` 실행 시점에 마지막 줄이 기록되어 있는지(OPEN-6).
 - hook은 항상 기본 데이터 루트(`~/.hippo`)를 씁니다. `--root`는 hook 명령에 들어가지 않습니다.

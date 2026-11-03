@@ -26,6 +26,10 @@ pub fn describe(section: &str, key: &str, lang: Lang) -> &'static str {
         ("embedder", "ollama_command") => {
             ("Path of the ollama executable", "ollama 실행 파일 경로")
         }
+        ("embedder", "query_prefix") => (
+            "Instruction put before search queries only. Empty for none. Restart needed, no reindex",
+            "검색 질의 앞에만 붙이는 지시문. 비우면 붙이지 않음. 재시작만 필요, 재색인 불필요",
+        ),
         ("vector", "backend") => (
             "lancedb, or memory (tests only)",
             "lancedb 또는 memory(테스트용)",
@@ -67,6 +71,10 @@ pub fn describe(section: &str, key: &str, lang: Lang) -> &'static str {
         ("inject", "cold_budget_ms") => (
             "Budget when the daemon or model is cold. Not smaller than budget_ms",
             "데몬이나 모델이 콜드일 때의 예산. budget_ms 이상",
+        ),
+        ("inject", "min_prompt_chars") => (
+            "Prompts shorter than this (trimmed, in characters) are not injected",
+            "앞뒤 공백을 뺀 길이가 이 값보다 짧은 프롬프트는 주입하지 않음",
         ),
         ("index", "vector_index_threshold") => (
             "Build an ANN index when vectors reach this count",

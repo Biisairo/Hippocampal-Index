@@ -28,6 +28,7 @@ const CONFIG: InjectConfig = InjectConfig {
     threshold: 0.55,
     top_k: 3,
     total_chars: 4_000,
+    min_prompt_chars: 0,
 };
 
 fn it(session: &str, mid: &str, cwd: &str, response: &str, result: Option<&str>) -> NewIteration {
@@ -117,6 +118,7 @@ impl Env {
             embedder: &self.embedder,
             vectors: &self.vectors,
             query_chars: QUERY_CHARS,
+            query_prefix: "",
         })
     }
 }
@@ -712,6 +714,7 @@ fn all_scope_falls_back_to_keywords_per_project() {
                 embedder: &failing,
                 vectors: &b.vectors,
                 query_chars: QUERY_CHARS,
+                query_prefix: "",
             }),
         },
     ];
@@ -1089,6 +1092,7 @@ fn long_query_embeds_only_first_query_chars_but_fts_uses_all() {
         embedder: &recorder,
         vectors: &env.vectors,
         query_chars: 10,
+        query_prefix: "",
     });
     let query = format!("{} validateToken", "가".repeat(30));
     let hits = search(
@@ -1105,6 +1109,125 @@ fn long_query_embeds_only_first_query_chars_but_fts_uses_all() {
         hit_ids(&hits).iter().any(|id| id == "s-old:m1"),
         "FTS는 질의 전체(validateToken)로 찾는다: {hits:?}"
     );
+}
+
+// ---- FR-RET-11: 질의 접두사 ----
+
+#[test]
+fn query_prefix_is_added_after_truncation_and_fts_uses_raw_query() {
+    let env = Env::standard();
+    let recorder = QueryRecorder {
+        inner: HashEmbedder::new(256, 8_000),
+        seen: std::sync::Mutex::new(Vec::new()),
+    };
+    let backends = Some(VectorBackends {
+        embedder: &recorder,
+        vectors: &env.vectors,
+        query_chars: 10,
+        query_prefix: "Instruct: find\nQuery:",
+    });
+    let query = format!("{} validateToken", "가".repeat(30));
+    let hits = search(
+        &env.records,
+        backends,
+        &req(&query, SearchKind::Iteration, None, 10),
+        None,
+    )
+    .unwrap();
+    let seen = recorder.seen.lock().unwrap();
+    assert_eq!(
+        seen.as_slice(),
+        [format!("Instruct: find\nQuery:{}", "가".repeat(10))]
+    );
+    assert!(
+        hit_ids(&hits).iter().any(|id| id == "s-old:m1"),
+        "FTS는 접두사 없는 질의 전체로 찾는다: {hits:?}"
+    );
+}
+
+#[test]
+fn injection_embeds_query_with_prefix() {
+    let env = Env::standard();
+    let recorder = QueryRecorder {
+        inner: HashEmbedder::new(256, 8_000),
+        seen: std::sync::Mutex::new(Vec::new()),
+    };
+    let backends = Some(VectorBackends {
+        embedder: &recorder,
+        vectors: &env.vectors,
+        query_chars: QUERY_CHARS,
+        query_prefix: "P: ",
+    });
+    build_injection(
+        &env.records,
+        backends,
+        RELEVANT,
+        "s-cur",
+        CONFIG,
+        far_deadline(),
+    )
+    .unwrap();
+    assert_eq!(
+        recorder.seen.lock().unwrap().as_slice(),
+        [format!("P: {RELEVANT}")]
+    );
+}
+
+// ---- FR-RET-1: 짧은 프롬프트 무주입 ----
+
+#[test]
+fn prompt_shorter_than_min_chars_is_not_injected() {
+    let env = Env::standard();
+    let len = RELEVANT.chars().count();
+    assert!(
+        RELEVANT.len() > len + 1,
+        "한글이 있어 바이트 수가 문자 수보다 크다"
+    );
+    let at = |min: usize, prompt: &str| {
+        inject(
+            &env,
+            prompt,
+            InjectConfig {
+                min_prompt_chars: min,
+                ..CONFIG
+            },
+        )
+    };
+    assert!(at(len, RELEVANT).is_some(), "기준과 같은 길이는 주입");
+    assert_eq!(at(len + 1, RELEVANT), None, "기준 미만은 무주입");
+    let padded = format!("  \n{RELEVANT}\t ");
+    assert_eq!(at(len + 1, &padded), None, "앞뒤 공백은 세지 않는다");
+    assert!(at(len, &padded).is_some());
+}
+
+#[test]
+fn short_prompt_skips_search_entirely() {
+    let env = Env::standard();
+    let recorder = QueryRecorder {
+        inner: HashEmbedder::new(256, 8_000),
+        seen: std::sync::Mutex::new(Vec::new()),
+    };
+    let backends = Some(VectorBackends {
+        embedder: &recorder,
+        vectors: &env.vectors,
+        query_chars: QUERY_CHARS,
+        query_prefix: "",
+    });
+    let config = InjectConfig {
+        min_prompt_chars: 11,
+        ..CONFIG
+    };
+    let out = build_injection(
+        &env.records,
+        backends,
+        "그거 알려줘",
+        "s-cur",
+        config,
+        far_deadline(),
+    )
+    .unwrap();
+    assert_eq!(out, None);
+    assert!(recorder.seen.lock().unwrap().is_empty(), "임베딩 요청 없음");
 }
 
 #[test]

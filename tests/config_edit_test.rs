@@ -18,6 +18,7 @@ url = "http://localhost:1"
 keep_alive = "5m"
 autostart = false
 ollama_command = "/x/ollama"
+query_prefix = "q: "
 [vector]
 backend = "memory"
 name = "n"
@@ -34,6 +35,7 @@ top_k = 9
 total_chars = 99
 budget_ms = 1
 cold_budget_ms = 2
+min_prompt_chars = 3
 [index]
 vector_index_threshold = 5
 job_batch = 6
@@ -81,10 +83,10 @@ fn fields_read_every_key_and_save_round_trips() {
     let all = Config::parse(ALL_KEYS).unwrap();
     let defaults = fields(&Config::default());
     let set = fields(&all);
-    assert_eq!(set.len(), 29);
+    assert_eq!(set.len(), 31);
     assert_eq!(
         changed(&defaults, &set).len(),
-        29,
+        31,
         "모든 키가 설정값을 읽음"
     );
     let d = dir();
@@ -242,6 +244,13 @@ fn restart_and_reindex_needs_follow_changed_keys() {
         FieldValue::Text("http://localhost:2".into()),
     );
     assert_eq!((needs_restart(&url), needs_reindex(&url)), (true, false));
+    let prefix = one("embedder", "query_prefix", FieldValue::Text("q: ".into()));
+    assert_eq!(
+        (needs_restart(&prefix), needs_reindex(&prefix)),
+        (true, false)
+    );
+    let min = one("inject", "min_prompt_chars", FieldValue::Int(3));
+    assert_eq!((needs_restart(&min), needs_reindex(&min)), (true, false));
     for (s, k) in [
         ("embedder", "model"),
         ("embedder", "max_input_tokens"),

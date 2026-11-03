@@ -22,12 +22,27 @@ fn defaults_match_srs() {
             c.inject.budget_ms,
             c.inject.cold_budget_ms
         ),
-        (0.40, 3, 12_000, 800, 2_500)
+        (0.50, 3, 12_000, 800, 2_500)
+    );
+    assert_eq!(c.inject.min_prompt_chars, 11);
+    assert_eq!(
+        c.embedder.query_prefix,
+        "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"
     );
     assert_eq!(c.index.vector_index_threshold, 100_000);
     assert!(c.redact.patterns.is_empty());
     assert!(c.daemon.autostart);
     assert_eq!(c.daemon.idle_timeout_secs, 1_800);
+}
+
+#[test]
+fn query_prefix_and_min_prompt_chars_override() {
+    let c =
+        Config::parse("[embedder]\nquery_prefix = \"\"\n[inject]\nmin_prompt_chars = 0\n").unwrap();
+    assert_eq!(c.embedder.query_prefix, "");
+    assert_eq!(c.inject.min_prompt_chars, 0);
+    let c = Config::parse("[embedder]\nquery_prefix = \"query: \"\n").unwrap();
+    assert_eq!(c.embedder.query_prefix, "query: ");
 }
 
 #[test]

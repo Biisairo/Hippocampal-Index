@@ -40,6 +40,8 @@ pub struct VectorBackends<'a> {
     pub vectors: &'a dyn VectorStore,
     /// 검색 질의에서 임베딩할 최대 문자 수(청크 한도). (FR-STO-5)
     pub query_chars: usize,
+    /// 길이 제한 뒤 질의 앞에 붙이는 지시문. (FR-RET-11)
+    pub query_prefix: &'a str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +75,7 @@ pub struct InjectConfig {
     pub threshold: f32,
     pub top_k: usize,
     pub total_chars: usize,
+    pub min_prompt_chars: usize,
 }
 
 const RRF_K: f64 = 60.0;
@@ -122,7 +125,10 @@ pub fn search(
     let query_vector = match backends {
         Some(b) => {
             let query: String = req.query.chars().take(b.query_chars).collect();
-            b.embedder.embed(&[query])?.into_iter().next()
+            b.embedder
+                .embed(&[format!("{}{query}", b.query_prefix)])?
+                .into_iter()
+                .next()
         }
         None => None,
     };
@@ -188,7 +194,10 @@ pub fn build_injection(
     config: InjectConfig,
     deadline: Instant,
 ) -> Result<Option<String>, SearchError> {
-    if prompt.trim().is_empty() || backends.is_none() || prompt.contains(TASK_NOTIFICATION_TAG) {
+    if prompt.trim().chars().count() < config.min_prompt_chars.max(1)
+        || backends.is_none()
+        || prompt.contains(TASK_NOTIFICATION_TAG)
+    {
         return Ok(None);
     }
     let req = SearchRequest {

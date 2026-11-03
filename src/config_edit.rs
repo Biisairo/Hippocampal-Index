@@ -80,6 +80,7 @@ pub fn fields(c: &Config) -> Vec<Field> {
         ("embedder", "keep_alive", text(&e.keep_alive)),
         ("embedder", "autostart", FieldValue::Bool(e.autostart)),
         ("embedder", "ollama_command", text(&e.ollama_command)),
+        ("embedder", "query_prefix", text(&e.query_prefix)),
         ("vector", "backend", text(&c.vector.backend)),
         ("vector", "name", text(&c.vector.name)),
         ("chunking", "max_tokens", int(c.chunking.max_tokens)),
@@ -104,6 +105,7 @@ pub fn fields(c: &Config) -> Vec<Field> {
         ("inject", "total_chars", int(c.inject.total_chars)),
         ("inject", "budget_ms", int(c.inject.budget_ms)),
         ("inject", "cold_budget_ms", int(c.inject.cold_budget_ms)),
+        ("inject", "min_prompt_chars", int(c.inject.min_prompt_chars)),
         (
             "index",
             "vector_index_threshold",

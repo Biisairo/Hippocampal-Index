@@ -1344,6 +1344,7 @@ fn setting_row(
 
 fn field_editor(ui: &mut egui::Ui, field: &mut Field, lang: Lang) {
     let is_language = (field.section, field.key) == ("ui", "language");
+    let is_multiline = (field.section, field.key) == ("embedder", "query_prefix");
     match &mut field.value {
         FieldValue::Bool(b) => {
             ui.checkbox(b, "");
@@ -1369,6 +1370,12 @@ fn field_editor(ui: &mut egui::Ui, field: &mut Field, lang: Lang) {
                         ui.selectable_value(s, code.to_string(), code);
                     }
                 });
+        }
+        FieldValue::Text(s) if is_multiline => {
+            ui.add_sized(
+                [TEXT_FIELD_WIDTH, FIELD_HEIGHT * 2.0],
+                egui::TextEdit::multiline(s).desired_rows(2),
+            );
         }
         FieldValue::Text(s) => {
             ui.add_sized(

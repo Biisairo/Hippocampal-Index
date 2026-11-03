@@ -23,6 +23,10 @@ pub enum ConfigError {
     NoHome,
 }
 
+/// Qwen3-Embedding이 권장하는 검색 질의 지시문. (FR-RET-11)
+pub const QWEN_QUERY_PREFIX: &str =
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:";
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmbedderConfig {
@@ -36,6 +40,8 @@ pub struct EmbedderConfig {
     /// 서버에 연결할 수 없으면 `ollama_command serve`를 띄운다. (FR-EMB-1)
     pub autostart: bool,
     pub ollama_command: String,
+    /// 벡터 검색 질의 앞에 붙여 임베딩하는 지시문. 저장 텍스트에는 붙이지 않는다. (FR-RET-11)
+    pub query_prefix: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -71,6 +77,8 @@ pub struct InjectSection {
     pub budget_ms: u64,
     /// hook이 데몬을 새로 띄운 요청의 예산. (FR-RET-5)
     pub cold_budget_ms: u64,
+    /// 공백을 뺀 길이가 이보다 짧은 프롬프트는 주입하지 않는다. (FR-RET-1)
+    pub min_prompt_chars: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -272,6 +280,7 @@ impl Default for EmbedderConfig {
             keep_alive: "30m".into(),
             autostart: true,
             ollama_command: "ollama".into(),
+            query_prefix: QWEN_QUERY_PREFIX.into(),
         }
     }
 }
@@ -303,11 +312,12 @@ impl Default for EmbedTextConfig {
 impl Default for InjectSection {
     fn default() -> Self {
         Self {
-            threshold: 0.40,
+            threshold: 0.50,
             top_k: 3,
             total_chars: 12_000,
             budget_ms: 800,
             cold_budget_ms: 2_500,
+            min_prompt_chars: 11,
         }
     }
 }
