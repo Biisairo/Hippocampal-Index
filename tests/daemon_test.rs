@@ -1937,6 +1937,7 @@ fn shutdown_is_rejected_during_reindex() {
     let resp = request(&e.paths.socket(), &Request::Shutdown, TIMEOUT).unwrap();
     assert!(matches!(resp, Response::Error { .. }), "{resp:?}");
     assert_eq!(status(&e.paths).reindex, "running");
+    wait_reindex(&e.paths);
     handle.shutdown();
 }
 
@@ -2129,6 +2130,7 @@ fn preview_is_allowed_during_reindex() {
     );
     let p = preview(&e.paths, &s2_cwd(), Path::new(&s2_cwd()));
     assert!(p.summary.contains("No change"), "{}", p.summary);
+    wait_reindex(&e.paths);
     handle.shutdown();
 }
 

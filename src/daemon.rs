@@ -1318,6 +1318,13 @@ fn start_reindex(shared: &Arc<Shared>, scope: &Scope, cwd: &str) -> Response {
         if let Ok(mut current) = shared.reindex_project.lock() {
             *current = None;
         }
+        // 플래그를 내리기 전에 다시 연다. 내린 뒤에 열면 그사이 지운 프로젝트의 디렉터리를 다시 만든다. (FR-DEL-6)
+        for id in &targets {
+            match shared.records(id) {
+                Ok(records) => shared.enqueue_pending(id, &records),
+                Err(e) => shared.log(&format!("project {id}: {e}")),
+            }
+        }
         if failures.is_empty() {
             shared.set_reindex_state(REINDEX_DONE);
             shared.log("reindex done");
@@ -1325,12 +1332,7 @@ fn start_reindex(shared: &Arc<Shared>, scope: &Scope, cwd: &str) -> Response {
             shared.set_reindex_state(&format!("failed: {}", failures.join("; ")));
         }
         shared.reindexing.store(false, Ordering::SeqCst);
-        for id in &targets {
-            match shared.records(id) {
-                Ok(records) => shared.enqueue_pending(id, &records),
-                Err(e) => shared.log(&format!("project {id}: {e}")),
-            }
-        }
+        let _ = shared.notify_tx.send(());
     });
     Response::Done
 }

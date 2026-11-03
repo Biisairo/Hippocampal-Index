@@ -7,9 +7,12 @@ use hippo::vector::{VectorError, VectorFilter, VectorStore};
 
 #[test]
 fn lancedb_satisfies_contract() {
+    let dirs = std::sync::Mutex::new(Vec::new());
     vector_store_contract(&|| {
-        let dir = tempfile::tempdir().unwrap().keep();
-        Box::new(LanceVectorStore::open(&dir).unwrap()) as Box<dyn VectorStore>
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceVectorStore::open(dir.path()).unwrap();
+        dirs.lock().unwrap().push(dir);
+        Box::new(store) as Box<dyn VectorStore>
     });
 }
 

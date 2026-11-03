@@ -343,6 +343,7 @@ impl Records {
         if self.delete_task.running {
             return;
         }
+        self.message = None;
         let req = target.request(cwd, true);
         let paths = paths.clone();
         self.preview_task
