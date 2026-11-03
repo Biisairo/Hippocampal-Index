@@ -283,7 +283,20 @@ fn install_user_scope_uses_home() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(dir.path().join(".claude/settings.json").exists());
+    let exe = dir.path().join("root/bin/hippo");
+    assert!(exe.exists(), "실행 파일을 데이터 루트로 복사 (FR-INS-8)");
+    let settings = fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
+    assert!(
+        settings.contains(&format!("{} hook stop", exe.display())),
+        "hook은 설치 경로: {settings}"
+    );
     let memory = dir.path().join(".claude/CLAUDE.md");
+    assert!(
+        fs::read_to_string(&memory)
+            .unwrap()
+            .contains(&format!("{} search", exe.display())),
+        "안내 블록도 설치 경로"
+    );
     assert!(
         fs::read_to_string(&memory)
             .unwrap()
@@ -325,6 +338,19 @@ fn install_user_scope_uses_home() {
     assert!(
         !project.join("CLAUDE.local.md").exists(),
         "블록만 있던 파일은 지움"
+    );
+    assert!(exe.exists(), "user 범위 설치가 남아 있으면 실행 파일 유지");
+    let out = Command::new(BIN)
+        .env("HOME", dir.path())
+        .arg("--root")
+        .arg(dir.path().join("root"))
+        .args(["uninstall", "--scope", "user"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        !dir.path().join("root/bin").exists(),
+        "마지막 제거에서 실행 파일 삭제 (FR-INS-9)"
     );
 }
 

@@ -163,21 +163,17 @@ cargo build --release
 
 ### 3.2 바이너리 위치
 
-`hippo install`은 **자신을 실행한 바이너리의 절대 경로**를 hook 명령에 넣고, 데몬도 같은 바이너리로 띄웁니다. 그래서 빌드한 자리에서 바로 설치해도 됩니다.
+`hippo install`은 자신을 데이터 루트의 **`~/.hippo/bin/hippo`로 복사**하고, hook 명령과 Claude 안내문에 이 경로를 씁니다. 데몬도 이 복사본으로 뜹니다. 그래서 빌드한 자리에서 바로 설치해도 되고, 그 뒤에 `cargo clean`을 하거나 저장소를 옮겨도 hook은 계속 동작합니다.
 
 ```bash
 ./target/release/hippo install --scope user --dry-run
 ```
 
-다만 hook이 그 경로에 묶입니다. `cargo clean`을 하거나 저장소를 옮기면, 다시 빌드하거나 `install`을 다시 실행할 때까지 hook이 동작하지 않습니다. 같은 자리에서 다시 빌드하는 것은 괜찮습니다. 고정된 위치를 원하면 아래 중 하나로 설치한 뒤 그 위치에서 `install`을 실행하십시오.
+- 다시 빌드한 뒤에는 `install`을 다시 실행해야 새 바이너리가 복사됩니다. 내용이 같으면 복사하지 않습니다.
+- 복사는 APFS 파일 복제를 쓰므로 디스크를 거의 더 쓰지 않습니다.
+- 어느 설정 파일에 설치했는지는 `~/.hippo/bin/installs`에 기록됩니다. `uninstall`로 마지막 설치까지 지우면 복사본도 지웁니다.
 
-```bash
-cargo install --path .            # → ~/.cargo/bin/hippo
-# 또는
-mkdir -p ~/.local/bin && cp target/release/hippo ~/.local/bin/hippo
-```
-
-아래 예시는 `~/.local/bin/hippo`를 씁니다. 실제 바이너리 경로로 바꿔서 쓰십시오.
+아래 예시에서 설치 전 명령은 `./target/release/hippo`, 설치 후 명령은 `~/.hippo/bin/hippo`를 씁니다.
 
 ### 3.3 Ollama와 임베딩 모델
 
@@ -197,14 +193,14 @@ Ollama는 기본으로 `127.0.0.1:11434`에서만 요청을 받습니다. `hippo
 방법 A: 터미널에서 실행합니다. 처음 시험해 볼 때 적합합니다.
 
 ```bash
-~/.local/bin/hippo daemon
+~/.hippo/bin/hippo daemon
 ```
 
 방법 B: launchd에 등록해 로그인할 때 자동으로 시작합니다.
 
 ```bash
 mkdir -p ~/.hippo/logs && chmod 700 ~/.hippo ~/.hippo/logs
-~/.local/bin/hippo launchd-plist > ~/Library/LaunchAgents/com.hippo.daemon.plist
+~/.hippo/bin/hippo launchd-plist > ~/Library/LaunchAgents/com.hippo.daemon.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hippo.daemon.plist
 ```
 
@@ -213,7 +209,7 @@ launchd는 데몬이 비정상 종료했을 때만 다시 띄우고, 유휴 종�
 데몬 상태 확인:
 
 ```bash
-~/.local/bin/hippo status
+~/.hippo/bin/hippo status
 ```
 
 ### 3.5 hook 등록
@@ -222,12 +218,12 @@ launchd는 데몬이 비정상 종료했을 때만 다시 띄우고, 유휴 종�
 
 ```bash
 # 특정 프로젝트만: <프로젝트>/.claude/settings.local.json (개인 파일, git에 올라가지 않음)
-~/.local/bin/hippo install --scope project --project ~/work/my-app --dry-run
-~/.local/bin/hippo install --scope project --project ~/work/my-app
+./target/release/hippo install --scope project --project ~/work/my-app --dry-run
+./target/release/hippo install --scope project --project ~/work/my-app
 
 # 모든 세션: ~/.claude/settings.json
-~/.local/bin/hippo install --scope user --dry-run
-~/.local/bin/hippo install --scope user
+./target/release/hippo install --scope user --dry-run
+./target/release/hippo install --scope user
 ```
 
 `install`이 하는 일:
@@ -247,7 +243,7 @@ hook을 등록한 뒤에는 Claude Code 세션을 새로 시작하십시오.
 ### 3.6 제거
 
 ```bash
-~/.local/bin/hippo uninstall --scope user          # 또는 --scope project --project <경로>
+~/.hippo/bin/hippo uninstall --scope user          # 또는 --scope project --project <경로>
 launchctl bootout gui/$(id -u)/com.hippo.daemon
 rm ~/Library/LaunchAgents/com.hippo.daemon.plist
 rm -rf ~/.hippo                          # 저장된 기억이 모두 지워집니다
@@ -429,6 +425,8 @@ pattern = 'HCI-\d{6}'
 ```
 ~/.hippo/            (0700)
 ├─ config.toml
+├─ bin/hippo                  (0700) 설치한 실행 파일. hook과 안내문이 이 경로를 씀
+├─ bin/installs               (0600) hook을 넣은 설정 파일 목록
 ├─ registry.sqlite            (0600) 목록 DB: 프로젝트, 위치, 루트 커밋, 세션 → 프로젝트
 ├─ projects/<id>/             (0700) 프로젝트 하나
 │  ├─ records.sqlite          (0600) 기준 데이터

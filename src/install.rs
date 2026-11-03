@@ -8,6 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value};
 use similar::TextDiff;
 
+use crate::fsutil::{ensure_private_dir, open_private_append};
+
 #[derive(Debug, thiserror::Error)]
 pub enum InstallError {
     #[error(transparent)]
@@ -469,4 +471,140 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
         .unwrap_or_default();
     name.push(format!(".{suffix}"));
     path.with_file_name(name)
+}
+
+const BIN_DIR: &str = "bin";
+const INSTALLS_FILE: &str = "installs";
+#[cfg(unix)]
+const EXE_MODE: u32 = 0o700;
+const COMPARE_BUFFER: usize = 1 << 20;
+
+/// 실행 파일 복사 결과. `copied`가 false면 이미 같은 파일이 있었다. (FR-INS-8)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryOutcome {
+    pub path: PathBuf,
+    pub copied: bool,
+}
+
+/// 설치 경로: 데이터 루트의 `bin/hippo`. (FR-INS-8)
+pub fn installed_exe(root: &Path) -> PathBuf {
+    root.join(BIN_DIR).join(EXE_NAME)
+}
+
+/// 실행 파일을 설치 경로로 원자적으로 복사한다. 같은 내용이거나 같은 파일이면 복사하지 않는다. (FR-INS-8)
+pub fn install_binary(
+    src: &Path,
+    root: &Path,
+    dry_run: bool,
+) -> Result<BinaryOutcome, InstallError> {
+    let target = installed_exe(root);
+    if fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(InstallError::Symlink(target));
+    }
+    let same_file = target.exists() && fs::canonicalize(src)? == fs::canonicalize(&target)?;
+    if same_file || same_content(src, &target)? {
+        return Ok(BinaryOutcome {
+            path: target,
+            copied: false,
+        });
+    }
+    if dry_run {
+        return Ok(BinaryOutcome {
+            path: target,
+            copied: true,
+        });
+    }
+    let dir = target
+        .parent()
+        .ok_or_else(|| InstallError::Shape("install path has no directory".into()))?;
+    ensure_private_dir(dir)?;
+    let tmp = dir.join(format!(".{EXE_NAME}.tmp-{}", std::process::id()));
+    if fs::symlink_metadata(&tmp).is_ok() {
+        fs::remove_file(&tmp)?;
+    }
+    fs::copy(src, &tmp)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(EXE_MODE))?;
+    }
+    fs::rename(&tmp, &target)?;
+    Ok(BinaryOutcome {
+        path: target,
+        copied: true,
+    })
+}
+
+fn same_content(a: &Path, b: &Path) -> Result<bool, InstallError> {
+    use std::io::Read;
+    let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::metadata(b)) else {
+        return Ok(false);
+    };
+    if ma.len() != mb.len() {
+        return Ok(false);
+    }
+    let (mut fa, mut fb) = (fs::File::open(a)?, fs::File::open(b)?);
+    let (mut ba, mut bb) = (vec![0u8; COMPARE_BUFFER], vec![0u8; COMPARE_BUFFER]);
+    loop {
+        let n = fa.read(&mut ba)?;
+        if n == 0 {
+            return Ok(true);
+        }
+        fb.read_exact(&mut bb[..n])?;
+        if ba[..n] != bb[..n] {
+            return Ok(false);
+        }
+    }
+}
+
+fn installs_file(root: &Path) -> PathBuf {
+    root.join(BIN_DIR).join(INSTALLS_FILE)
+}
+
+fn read_installs(root: &Path) -> Result<Vec<String>, InstallError> {
+    Ok(read_existing(&installs_file(root))?
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// hook을 넣은 설정 파일을 설치 목록에 기록한다. 이미 있으면 그대로 둔다. (FR-INS-9)
+pub fn record_install(root: &Path, settings: &Path) -> Result<(), InstallError> {
+    let line = settings.to_string_lossy().into_owned();
+    if read_installs(root)?.contains(&line) {
+        return Ok(());
+    }
+    ensure_private_dir(&root.join(BIN_DIR))?;
+    open_private_append(&installs_file(root))?.write_all(format!("{line}\n").as_bytes())?;
+    Ok(())
+}
+
+/// 설치 목록에서 지우고, 남은 설치가 없으면 실행 파일과 목록, 빈 `bin/`을 지운다.
+/// 실행 파일을 지웠으면 true. (FR-INS-9)
+pub fn forget_install(root: &Path, settings: &Path, dry_run: bool) -> Result<bool, InstallError> {
+    let line = settings.to_string_lossy().into_owned();
+    let installs = read_installs(root)?;
+    if !installs.contains(&line) {
+        return Ok(false);
+    }
+    let rest: Vec<&String> = installs.iter().filter(|l| **l != line).collect();
+    if dry_run {
+        return Ok(rest.is_empty());
+    }
+    if !rest.is_empty() {
+        let text: String = rest.iter().map(|l| format!("{l}\n")).collect();
+        let mut tmp = tempfile::NamedTempFile::new_in(root.join(BIN_DIR))?;
+        tmp.write_all(text.as_bytes())?;
+        tmp.persist(installs_file(root)).map_err(|e| e.error)?;
+        return Ok(false);
+    }
+    let exe = installed_exe(root);
+    if fs::symlink_metadata(&exe).is_ok() {
+        fs::remove_file(&exe)?;
+    }
+    fs::remove_file(installs_file(root))?;
+    let _ = fs::remove_dir(root.join(BIN_DIR));
+    Ok(true)
 }

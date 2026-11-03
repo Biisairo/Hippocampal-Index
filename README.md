@@ -163,21 +163,17 @@ cargo build --release
 
 ### 3.2 Where the binary lives
 
-`hippo install` writes the **absolute path of the binary that runs it** into the hook commands, and the daemon is started from the same binary. So you can install straight from the build directory:
+`hippo install` **copies itself to `~/.hippo/bin/hippo`** in the data root and uses that path in the hook commands and the Claude guide. The daemon also starts from this copy. So you can install straight from the build directory, and the hooks keep working after `cargo clean` or after you move the repository.
 
 ```bash
 ./target/release/hippo install --scope user --dry-run
 ```
 
-Keep in mind that the hooks then depend on that path. `cargo clean` or moving the repository breaks them until you rebuild or run `install` again. Rebuilding in place is fine. If you want a stable location, use one of these and run `install` from there:
+- After you rebuild, run `install` again to copy the new binary. If the content is the same, nothing is copied.
+- The copy uses APFS file cloning, so it takes almost no extra disk space.
+- `~/.hippo/bin/installs` records which settings files you installed into. When `uninstall` removes the last one, the copy is removed too.
 
-```bash
-cargo install --path .            # → ~/.cargo/bin/hippo
-# or
-mkdir -p ~/.local/bin && cp target/release/hippo ~/.local/bin/hippo
-```
-
-The examples below use `~/.local/bin/hippo`. Replace it with your binary path.
+In the examples below, commands before installing use `./target/release/hippo`, and commands after installing use `~/.hippo/bin/hippo`.
 
 ### 3.3 Ollama and the embedding model
 
@@ -197,14 +193,14 @@ You can skip this step. Hooks and CLI commands start the daemon automatically wh
 Option A: run it in a terminal (good for a first test).
 
 ```bash
-~/.local/bin/hippo daemon
+~/.hippo/bin/hippo daemon
 ```
 
 Option B: register it with launchd so it starts at login.
 
 ```bash
 mkdir -p ~/.hippo/logs && chmod 700 ~/.hippo ~/.hippo/logs
-~/.local/bin/hippo launchd-plist > ~/Library/LaunchAgents/com.hippo.daemon.plist
+~/.hippo/bin/hippo launchd-plist > ~/Library/LaunchAgents/com.hippo.daemon.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hippo.daemon.plist
 ```
 
@@ -213,7 +209,7 @@ launchd restarts the daemon only after a crash, not after an idle exit. To stop 
 Check the daemon:
 
 ```bash
-~/.local/bin/hippo status
+~/.hippo/bin/hippo status
 ```
 
 ### 3.5 Register the hooks
@@ -222,12 +218,12 @@ Check the daemon:
 
 ```bash
 # One project only: <project>/.claude/settings.local.json (personal file, not committed)
-~/.local/bin/hippo install --scope project --project ~/work/my-app --dry-run
-~/.local/bin/hippo install --scope project --project ~/work/my-app
+./target/release/hippo install --scope project --project ~/work/my-app --dry-run
+./target/release/hippo install --scope project --project ~/work/my-app
 
 # All sessions: ~/.claude/settings.json
-~/.local/bin/hippo install --scope user --dry-run
-~/.local/bin/hippo install --scope user
+./target/release/hippo install --scope user --dry-run
+./target/release/hippo install --scope user
 ```
 
 What `install` does:
@@ -247,7 +243,7 @@ Start a new Claude Code session after you install the hooks.
 ### 3.6 Uninstall
 
 ```bash
-~/.local/bin/hippo uninstall --scope user          # or --scope project --project <path>
+~/.hippo/bin/hippo uninstall --scope user          # or --scope project --project <path>
 launchctl bootout gui/$(id -u)/com.hippo.daemon
 rm ~/Library/LaunchAgents/com.hippo.daemon.plist
 rm -rf ~/.hippo                          # deletes all stored memory
@@ -429,6 +425,8 @@ To add a completely new backend, see [9.4](#94-adding-a-new-backend).
 ```
 ~/.hippo/            (0700)
 ├─ config.toml
+├─ bin/hippo                  (0700) installed binary; hooks and the guide use this path
+├─ bin/installs               (0600) settings files the hooks were installed into
 ├─ registry.sqlite            (0600) registry: projects, locations, root commits, session → project
 ├─ projects/<id>/             (0700) one project
 │  ├─ records.sqlite          (0600) source of truth

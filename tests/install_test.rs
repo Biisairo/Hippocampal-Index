@@ -493,3 +493,99 @@ fn uninstall_deletes_settings_left_empty_and_empty_directory() {
     let left: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(left, json!({"model": "opus"}));
 }
+
+// ---- FR-INS-8, 9: 실행 파일 복사와 설치 목록 ----
+
+use hippo::install::{forget_install, install_binary, installed_exe, record_install};
+use std::os::unix::fs::PermissionsExt;
+
+fn mode(p: &Path) -> u32 {
+    fs::metadata(p).unwrap().permissions().mode() & 0o777
+}
+
+#[test]
+fn binary_is_copied_to_data_root_once_per_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("build/hippo");
+    fs::create_dir_all(src.parent().unwrap()).unwrap();
+    fs::write(&src, b"binary v1").unwrap();
+    let root = dir.path().join("root");
+    let target = installed_exe(&root);
+    assert_eq!(target, root.join("bin/hippo"));
+
+    let dry = install_binary(&src, &root, true).unwrap();
+    assert!(
+        dry.copied && dry.path == target && !target.exists(),
+        "dry-run은 복사하지 않음"
+    );
+
+    let first = install_binary(&src, &root, false).unwrap();
+    assert!(first.copied);
+    assert_eq!(fs::read(&target).unwrap(), b"binary v1");
+    assert_eq!(
+        (mode(&target), mode(target.parent().unwrap())),
+        (0o700, 0o700)
+    );
+    assert!(
+        !install_binary(&src, &root, false).unwrap().copied,
+        "같은 내용이면 생략"
+    );
+
+    fs::write(&src, b"binary v2").unwrap();
+    assert!(install_binary(&src, &root, false).unwrap().copied);
+    assert_eq!(fs::read(&target).unwrap(), b"binary v2");
+    assert!(
+        !install_binary(&target, &root, false).unwrap().copied,
+        "설치된 복사본으로 실행하면 생략"
+    );
+}
+
+#[test]
+fn symlinked_install_path_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("hippo-src");
+    fs::write(&src, b"bin").unwrap();
+    let root = dir.path().join("root");
+    fs::create_dir_all(root.join("bin")).unwrap();
+    let elsewhere = dir.path().join("elsewhere");
+    fs::write(&elsewhere, b"keep").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, root.join("bin/hippo")).unwrap();
+    assert!(matches!(
+        install_binary(&src, &root, false),
+        Err(InstallError::Symlink(_))
+    ));
+    assert_eq!(fs::read(&elsewhere).unwrap(), b"keep");
+}
+
+#[test]
+fn binary_is_removed_only_after_last_install_is_forgotten() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("hippo-src");
+    fs::write(&src, b"bin").unwrap();
+    let root = dir.path().join("root");
+    install_binary(&src, &root, false).unwrap();
+    let user = dir.path().join("home/.claude/settings.json");
+    let project = dir.path().join("p/.claude/settings.local.json");
+    record_install(&root, &user).unwrap();
+    record_install(&root, &user).unwrap();
+    record_install(&root, &project).unwrap();
+    let listed = fs::read_to_string(root.join("bin/installs")).unwrap();
+    assert_eq!(listed.lines().count(), 2, "중복 없이 기록: {listed}");
+    assert_eq!(mode(&root.join("bin/installs")), 0o600);
+
+    assert!(
+        !forget_install(&root, &project, true).unwrap(),
+        "dry-run은 그대로"
+    );
+    assert!(!forget_install(&root, &project, false).unwrap());
+    assert!(installed_exe(&root).exists(), "다른 범위 설치가 남아 있음");
+    assert!(forget_install(&root, &user, false).unwrap());
+    assert!(
+        !root.join("bin").exists(),
+        "마지막 제거에서 실행 파일과 bin/ 삭제"
+    );
+    assert!(
+        !forget_install(&root, &user, false).unwrap(),
+        "이미 없으면 변경 없음"
+    );
+}

@@ -1,5 +1,6 @@
+use std::fs;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -13,8 +14,8 @@ use hippo::daemon;
 use hippo::i18n::Lang;
 use hippo::ingest::ImportOutcome;
 use hippo::install::{
-    Action, Outcome, Scope, apply, apply_memory, guide_block, memory_file, target_file,
-    warn_untracked,
+    Action, Outcome, Scope, apply, apply_memory, forget_install, guide_block, install_binary,
+    installed_exe, memory_file, record_install, target_file, warn_untracked,
 };
 use hippo::protocol::{
     ImportSessionReport, Request, Response, Scope as QueryScope, embed_progress,
@@ -214,7 +215,10 @@ fn main() -> ExitCode {
             Err(e) => fail(&e),
         },
         Command::Daemon => run_daemon(paths),
-        Command::HooksConfig => match hook_settings(&paths) {
+        Command::HooksConfig => match std::env::current_exe()
+            .map_err(|e| e.to_string())
+            .and_then(|exe| hook_settings(&paths, &exe))
+        {
             Ok(hooks) => {
                 println!(
                     "{}",
@@ -224,11 +228,8 @@ fn main() -> ExitCode {
             }
             Err(e) => fail(&e),
         },
-        Command::Install(args) => match hook_settings(&paths) {
-            Ok(hooks) => run_install(&args, Action::Install(hooks), ui_lang(&paths)),
-            Err(e) => fail(&e),
-        },
-        Command::Uninstall(args) => run_install(&args, Action::Uninstall, ui_lang(&paths)),
+        Command::Install(args) => run_install(&paths, &args, true, ui_lang(&paths)),
+        Command::Uninstall(args) => run_install(&paths, &args, false, ui_lang(&paths)),
         Command::LaunchdPlist => match std::env::current_exe() {
             Ok(exe) => {
                 print!("{}", launchd_plist(&exe, &paths));
@@ -259,31 +260,74 @@ fn scope_arg(cwd: &str, scope: &str) -> QueryScope {
 }
 
 /// 실행 중인 hippo 경로로 hook 설정을 만든다. UserPromptSubmit timeout은 시간 예산보다 여유를 둔다.
-fn hook_settings(paths: &Paths) -> Result<serde_json::Value, String> {
+fn hook_settings(paths: &Paths, exe: &Path) -> Result<serde_json::Value, String> {
     let budget_ms = Config::load(&paths.config())
         .map_err(|e| e.to_string())?
         .inject
         .budget_ms;
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let timeout = budget_ms.div_ceil(1_000) + INJECT_TIMEOUT_MARGIN_SECS;
-    Ok(hooks_config(&exe, timeout))
+    Ok(hooks_config(exe, timeout))
 }
 
 /// hook 설정과 메모리 파일의 안내 블록을 함께 바꾼다. (IF-CLI-6, FR-INS-7)
-fn run_install(args: &InstallArgs, action: Action, lang: Lang) -> ExitCode {
+fn run_install(paths: &Paths, args: &InstallArgs, install: bool, lang: Lang) -> ExitCode {
     let scope = match args.scope {
         ScopeArg::User => Scope::User,
-        ScopeArg::Project => match args.project.clone().map_or_else(std::env::current_dir, Ok) {
+        ScopeArg::Project => match args
+            .project
+            .clone()
+            .map_or_else(std::env::current_dir, Ok)
+            .and_then(|dir| fs::canonicalize(&dir).or_else(|_| std::path::absolute(&dir)))
+        {
             Ok(dir) => Scope::Project(dir),
             Err(e) => return fail(&e.to_string()),
         },
     };
-    let install = matches!(action, Action::Install(_));
-    let block = match install.then(std::env::current_exe).transpose() {
-        Ok(exe) => exe.map(|exe| guide_block(&exe)),
+    let root = match std::path::absolute(&paths.root) {
+        Ok(root) => root,
         Err(e) => return fail(&e.to_string()),
     };
-    let settings = target_file(&scope).and_then(|path| apply(&path, &action, args.dry_run));
+    let settings_path = match target_file(&scope) {
+        Ok(path) => path,
+        Err(e) => return fail(&e.to_string()),
+    };
+    let (action, block) = if install {
+        let binary = match std::env::current_exe()
+            .map_err(|e| e.to_string())
+            .and_then(|exe| install_binary(&exe, &root, args.dry_run).map_err(|e| e.to_string()))
+        {
+            Ok(b) => b,
+            Err(e) => return fail(&e),
+        };
+        let path = binary.path.display();
+        println!(
+            "{}",
+            match (binary.copied, args.dry_run) {
+                (true, false) => tr!(
+                    lang,
+                    "Installed binary: {path}",
+                    "실행 파일을 설치했습니다: {path}"
+                ),
+                (true, true) => tr!(
+                    lang,
+                    "(dry-run) Would install binary: {path}",
+                    "(dry-run) 실행 파일을 설치할 위치: {path}"
+                ),
+                (false, _) => tr!(
+                    lang,
+                    "Binary up to date: {path}",
+                    "실행 파일이 최신입니다: {path}"
+                ),
+            }
+        );
+        match hook_settings(paths, &binary.path) {
+            Ok(hooks) => (Action::Install(hooks), Some(guide_block(&binary.path))),
+            Err(e) => return fail(&e),
+        }
+    } else {
+        (Action::Uninstall, None)
+    };
+    let settings = apply(&settings_path, &action, args.dry_run);
     let memory = settings.and_then(|settings| {
         memory_file(&scope)
             .and_then(|path| apply_memory(&path, block.as_deref(), args.dry_run))
@@ -295,6 +339,37 @@ fn run_install(args: &InstallArgs, action: Action, lang: Lang) -> ExitCode {
     };
     print_outcome(&settings, args.dry_run, lang);
     print_outcome(&memory, args.dry_run, lang);
+    let recorded = if install {
+        if args.dry_run {
+            Ok(false)
+        } else {
+            record_install(&root, &settings_path).map(|()| false)
+        }
+    } else {
+        forget_install(&root, &settings_path, args.dry_run)
+    };
+    match recorded {
+        Ok(true) => {
+            let path = installed_exe(&root);
+            let path = path.display();
+            let line = if args.dry_run {
+                tr!(
+                    lang,
+                    "(dry-run) Would remove binary: {path}",
+                    "(dry-run) 지울 실행 파일: {path}"
+                )
+            } else {
+                tr!(
+                    lang,
+                    "Removed binary: {path}",
+                    "실행 파일을 지웠습니다: {path}"
+                )
+            };
+            println!("{line}");
+        }
+        Ok(false) => {}
+        Err(e) => return fail(&e.to_string()),
+    }
     if let Scope::Project(dir) = &scope
         && install
         && warn_untracked(dir)
