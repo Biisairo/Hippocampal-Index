@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use arrow_array::{
@@ -13,6 +14,7 @@ use futures::TryStreamExt;
 use lancedb::index::Index;
 use lancedb::index::vector::IvfPqIndexBuilder;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
+use lancedb::table::{CompactionOptions, Duration, OptimizeAction};
 use lancedb::{Connection, DistanceType, Table};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
@@ -40,6 +42,8 @@ pub struct LanceVectorStore {
     table: Mutex<Option<Table>>,
     info: Mutex<StoreInfo>,
     meta_path: PathBuf,
+    /// 마지막 정리 뒤의 수정 연산 수. (FR-STO-12)
+    pending: AtomicU64,
 }
 
 fn backend<E: std::fmt::Display>(e: E) -> VectorError {
@@ -89,6 +93,7 @@ impl LanceVectorStore {
             table: Mutex::new(table),
             info: Mutex::new(info),
             meta_path,
+            pending: AtomicU64::new(0),
         })
     }
 
@@ -98,6 +103,58 @@ impl LanceVectorStore {
 
     fn info_guard(&self) -> Result<MutexGuard<'_, StoreInfo>, VectorError> {
         self.info.lock().map_err(backend)
+    }
+
+    fn changed(&self) {
+        self.pending.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// 차원을 검사하고, 테이블과 meta가 없으면 만든다. 비어 있지 않은 `records`의 배치와 테이블 잠금을 돌려준다.
+    fn prepare(
+        &self,
+        records: &[VectorRecord],
+    ) -> Result<(MutexGuard<'_, Option<Table>>, RecordBatch, SchemaRef), VectorError> {
+        let Some(first) = records.first() else {
+            return Err(VectorError::Backend("no records".into()));
+        };
+        let mut info = self.info_guard()?;
+        let dimension = info.dimension.unwrap_or(first.vector.len());
+        if let Some(bad) = records.iter().find(|r| r.vector.len() != dimension) {
+            return Err(VectorError::DimensionMismatch {
+                expected: dimension,
+                actual: bad.vector.len(),
+            });
+        }
+        let schema = schema(dimension);
+        let mut table = self.table()?;
+        if table.is_none() {
+            let created = self
+                .runtime
+                .block_on(
+                    self.conn
+                        .create_empty_table(TABLE, schema.clone())
+                        .execute(),
+                )
+                .map_err(backend)?;
+            *table = Some(created);
+        }
+        if info.dimension.is_none() {
+            let meta = Meta {
+                embed_model: first.embed_model.clone(),
+                dimension,
+            };
+            fs::write(
+                &self.meta_path,
+                serde_json::to_string(&meta).map_err(backend)?,
+            )
+            .map_err(backend)?;
+            *info = StoreInfo {
+                embed_model: Some(meta.embed_model),
+                dimension: Some(dimension),
+            };
+        }
+        let batch = to_batch(records, schema.clone(), dimension)?;
+        Ok((table, batch, schema))
     }
 }
 
@@ -169,6 +226,28 @@ fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+/// `refs`의 모든 청크를 고르는 조건. 비어 있으면 `None`.
+fn refs_predicate(refs: &[(RecordKind, String)]) -> Option<String> {
+    let parts: Vec<String> = [RecordKind::Iteration, RecordKind::Result]
+        .into_iter()
+        .filter_map(|kind| {
+            let ids: Vec<String> = refs
+                .iter()
+                .filter(|(k, _)| *k == kind)
+                .map(|(_, id)| quote(id))
+                .collect();
+            (!ids.is_empty()).then(|| {
+                format!(
+                    "(kind = {} AND ref_id IN ({}))",
+                    quote(kind.as_str()),
+                    ids.join(", ")
+                )
+            })
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" OR "))
+}
+
 fn filter_expr(filter: &VectorFilter) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(kind) = filter.kind {
@@ -205,49 +284,13 @@ impl VectorStore for LanceVectorStore {
     }
 
     fn upsert(&self, records: &[VectorRecord]) -> Result<(), VectorError> {
-        let Some(first) = records.first() else {
+        if records.is_empty() {
             return Ok(());
-        };
-        let mut info = self.info_guard()?;
-        let dimension = info.dimension.unwrap_or(first.vector.len());
-        if let Some(bad) = records.iter().find(|r| r.vector.len() != dimension) {
-            return Err(VectorError::DimensionMismatch {
-                expected: dimension,
-                actual: bad.vector.len(),
-            });
         }
-        let schema = schema(dimension);
-        let mut table = self.table()?;
-        if table.is_none() {
-            let created = self
-                .runtime
-                .block_on(
-                    self.conn
-                        .create_empty_table(TABLE, schema.clone())
-                        .execute(),
-                )
-                .map_err(backend)?;
-            *table = Some(created);
-        }
-        if info.dimension.is_none() {
-            let meta = Meta {
-                embed_model: first.embed_model.clone(),
-                dimension,
-            };
-            fs::write(
-                &self.meta_path,
-                serde_json::to_string(&meta).map_err(backend)?,
-            )
-            .map_err(backend)?;
-            *info = StoreInfo {
-                embed_model: Some(meta.embed_model),
-                dimension: Some(dimension),
-            };
-        }
+        let (table, batch, schema) = self.prepare(records)?;
         let Some(table) = table.as_ref() else {
             return Err(VectorError::Backend("table not created".into()));
         };
-        let batch = to_batch(records, schema.clone(), dimension)?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
         let mut merge = table.merge_insert(&["id"]);
         merge
@@ -256,6 +299,39 @@ impl VectorStore for LanceVectorStore {
         self.runtime
             .block_on(merge.execute(Box::new(reader)))
             .map_err(backend)?;
+        self.changed();
+        Ok(())
+    }
+
+    fn replace(
+        &self,
+        refs: &[(RecordKind, String)],
+        records: &[VectorRecord],
+    ) -> Result<(), VectorError> {
+        if refs.is_empty() && records.is_empty() {
+            return Ok(());
+        }
+        let (table, batch) = if records.is_empty() {
+            (self.table()?, None)
+        } else {
+            let (table, batch, _) = self.prepare(records)?;
+            (table, Some(batch))
+        };
+        let Some(table) = table.as_ref() else {
+            return Ok(());
+        };
+        if let Some(predicate) = refs_predicate(refs) {
+            self.runtime
+                .block_on(table.delete(predicate.as_str()))
+                .map_err(backend)?;
+            self.changed();
+        }
+        if let Some(batch) = batch {
+            self.runtime
+                .block_on(table.add(batch).execute())
+                .map_err(backend)?;
+            self.changed();
+        }
         Ok(())
     }
 
@@ -272,6 +348,7 @@ impl VectorStore for LanceVectorStore {
         self.runtime
             .block_on(table.delete(predicate.as_str()))
             .map_err(backend)?;
+        self.changed();
         Ok(())
     }
 
@@ -403,6 +480,34 @@ impl VectorStore for LanceVectorStore {
         self.runtime
             .block_on(table.create_index(&["vector"], index).execute())
             .map_err(backend)
+    }
+
+    fn optimize(&self) -> Result<(), VectorError> {
+        if self.pending.load(Ordering::SeqCst) == 0 {
+            return Ok(());
+        }
+        let table = self.table()?;
+        if let Some(table) = table.as_ref() {
+            self.runtime
+                .block_on(table.optimize(OptimizeAction::Compact {
+                    options: CompactionOptions::default(),
+                    remap_options: None,
+                }))
+                .map_err(backend)?;
+            self.runtime
+                .block_on(table.optimize(OptimizeAction::Prune {
+                    older_than: Some(Duration::zero()),
+                    delete_unverified: Some(false),
+                    error_if_tagged_old_versions: None,
+                }))
+                .map_err(backend)?;
+        }
+        self.pending.store(0, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn pending_changes(&self) -> u64 {
+        self.pending.load(Ordering::SeqCst)
     }
 }
 

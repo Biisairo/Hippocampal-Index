@@ -114,6 +114,34 @@ impl VectorStore for MemoryVectorStore {
         Ok(())
     }
 
+    fn replace(
+        &self,
+        refs: &[(RecordKind, String)],
+        records: &[VectorRecord],
+    ) -> Result<(), VectorError> {
+        if let Some(first) = records.first() {
+            let expected = self.lock()?.info.dimension.unwrap_or(first.vector.len());
+            if let Some(bad) = records.iter().find(|r| r.vector.len() != expected) {
+                return Err(VectorError::DimensionMismatch {
+                    expected,
+                    actual: bad.vector.len(),
+                });
+            }
+        }
+        for (kind, ref_id) in refs {
+            self.delete(*kind, ref_id)?;
+        }
+        self.upsert(records)
+    }
+
+    fn optimize(&self) -> Result<(), VectorError> {
+        Ok(())
+    }
+
+    fn pending_changes(&self) -> u64 {
+        0
+    }
+
     fn delete(&self, kind: RecordKind, ref_id: &str) -> Result<(), VectorError> {
         self.lock()?
             .records

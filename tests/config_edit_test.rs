@@ -39,6 +39,7 @@ min_prompt_chars = 3
 [index]
 vector_index_threshold = 5
 job_batch = 6
+optimize_every = 7
 [daemon]
 autostart = false
 idle_timeout_secs = 0
@@ -83,10 +84,10 @@ fn fields_read_every_key_and_save_round_trips() {
     let all = Config::parse(ALL_KEYS).unwrap();
     let defaults = fields(&Config::default());
     let set = fields(&all);
-    assert_eq!(set.len(), 31);
+    assert_eq!(set.len(), 32);
     assert_eq!(
         changed(&defaults, &set).len(),
-        31,
+        32,
         "모든 키가 설정값을 읽음"
     );
     let d = dir();

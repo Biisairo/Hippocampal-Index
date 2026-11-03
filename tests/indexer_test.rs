@@ -1,14 +1,18 @@
 mod common;
 
+use common::probe::{Probe, lance_versions};
+
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use hippo::embed_text::build_embed_text;
 use hippo::embedder::{EmbedError, Embedder, InjectGate, YieldingEmbedder};
 use hippo::indexer::{
-    ChunkConfig, Compatibility, compatibility, process_embed_jobs, process_jobs_until, reindex,
+    ChunkConfig, Compatibility, compatibility, optimize_if_due, process_embed_jobs,
+    process_jobs_until, reindex,
 };
+use hippo::lance::LanceVectorStore;
 use hippo::store::{Batch, NewIteration, RecordKind, RecordStore};
 use hippo::testing::{HashEmbedder, MemoryVectorStore};
 use hippo::transcript::{ExtractorState, Iteration, IterationInput, ToolCall, ToolResultData};
@@ -240,7 +244,7 @@ fn reindex_rebuilds_everything_into_new_store() {
     let new_embedder = HashEmbedder::new(16, 8_000);
     let target = MemoryVectorStore::default();
     assert_eq!(
-        reindex(&store, &new_embedder, &target, CHUNKING, 2).unwrap(),
+        reindex(&store, &new_embedder, &target, CHUNKING, 2, 20).unwrap(),
         4,
         "반복 3 + 중복 제거된 결과 1"
     );
@@ -441,4 +445,149 @@ fn inject_gate_counts_nested_entries() {
     assert!(gate.is_busy());
     drop(b);
     assert!(!gate.is_busy());
+}
+
+// ---- FR-STO-7, FR-STO-12: 묶음 저장과 정리 ----
+
+fn many(n: usize) -> RecordStore {
+    store_with(
+        (0..n)
+            .map(|i| iteration(&format!("m{i}"), &format!("응답 {i} 내용"), None))
+            .collect(),
+    )
+}
+
+#[test]
+fn batch_is_saved_with_one_replace() {
+    let mut store = many(5);
+    let v = Probe::new(Box::new(MemoryVectorStore::default()));
+    let jobs = store.embed_jobs(10).unwrap();
+    let done = process_jobs_until(
+        &mut store,
+        &HashEmbedder::new(8, 8_000),
+        &v,
+        CHUNKING,
+        &jobs,
+        &|| false,
+    )
+    .unwrap();
+    assert_eq!(done, 5);
+    assert_eq!(v.replaces.load(Ordering::SeqCst), 1);
+    assert_eq!(v.other_writes.load(Ordering::SeqCst), 0);
+    assert_eq!(v.count().unwrap(), 5);
+}
+
+#[test]
+fn stopped_batch_saves_only_finished_jobs() {
+    let mut store = many(3);
+    let v = Probe::new(Box::new(MemoryVectorStore::default()));
+    let jobs = store.embed_jobs(10).unwrap();
+    let done = process_jobs_until(
+        &mut store,
+        &HashEmbedder::new(8, 8_000),
+        &v,
+        CHUNKING,
+        &jobs,
+        &|| true,
+    )
+    .unwrap();
+    assert_eq!(done, 1);
+    assert_eq!(v.replaces.load(Ordering::SeqCst), 1);
+    assert_eq!(v.count().unwrap(), 1);
+    assert_eq!(store.counts().unwrap().embed_jobs, 2);
+}
+
+/// 두 번째 청크 요청부터 실패하는 임베더.
+struct FailAfter {
+    inner: HashEmbedder,
+    left: AtomicUsize,
+}
+
+impl Embedder for FailAfter {
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+    fn dimension(&self) -> usize {
+        self.inner.dimension()
+    }
+    fn max_input_tokens(&self) -> usize {
+        self.inner.max_input_tokens()
+    }
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if self.left.load(Ordering::SeqCst) == 0 {
+            return Err(EmbedError::Unavailable("down".into()));
+        }
+        self.left.fetch_sub(1, Ordering::SeqCst);
+        self.inner.embed(texts)
+    }
+}
+
+#[test]
+fn failure_mid_batch_saves_and_completes_earlier_jobs() {
+    let mut store = many(3);
+    let v = MemoryVectorStore::default();
+    let e = FailAfter {
+        inner: HashEmbedder::new(8, 8_000),
+        left: AtomicUsize::new(1),
+    };
+    assert!(process_embed_jobs(&mut store, &e, &v, CHUNKING, 10).is_err());
+    assert_eq!(v.count().unwrap(), 1, "첫 작업의 벡터는 저장");
+    assert_eq!(store.counts().unwrap().embed_jobs, 2, "첫 작업만 완료");
+}
+
+#[test]
+fn optimize_if_due_follows_the_threshold() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = LanceVectorStore::open(dir.path()).unwrap();
+    s.upsert(&[VectorRecord {
+        kind: RecordKind::Iteration,
+        ref_id: "a".into(),
+        chunk_index: 0,
+        vector: vec![1.0, 0.0],
+        embed_model: "m".into(),
+        cwd: None,
+        session_id: None,
+        ts: String::new(),
+    }])
+    .unwrap();
+    s.delete(RecordKind::Iteration, "zzz").unwrap();
+    assert!(!optimize_if_due(&s, 3).unwrap(), "2 < 3");
+    assert!(!optimize_if_due(&s, 0).unwrap(), "0이면 하지 않음");
+    assert_eq!(s.pending_changes(), 2);
+    assert!(optimize_if_due(&s, 2).unwrap());
+    assert_eq!(s.pending_changes(), 0);
+    assert_eq!(lance_versions(dir.path()), 1);
+}
+
+#[test]
+fn reindex_replaces_per_page_and_stays_bounded() {
+    let store = many(12);
+    let dir = tempfile::tempdir().unwrap();
+    let target = Probe::new(Box::new(LanceVectorStore::open(dir.path()).unwrap()));
+    assert_eq!(
+        reindex(
+            &store,
+            &HashEmbedder::new(8, 8_000),
+            &target,
+            CHUNKING,
+            2,
+            3
+        )
+        .unwrap(),
+        12
+    );
+    assert_eq!(
+        target.replaces.load(Ordering::SeqCst),
+        6,
+        "페이지 2개씩 6번"
+    );
+    assert_eq!(target.other_writes.load(Ordering::SeqCst), 0);
+    assert!(
+        target.max_pending.load(Ordering::SeqCst) <= 3 + 1,
+        "max pending {}",
+        target.max_pending.load(Ordering::SeqCst)
+    );
+    assert_eq!(target.pending_changes(), 0, "끝나면 한 번 더 정리");
+    assert_eq!(lance_versions(dir.path()), 1);
+    assert_eq!(target.count().unwrap(), 12);
 }

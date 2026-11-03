@@ -57,6 +57,12 @@ pub struct StoreInfo {
 pub trait VectorStore: Send + Sync {
     fn info(&self) -> Result<StoreInfo, VectorError>;
     fn upsert(&self, records: &[VectorRecord]) -> Result<(), VectorError>;
+    /// `refs`의 모든 청크 벡터를 지운 뒤 `records`를 저장한다. 차원이 맞지 않으면 아무것도 바꾸지 않는다. (FR-STO-7)
+    fn replace(
+        &self,
+        refs: &[(RecordKind, String)],
+        records: &[VectorRecord],
+    ) -> Result<(), VectorError>;
     /// `ref_id`의 모든 청크 벡터를 지운다.
     fn delete(&self, kind: RecordKind, ref_id: &str) -> Result<(), VectorError>;
     fn search(
@@ -67,6 +73,10 @@ pub trait VectorStore: Send + Sync {
     ) -> Result<Vec<VectorHit>, VectorError>;
     fn count(&self) -> Result<u64, VectorError>;
     fn ensure_index(&self) -> Result<(), VectorError>;
+    /// 작은 파일을 합치고 최신 버전만 남긴다. 마지막 정리 뒤 수정이 없으면 아무것도 하지 않는다. (FR-STO-12)
+    fn optimize(&self) -> Result<(), VectorError>;
+    /// 마지막 정리 뒤의 수정 연산 수. (FR-STO-12)
+    fn pending_changes(&self) -> u64;
     /// 모든 벡터 레코드를 읽는다. 프로젝트 병합에 쓴다. (FR-PRJ-9)
     fn scan(&self) -> Result<Vec<VectorRecord>, VectorError>;
 }

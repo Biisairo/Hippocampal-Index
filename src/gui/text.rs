@@ -84,6 +84,10 @@ pub fn describe(section: &str, key: &str, lang: Lang) -> &'static str {
             "Embedding jobs per batch",
             "한 번에 처리하는 임베딩 작업 수",
         ),
+        ("index", "optimize_every") => (
+            "Compact the vector store and drop old versions after this many changes (0 = only when the queue is empty)",
+            "벡터 저장소를 이만큼 수정하면 파일을 합치고 이전 버전을 지움(0이면 큐가 빌 때만)",
+        ),
         ("daemon", "autostart") => (
             "Hooks, CLI and GUI start the daemon when it is not running",
             "데몬이 없으면 hook, CLI, GUI가 띄움",

@@ -2130,3 +2130,93 @@ fn preview_is_allowed_during_reindex() {
     assert!(p.summary.contains("No change"), "{}", p.summary);
     handle.shutdown();
 }
+
+// ---- FR-STO-12: 임베딩 중 버전 상한과 큐가 빌 때 정리 ----
+
+/// LanceDB 저장소를 Probe로 감싸 연다. 연 저장소와 디렉터리를 `opened`에 모은다.
+type Opened = Arc<Mutex<Vec<(PathBuf, Arc<probe::Probe>)>>>;
+
+fn probed_lance_source(opened: Opened) -> VectorSource {
+    VectorSource {
+        name: "default".into(),
+        open: Arc::new(move |dir: &Path| {
+            let inner = hippo::lance::LanceVectorStore::open(dir)?;
+            let p = Arc::new(probe::Probe::new(Box::new(inner)));
+            opened.lock().unwrap().push((dir.to_path_buf(), p.clone()));
+            Ok(p as Arc<dyn VectorStore>)
+        }),
+    }
+}
+
+fn lance_config(optimize_every: u64) -> Config {
+    Config::parse(&format!(
+        "[embedder]\nbackend = \"hash\"\ndimension = 256\nquery_prefix = \"\"\n[vector]\nbackend = \"lancedb\"\n[chunking]\nmax_tokens = 8000\n[index]\njob_batch = 1\noptimize_every = {optimize_every}\n[import]\ntranscripts_dir = \"/nonexistent/hippo-test-transcripts\"\n"
+    ))
+    .unwrap()
+}
+
+/// 임베딩을 마치고 큐가 빈 뒤의 (쓰기 직후 최대 pending, 남은 버전 수).
+fn embed_with_optimize_every(optimize_every: u64) -> (u64, usize) {
+    let e = env();
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(256, 8_000));
+    let handle = start(
+        e.paths.clone(),
+        lance_config(optimize_every),
+        embedder,
+        probed_lance_source(opened.clone()),
+    )
+    .unwrap();
+    ingest(&e.paths, &e.transcript, HookEvent::Stop);
+    wait_until(|| totals(&status(&e.paths)).1 == 0);
+    let (dir, p) = opened.lock().unwrap()[0].clone();
+    assert_eq!(
+        p.replaces.load(std::sync::atomic::Ordering::SeqCst),
+        4,
+        "작업 4개, 묶음 1개씩"
+    );
+    wait_until(|| p.pending_changes() == 0);
+    let result = (
+        p.max_pending.load(std::sync::atomic::Ordering::SeqCst),
+        probe::lance_versions(&dir),
+    );
+    handle.shutdown();
+    result
+}
+
+#[test]
+fn embedding_keeps_lancedb_versions_bounded() {
+    let (max_pending, versions) = embed_with_optimize_every(2);
+    assert!(max_pending <= 2 + 1, "max pending {max_pending}");
+    assert_eq!(versions, 1, "큐가 비면 정리");
+}
+
+#[test]
+fn zero_optimize_every_only_cleans_when_queue_is_empty() {
+    let (max_pending, versions) = embed_with_optimize_every(0);
+    assert_eq!(max_pending, 8, "쓰는 도중에는 정리하지 않음");
+    assert_eq!(versions, 1, "큐가 비면 정리");
+}
+
+#[test]
+fn reindexed_lancedb_generation_keeps_one_version() {
+    let e = env();
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(256, 8_000));
+    let handle = start(
+        e.paths.clone(),
+        lance_config(20),
+        embedder,
+        probed_lance_source(opened.clone()),
+    )
+    .unwrap();
+    ingest(&e.paths, &e.transcript, HookEvent::Stop);
+    wait_until(|| totals(&status(&e.paths)).1 == 0);
+    request(&e.paths.socket(), &reindex_all(), TIMEOUT).unwrap();
+    assert_eq!(wait_reindex(&e.paths).reindex, "done");
+    let (dir, p) = opened.lock().unwrap().last().unwrap().clone();
+    assert_eq!(p.pending_changes(), 0);
+    assert_eq!(probe::lance_versions(&dir), 1);
+    assert_eq!(p.count().unwrap(), 4);
+    handle.shutdown();
+}

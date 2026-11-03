@@ -30,6 +30,7 @@ fn defaults_match_srs() {
         "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"
     );
     assert_eq!(c.index.vector_index_threshold, 100_000);
+    assert_eq!(c.index.optimize_every, 20);
     assert!(c.redact.patterns.is_empty());
     assert!(c.daemon.autostart);
     assert_eq!(c.daemon.idle_timeout_secs, 1_800);

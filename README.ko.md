@@ -403,6 +403,7 @@ min_prompt_chars = 11              # 앞뒤 공백을 뺀 길이가 이보다 �
 [index]
 vector_index_threshold = 100000    # 벡터 수가 이 값에 이르면 ANN 인덱스를 만듦
 job_batch = 64
+optimize_every = 20                 # 벡터 저장소를 이만큼 수정하면 작은 파일을 합치고 이전 버전을 지움(0이면 큐가 빌 때만)
 
 [daemon]
 autostart = true                   # 데몬이 없으면 hook과 CLI가 띄움
@@ -490,6 +491,7 @@ pattern = 'HCI-\d{6}'
 | `lance-*`나 `protoc`에서 빌드 실패 | `brew reinstall protobuf` 후 `protoc --version` 확인 |
 | `refusing to modify through a symbolic link` | 설정 파일이 심볼릭 링크입니다. 실제 파일 경로에 `install`을 실행하거나, `hippo hooks-config` 출력을 직접 넣으십시오 |
 | `spool_pending`이 0보다 큼 | 데몬이 꺼져 있던 동안의 요청입니다. 데몬이 시작되면 처리됩니다 |
+| 0.14 이하 버전에서 올린 뒤 `vectors/`가 매우 큼(수십 GB) | 0.14 이하 버전은 LanceDB의 버전을 모두 남겼습니다. 업그레이드 뒤 첫 정리에서 지워지지만, 몇 분 걸릴 수 있고 그동안 그 프로젝트의 검색이 기다립니다. 바로 비우려면 `hippo reindex`를 실행하십시오 |
 
 ---
 

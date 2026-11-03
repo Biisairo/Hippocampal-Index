@@ -174,6 +174,78 @@ pub fn vector_store_contract(make: &dyn Fn() -> Box<dyn VectorStore>) {
     ));
     assert_eq!(s.count().unwrap(), 2);
     s.ensure_index().unwrap();
+
+    // replace: 대상 레코드의 모든 청크를 바꾸고 나머지는 남김 (FR-STO-7)
+    let s = make();
+    s.upsert(&[
+        record(Iteration, "a", 0, vec![1.0, 0.0, 0.0], None, Some("s1")),
+        record(Iteration, "a", 1, vec![0.0, 1.0, 0.0], None, Some("s1")),
+        record(Iteration, "x", 0, vec![0.0, 0.0, 1.0], None, Some("s1")),
+        record(Iteration, "keep", 0, vec![1.0, 1.0, 0.0], None, Some("s1")),
+        record(Result, "a", 0, vec![1.0, 0.0, 1.0], None, None),
+    ])
+    .unwrap();
+    s.replace(
+        &[(Iteration, "a".into()), (Iteration, "x".into())],
+        &[record(
+            Iteration,
+            "a",
+            0,
+            vec![0.0, 1.0, 1.0],
+            None,
+            Some("s1"),
+        )],
+    )
+    .unwrap();
+    let mut left: Vec<String> = s
+        .scan()
+        .unwrap()
+        .iter()
+        .map(|r| format!("{}:{}#{}", r.kind.as_str(), r.ref_id, r.chunk_index))
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        vec!["iteration:a#0", "iteration:keep#0", "result:a#0"],
+        "a의 이전 청크 1과 x는 지워지고, 다른 kind와 다른 레코드는 남음"
+    );
+    let a0 = s
+        .scan()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.kind == Iteration && r.ref_id == "a")
+        .unwrap();
+    assert_eq!(a0.vector, vec![0.0, 1.0, 1.0]);
+
+    // replace: 빈 입력은 아무것도 바꾸지 않음
+    s.replace(&[], &[]).unwrap();
+    assert_eq!(s.count().unwrap(), 3);
+
+    // replace: 차원이 맞지 않으면 아무것도 지우지 않음
+    let err = s
+        .replace(
+            &[(Iteration, "keep".into())],
+            &[record(Iteration, "keep", 0, vec![1.0, 0.0], None, None)],
+        )
+        .unwrap_err();
+    assert!(matches!(err, VectorError::DimensionMismatch { .. }));
+    assert_eq!(s.count().unwrap(), 3);
+
+    // optimize: 내용과 검색 결과를 바꾸지 않음 (FR-STO-12)
+    let before = ids(&s
+        .search(&[0.0, 1.0, 1.0], &VectorFilter::default(), 10)
+        .unwrap());
+    s.optimize().unwrap();
+    s.optimize().unwrap();
+    assert_eq!(s.count().unwrap(), 3);
+    assert_eq!(
+        ids(&s
+            .search(&[0.0, 1.0, 1.0], &VectorFilter::default(), 10)
+            .unwrap()),
+        before
+    );
+    assert_eq!(s.pending_changes(), 0);
+    make().optimize().unwrap();
 }
 
 pub fn embedder_contract(e: &dyn Embedder) {

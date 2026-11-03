@@ -112,6 +112,7 @@ pub fn fields(c: &Config) -> Vec<Field> {
             int(c.index.vector_index_threshold),
         ),
         ("index", "job_batch", int(c.index.job_batch)),
+        ("index", "optimize_every", int(c.index.optimize_every)),
         ("daemon", "autostart", FieldValue::Bool(c.daemon.autostart)),
         (
             "daemon",

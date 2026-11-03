@@ -403,6 +403,7 @@ min_prompt_chars = 11              # prompts shorter than this after trimming ge
 [index]
 vector_index_threshold = 100000    # build an ANN index when the vector count reaches this
 job_batch = 64
+optimize_every = 20                 # after this many vector store changes, merge small files and drop old versions (0 = only when the queue is empty)
 
 [daemon]
 autostart = true                   # hooks and CLI start the daemon when it is not running
@@ -490,6 +491,7 @@ Security measures:
 | Build fails in `lance-*` / `protoc` | `brew reinstall protobuf` and check `protoc --version` |
 | `refusing to modify through a symbolic link` | Your settings file is a symlink. Run `install` on the real file path, or add the output of `hippo hooks-config` by hand. |
 | `spool_pending` > 0 | Requests from a time when the daemon was down. They are processed when the daemon starts. |
+| `vectors/` is very large (tens of GB) after upgrading from 0.14 or earlier | Version 0.14 and earlier kept every LanceDB version. The first cleanup after the upgrade removes them, but it can take a few minutes, and search in that project waits until it ends. To free the space at once, run `hippo reindex`. |
 
 ---
 

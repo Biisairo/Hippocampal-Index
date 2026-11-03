@@ -1,4 +1,4 @@
-//! 임베딩 작업 처리, 재색인, 호환성 판정. (FR-STO-7, FR-SWP-5, FR-SWP-6)
+//! 임베딩 작업 처리, 재색인, 벡터 저장소 정리, 호환성 판정. (FR-STO-7, FR-STO-12, FR-SWP-5, FR-SWP-6)
 
 use crate::embed_text::{chunk, chunk_limit};
 use crate::embedder::{EmbedError, Embedder};
@@ -46,8 +46,9 @@ pub fn process_embed_jobs(
     process_jobs_until(records, embedder, vectors, chunking, &jobs, &|| false)
 }
 
-/// 주어진 작업을 차례로 처리한다. 작업 1건을 마칠 때마다 `stop()`이 참이면 남은 작업을 두고 멈춘다.
-/// 실패하면 그때까지 끝난 작업만 완료 처리하고 오류를 돌려준다. (FR-DMN-6)
+/// 주어진 작업을 차례로 임베딩하고, 마친 작업의 벡터를 `replace` 한 번으로 저장한다.
+/// 작업 1건을 마칠 때마다 `stop()`이 참이면 남은 작업을 두고 멈춘다.
+/// 실패하면 그때까지 끝난 작업만 저장·완료 처리하고 오류를 돌려준다. (FR-STO-7, FR-DMN-6)
 pub fn process_jobs_until(
     records: &mut RecordStore,
     embedder: &dyn Embedder,
@@ -57,10 +58,14 @@ pub fn process_jobs_until(
     stop: &dyn Fn() -> bool,
 ) -> Result<usize, IndexError> {
     let mut done: Vec<EmbedJob> = Vec::new();
+    let mut pending = Pending::default();
     let mut failure = None;
     for job in jobs {
-        match index_one(records, embedder, vectors, chunking, job.kind, &job.ref_id) {
-            Ok(()) => done.push(job.clone()),
+        match embed_one(records, embedder, chunking, job.kind, &job.ref_id) {
+            Ok(embedded) => {
+                pending.push(job.kind, &job.ref_id, embedded);
+                done.push(job.clone());
+            }
             Err(e) => {
                 failure = Some(e);
                 break;
@@ -70,6 +75,7 @@ pub fn process_jobs_until(
             break;
         }
     }
+    pending.save(vectors)?;
     records.complete_embed_jobs(&done)?;
     match failure {
         Some(e) => Err(e),
@@ -77,13 +83,15 @@ pub fn process_jobs_until(
     }
 }
 
-/// 원본 저장소 전체를 대상 벡터 저장소에 다시 색인한다. 색인한 레코드(반복+결과) 수를 돌려준다.
+/// 원본 저장소 전체를 대상 벡터 저장소에 페이지 단위로 다시 색인한다. 색인한 레코드(반복+결과) 수를 돌려준다.
+/// 페이지마다 `optimize_if_due`를 적용하고, 끝나면 한 번 더 정리한다. (FR-SWP-5, FR-STO-12)
 pub fn reindex(
     records: &RecordStore,
     embedder: &dyn Embedder,
     target: &dyn VectorStore,
     chunking: ChunkConfig,
     page_size: usize,
+    optimize_every: u64,
 ) -> Result<usize, IndexError> {
     let mut total = 0;
     for kind in [RecordKind::Iteration, RecordKind::Result] {
@@ -97,14 +105,49 @@ pub fn reindex(
                 break;
             };
             after = *last;
+            let mut pending = Pending::default();
             for (_, ref_id) in &page {
-                index_one(records, embedder, target, chunking, kind, ref_id)?;
+                let embedded = embed_one(records, embedder, chunking, kind, ref_id)?;
+                pending.push(kind, ref_id, embedded);
                 total += 1;
             }
+            pending.save(target)?;
+            optimize_if_due(target, optimize_every)?;
         }
     }
     target.ensure_index()?;
+    target.optimize()?;
     Ok(total)
+}
+
+/// 마지막 정리 뒤 수정 수가 `every` 이상이면 정리하고 참을 돌려준다. `every`가 0이면 하지 않는다. (FR-STO-12)
+pub fn optimize_if_due(vectors: &dyn VectorStore, every: u64) -> Result<bool, VectorError> {
+    if every == 0 || vectors.pending_changes() < every {
+        return Ok(false);
+    }
+    vectors.optimize()?;
+    Ok(true)
+}
+
+/// 한 번의 `replace`로 저장할 레코드와 새 벡터.
+#[derive(Default)]
+struct Pending {
+    refs: Vec<(RecordKind, String)>,
+    records: Vec<VectorRecord>,
+}
+
+impl Pending {
+    /// 원본이 없는 레코드(`None`)는 벡터를 건드리지 않는다.
+    fn push(&mut self, kind: RecordKind, ref_id: &str, embedded: Option<Vec<VectorRecord>>) {
+        if let Some(mut records) = embedded {
+            self.refs.push((kind, ref_id.to_string()));
+            self.records.append(&mut records);
+        }
+    }
+
+    fn save(self, vectors: &dyn VectorStore) -> Result<(), VectorError> {
+        vectors.replace(&self.refs, &self.records)
+    }
 }
 
 pub fn compatibility(
@@ -152,16 +195,16 @@ fn load_source(
     })
 }
 
-fn index_one(
+/// 레코드 하나를 청크로 나눠 임베딩한다. 원본이 없으면 `None`. (FR-STO-7)
+fn embed_one(
     records: &RecordStore,
     embedder: &dyn Embedder,
-    vectors: &dyn VectorStore,
     chunking: ChunkConfig,
     kind: RecordKind,
     ref_id: &str,
-) -> Result<(), IndexError> {
+) -> Result<Option<Vec<VectorRecord>>, IndexError> {
     let Some(source) = load_source(records, kind, ref_id)? else {
-        return Ok(());
+        return Ok(None);
     };
     let limit = chunk_limit(
         embedder.max_input_tokens(),
@@ -195,7 +238,5 @@ fn index_one(
             ts: source.ts.clone(),
         })
         .collect();
-    vectors.delete(kind, ref_id)?;
-    vectors.upsert(&new_records)?;
-    Ok(())
+    Ok(Some(new_records))
 }

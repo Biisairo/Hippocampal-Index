@@ -19,7 +19,9 @@ use crate::fsutil::{ensure_private_dir, open_private_append, set_private_file};
 use crate::generations::{activate, active_dir, cleanup_inactive, new_generation};
 use crate::i18n::{Lang, local_time};
 use crate::import::{Candidate, candidates, import_status};
-use crate::indexer::{ChunkConfig, Compatibility, compatibility, process_jobs_until, reindex};
+use crate::indexer::{
+    ChunkConfig, Compatibility, compatibility, optimize_if_due, process_jobs_until, reindex,
+};
 use crate::ingest::{
     ImportOutcome, ImportReport, IngestOptions, IngestRequest, import_session, ingest,
     session_start_cwd,
@@ -262,6 +264,25 @@ impl Shared {
             Scope::All => self.project_ids(),
             Scope::Project => Ok(self.lookup(cwd)?.into_iter().collect()),
             Scope::Path(path) => Ok(self.lookup(path)?.into_iter().collect()),
+        }
+    }
+
+    /// 열려 있고 마지막 정리 뒤 수정된 벡터 저장소를 정리한다. 실패는 로그에 남긴다. (FR-STO-12 (b))
+    fn optimize_open(&self) {
+        let handles: Vec<(String, Arc<ProjectHandle>)> = match lock(&self.open) {
+            Ok(open) => open.entries.iter().cloned().collect(),
+            Err(e) => {
+                self.log(&e);
+                return;
+            }
+        };
+        for (id, handle) in handles {
+            if handle.vectors.pending_changes() == 0 {
+                continue;
+            }
+            if let Err(e) = handle.vectors.optimize() {
+                self.log(&format!("project {id}: vector optimize failed: {e}"));
+            }
         }
     }
 
@@ -1011,6 +1032,7 @@ fn spawn_embed(shared: Arc<Shared>, notify: Receiver<()>) -> JoinHandle<()> {
                     let from_bulk = q.lane_counts().0 == 0;
                     q.front_batch(batch).map(|(p, j)| (p, j, from_bulk))
                 }) else {
+                    shared.optimize_open();
                     break;
                 };
                 match embed_batch(&shared, &project, &jobs, from_bulk, &mut next_index_at) {
@@ -1074,6 +1096,9 @@ fn embed_batch(
         &live_waiting,
     )
     .map_err(|e| failed(e.to_string()))?;
+    if let Err(e) = optimize_if_due(handle.vectors.as_ref(), shared.config.index.optimize_every) {
+        shared.log(&format!("project {project}: vector optimize failed: {e}"));
+    }
     handle.refresh(shared.embedder.as_ref());
     let threshold = shared.config.index.vector_index_threshold;
     let next = next_index_at
@@ -1150,6 +1175,7 @@ fn reindex_project(shared: &Shared, id: &str) -> Result<(), String> {
         target.as_ref(),
         shared.chunking(),
         REINDEX_PAGE,
+        shared.config.index.optimize_every,
     )
     .map_err(|e| e.to_string())?;
     activate(&base, &generation).map_err(|e| e.to_string())?;

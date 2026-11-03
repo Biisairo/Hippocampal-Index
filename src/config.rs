@@ -86,6 +86,8 @@ pub struct InjectSection {
 pub struct IndexConfig {
     pub vector_index_threshold: u64,
     pub job_batch: usize,
+    /// 벡터 저장소 수정이 이 수에 이르면 정리한다. 0이면 큐가 빌 때만 정리한다. (FR-STO-12)
+    pub optimize_every: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -355,6 +357,7 @@ impl Default for IndexConfig {
         Self {
             vector_index_threshold: 100_000,
             job_batch: 64,
+            optimize_every: 20,
         }
     }
 }
