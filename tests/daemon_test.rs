@@ -1615,3 +1615,65 @@ fn daemon_text_follows_language_setting_without_restart() {
     assert!(project_list(&e.paths).contains("No project"));
     handle.shutdown();
 }
+
+fn inject_log_lines(paths: &Paths) -> Vec<String> {
+    fs::read_to_string(paths.logs().join("hippo.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.contains("inject budget exceeded"))
+        .map(str::to_string)
+        .collect()
+}
+
+fn inject_request(paths: &Paths, session_id: &str) -> Response {
+    request(
+        &paths.socket(),
+        &Request::Inject {
+            prompt: "anything".into(),
+            cwd: s2_cwd(),
+            session_id: session_id.into(),
+        },
+        TIMEOUT,
+    )
+    .unwrap()
+}
+
+#[test]
+fn inject_over_budget_is_logged_with_queue_state() {
+    let e = env();
+    let mut cfg = config();
+    cfg.inject.budget_ms = 0;
+    let handle = launch_with(&e.paths, Arc::new(MemoryVectorStore::default()), cfg).unwrap();
+    ingest(&e.paths, &e.transcript, HookEvent::Stop);
+    wait_until(|| totals(&status(&e.paths)).1 == 0);
+
+    assert!(matches!(
+        inject_request(&e.paths, "other"),
+        Response::Inject { context: None }
+    ));
+    handle.shutdown();
+
+    let lines = inject_log_lines(&e.paths);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let line = &lines[0];
+    assert!(line.contains("project "), "{line}");
+    assert!(line.contains("budget=0ms"), "{line}");
+    assert!(line.contains("elapsed="), "{line}");
+    assert!(line.contains("queue normal=0 bulk=0"), "{line}");
+}
+
+#[test]
+fn inject_within_budget_is_not_logged() {
+    let e = env();
+    let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
+    ingest(&e.paths, &e.transcript, HookEvent::Stop);
+    wait_until(|| totals(&status(&e.paths)).1 == 0);
+
+    assert!(matches!(
+        inject_request(&e.paths, "other"),
+        Response::Inject { .. }
+    ));
+    handle.shutdown();
+
+    assert!(inject_log_lines(&e.paths).is_empty());
+}

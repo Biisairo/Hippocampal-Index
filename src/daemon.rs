@@ -1140,12 +1140,14 @@ fn handle_request(shared: &Arc<Shared>, req: Request) -> Response {
 }
 
 /// 현재 세션의 프로젝트에서만 찾는다. 프로젝트가 없으면 주입하지 않는다. (FR-RET-1)
+/// 처리 시간이 예산 이상이면 로그를 남긴다. (FR-RET-10)
 fn inject(
     shared: &Shared,
     prompt: &str,
     cwd: &str,
     session_id: &str,
 ) -> Result<Option<String>, String> {
+    let started = Instant::now();
     let bound = lock(&shared.registry)?
         .session_project(session_id)
         .map_err(|e| e.to_string())?;
@@ -1161,8 +1163,9 @@ fn inject(
         per_item_chars: c.per_item_chars,
         total_chars: c.total_chars,
     };
-    let deadline = Instant::now() + Duration::from_millis(c.budget_ms);
-    build_injection(
+    let budget = Duration::from_millis(c.budget_ms);
+    let deadline = Instant::now() + budget;
+    let result = build_injection(
         &records,
         handle.backends(shared.embedder.as_ref()),
         prompt,
@@ -1170,7 +1173,17 @@ fn inject(
         config,
         deadline,
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string());
+    let elapsed = started.elapsed();
+    if elapsed >= budget {
+        let (normal, bulk) = lock(&shared.queue)?.lane_counts();
+        shared.log(&format!(
+            "project {id}: inject budget exceeded: elapsed={}ms budget={}ms queue normal={normal} bulk={bulk}",
+            elapsed.as_millis(),
+            c.budget_ms
+        ));
+    }
+    result
 }
 
 fn search_scope(

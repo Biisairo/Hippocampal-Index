@@ -68,3 +68,18 @@ fn lane_queue_pops_normal_first_then_bulk_in_order() {
     let order: Vec<i32> = std::iter::from_fn(|| q.pop()).collect();
     assert_eq!(order, vec![2, 4, 1, 3]);
 }
+
+#[test]
+fn lane_counts_track_each_lane() {
+    let mut q = EmbedQueue::default();
+    assert_eq!(q.lane_counts(), (0, 0));
+    q.push("p1", job("n1"), false);
+    q.push("p1", job("b1"), true);
+    q.push("p2", job("b2"), true);
+    q.push("p2", job("b2"), true);
+    assert_eq!(q.lane_counts(), (1, 2));
+    q.remove("p2", &[job("b2")]);
+    assert_eq!(q.lane_counts(), (1, 1));
+    q.remove_project("p1");
+    assert_eq!(q.lane_counts(), (0, 0));
+}

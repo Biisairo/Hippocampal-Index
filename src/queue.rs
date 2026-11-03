@@ -103,4 +103,9 @@ impl EmbedQueue {
     pub fn is_empty(&self) -> bool {
         self.queued.is_empty()
     }
+
+    /// (일반 단계, bulk 단계) 대기 작업 수.
+    pub fn lane_counts(&self) -> (usize, usize) {
+        (self.normal.len(), self.bulk.len())
+    }
 }
