@@ -169,6 +169,7 @@ cargo build --release
 ./target/release/hippo install --scope user --dry-run
 ```
 
+- The hook commands and the Claude guide write the path with `~`, as in `~/.hippo/bin/hippo`, so shared settings files do not reveal your account name. (The launchd plist does not go through a shell, so it uses the absolute path.)
 - After you rebuild, run `install` again to copy the new binary. If the content is the same, nothing is copied.
 - The copy uses APFS file cloning, so it takes almost no extra disk space.
 - `~/.hippo/bin/installs` records which settings files you installed into. When `uninstall` removes the last one, the copy is removed too.

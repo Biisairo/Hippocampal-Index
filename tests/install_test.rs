@@ -589,3 +589,57 @@ fn binary_is_removed_only_after_last_install_is_forgotten() {
         "이미 없으면 변경 없음"
     );
 }
+
+// ---- FR-INS-10: 셸 표기 ----
+
+use hippo::setup::shell_path;
+
+#[test]
+fn paths_under_home_are_written_with_tilde() {
+    let home = Some(Path::new("/Users/someone"));
+    assert_eq!(
+        shell_path(Path::new("/Users/someone/.hippo/bin/hippo"), home),
+        "~/.hippo/bin/hippo"
+    );
+    assert_eq!(
+        shell_path(Path::new("/Users/someone/my tools/hippo"), home),
+        "~/'my tools/hippo'",
+        "~는 따옴표 밖에 둬야 펼쳐짐"
+    );
+    assert_eq!(
+        shell_path(Path::new("/Users/someone2/hippo"), home),
+        "/Users/someone2/hippo",
+        "이름이 비슷한 다른 홈은 그대로"
+    );
+    assert_eq!(
+        shell_path(Path::new("/opt/bin/hippo"), home),
+        "/opt/bin/hippo"
+    );
+    assert_eq!(
+        shell_path(Path::new("/opt/x y/hippo"), None),
+        "'/opt/x y/hippo'"
+    );
+    assert_eq!(
+        shell_path(Path::new("/Users/someone/it's/hippo"), home),
+        "~/'it'\\''s/hippo'"
+    );
+}
+
+#[test]
+fn hooks_and_guide_use_tilde_paths_under_home() {
+    let home = std::env::var("HOME").unwrap();
+    let exe = Path::new(&home).join(".hippo/bin/hippo");
+    let hooks = hooks_config(&exe, 3).to_string();
+    assert!(
+        hooks.contains("\"~/.hippo/bin/hippo hook stop\""),
+        "{hooks}"
+    );
+    assert!(!hooks.contains(&home), "홈 경로를 드러내지 않음");
+    assert!(
+        is_hippo_command("~/.hippo/bin/hippo hook stop"),
+        "설치 식별 (FR-INS-2)"
+    );
+    let block = guide_block(&exe);
+    assert!(block.contains("`~/.hippo/bin/hippo search"), "{block}");
+    assert!(!block.contains(&home));
+}

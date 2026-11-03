@@ -2,7 +2,7 @@
 
 | 항목 | 값 |
 |------|----|
-| 문서 버전 | 0.7 (설치 시 실행 파일을 고정 위치로 복사) |
+| 문서 버전 | 0.8 (hook·안내문 경로를 ~로 표시) |
 | 작성일 | 2026-11-02 |
 | 작성자 | biisairo |
 | 준거 표준 | ISO/IEC/IEEE 29148:2018 |
@@ -137,7 +137,7 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 | IF-HK-1 | `hippo hook <event>`는 stdin으로 hook 입력 JSON 1개를 받아야 한다. `<event>`는 `post-tool-batch`, `stop`, `stop-failure`, `session-end`, `user-prompt-submit` 중 하나이다. | M |
 | IF-HK-2 | `user-prompt-submit`을 뺀 모든 hook은 항상 종료 코드 0으로 끝나야 하며 stdout에 아무것도 출력하지 않아야 한다. | M |
 | IF-HK-3 | `user-prompt-submit`은 주입할 기억이 있으면 `hookSpecificOutput.additionalContext`를 담은 JSON 1개를 stdout에 출력하고, 없으면 아무것도 출력하지 않아야 한다. 어떤 경우에도 프롬프트를 차단하지 않아야 한다(종료 코드 0). | M |
-| IF-HK-4 | `hippo hooks-config`는 Claude Code `settings.json`에 넣을 hook 설정 JSON을 stdout에 출력해야 한다. 수집 hook(`PostToolBatch`, `Stop`, `StopFailure`, `SessionEnd`)은 `async: true`로 설정한다. `UserPromptSubmit`은 동기로 두고 `timeout`(초)을 시간 예산보다 크게 설정한다. 명령 경로는 실행 중인 `hippo`의 절대 경로를 쓴다. `hippo install`이 설정 파일에 넣을 때는 FR-INS-8의 설치 경로를 쓴다. | M |
+| IF-HK-4 | `hippo hooks-config`는 Claude Code `settings.json`에 넣을 hook 설정 JSON을 stdout에 출력해야 한다. 수집 hook(`PostToolBatch`, `Stop`, `StopFailure`, `SessionEnd`)은 `async: true`로 설정한다. `UserPromptSubmit`은 동기로 두고 `timeout`(초)을 시간 예산보다 크게 설정한다. 명령 경로는 실행 중인 `hippo`의 절대 경로를 쓴다. `hippo install`이 설정 파일에 넣을 때는 FR-INS-8의 설치 경로를 쓴다. 경로는 FR-INS-10의 셸 표기로 쓴다. | M |
 | IF-HK-5 | 수집 hook 클라이언트는 데몬에 요청을 보내고 처리 완료 응답을 기다린다(기본 10초). 요청이 실패하면 FR-DMN-7에 따라 데몬을 띄운 뒤 한 번 다시 보낸다. 그래도 실패하면 FR-CAP-5에 따라 스풀에 기록한다. | M |
 
 #### 3.1.2 CLI 인터페이스
@@ -246,9 +246,10 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 | FR-INS-3 | 설치는 기존 hippo hook 항목을 모두 지운 뒤 IF-HK-4의 hook 설정을 이벤트마다 추가해야 한다. 다른 hook과 다른 설정 키는 내용과 순서를 그대로 유지한다. 비게 된 matcher 그룹과 이벤트는 지운다. | M |
 | FR-INS-4 | 제거는 hippo hook 항목만 지워야 한다. 비게 된 matcher 그룹, 이벤트, `hooks` 키는 지운다. 그 결과 설정이 빈 객체(`{}`)이면 파일을 백업 없이 지우고, 설정 파일이 있던 디렉터리가 비면 그 디렉터리도 지운다. | M |
 | FR-INS-5 | 결과가 기존 내용과 같으면 파일을 쓰지 않고 "변경 없음"을 출력한다. 다르면 변경 내용(diff)을 출력하고, 기존 파일이 있으면 `<파일>.hippo-backup-<유닉스 시각>`(이미 있으면 `-<번호>`를 붙임)으로 백업한 뒤 임시 파일에 쓰고 이름을 바꿔 원자적으로 교체한다. 기존 파일 권한을 유지한다. 임시 파일은 같은 디렉터리에 무작위 이름으로 배타적으로 만들고, 백업은 링크를 따르지 않는 배타적 생성(권한 0600)으로 만든다. 설정 파일이나 바로 위 디렉터리가 심볼릭 링크이면 수정하지 않고 오류로 끝낸다. `--dry-run`이면 diff만 출력하고 아무것도 쓰지 않는다. | M |
-| FR-INS-7 | 설치는 hook 범위에 맞는 Claude 메모리 파일에 안내 블록을 넣어야 한다. `--scope user`는 `$HOME/.claude/CLAUDE.md`, `--scope project`는 `<프로젝트>/CLAUDE.local.md`이다. 블록은 `<!-- hippo:begin -->` 줄과 `<!-- hippo:end -->` 줄로 감싼다(Claude Code는 블록 HTML 주석을 컨텍스트에 넣기 전에 지운다). 블록이 이미 있으면 그 블록만 새 내용으로 바꾸고, 없으면 파일 끝에 빈 줄 하나를 두고 덧붙인다. 블록 밖의 내용은 그대로 둔다. 제거는 블록만 지우고, 그 결과 파일이 공백뿐이면 파일을 백업 없이 지운다. 블록의 명령은 FR-INS-8의 설치 경로로 쓴다(셸 특수 문자가 있으면 작은따옴표로 감싼다). `hippo`가 PATH에 없어도 Claude가 안내대로 실행할 수 있게 하기 위해서다. 시작 표식만 있고 끝 표식이 없으면 수정하지 않고 오류로 끝낸다. 쓰기, 백업, 변경 없음, diff, `--dry-run`, 심볼릭 링크 거부는 FR-INS-5와 같다. `--scope project`이고 프로젝트가 git 작업 트리 안인데 `CLAUDE.local.md`가 git에서 무시되지 않으면(`git check-ignore`) 커밋될 수 있다는 경고를 출력한다. `.gitignore`는 바꾸지 않는다. | M |
+| FR-INS-7 | 설치는 hook 범위에 맞는 Claude 메모리 파일에 안내 블록을 넣어야 한다. `--scope user`는 `$HOME/.claude/CLAUDE.md`, `--scope project`는 `<프로젝트>/CLAUDE.local.md`이다. 블록은 `<!-- hippo:begin -->` 줄과 `<!-- hippo:end -->` 줄로 감싼다(Claude Code는 블록 HTML 주석을 컨텍스트에 넣기 전에 지운다). 블록이 이미 있으면 그 블록만 새 내용으로 바꾸고, 없으면 파일 끝에 빈 줄 하나를 두고 덧붙인다. 블록 밖의 내용은 그대로 둔다. 제거는 블록만 지우고, 그 결과 파일이 공백뿐이면 파일을 백업 없이 지운다. 블록의 명령은 FR-INS-8의 설치 경로를 FR-INS-10의 셸 표기로 쓴다. `hippo`가 PATH에 없어도 Claude가 안내대로 실행할 수 있게 하기 위해서다. 시작 표식만 있고 끝 표식이 없으면 수정하지 않고 오류로 끝낸다. 쓰기, 백업, 변경 없음, diff, `--dry-run`, 심볼릭 링크 거부는 FR-INS-5와 같다. `--scope project`이고 프로젝트가 git 작업 트리 안인데 `CLAUDE.local.md`가 git에서 무시되지 않으면(`git check-ignore`) 커밋될 수 있다는 경고를 출력한다. `.gitignore`는 바꾸지 않는다. | M |
 | FR-INS-8 | 설치는 실행 중인 `hippo` 실행 파일을 데이터 루트의 `bin/hippo`(기본 `~/.hippo/bin/hippo`, 이하 설치 경로)로 복사하고, hook 명령(IF-HK-4)과 안내 블록(FR-INS-7)은 설치 경로를 써야 한다. 빌드 폴더를 지우거나 옮겨도 hook이 동작하게 하기 위해서다. 복사는 같은 디렉터리의 임시 파일에 쓴 뒤 이름을 바꿔 원자적으로 하고, 디렉터리 권한은 0700, 실행 파일 권한은 0700이다. 설치 경로의 파일이 실행 중인 파일과 내용이 같거나 실행 중인 파일 자체이면 복사하지 않는다. 설치 경로가 심볼릭 링크이면 오류로 끝낸다. `--dry-run`이면 복사하지 않고 설치 경로를 출력한다. | M |
 | FR-INS-9 | 설치는 hook을 넣은 설정 파일의 절대 경로를 `bin/installs`(한 줄에 하나, 권한 0600)에 기록해야 한다. 제거는 그 설정 파일의 줄을 지우고, 남은 줄이 없으면 설치 경로의 실행 파일, `bin/installs`, 빈 `bin/` 디렉터리를 지운다. 다른 범위의 설치가 남아 있으면 실행 파일을 지우지 않는다. `--dry-run`이면 아무것도 바꾸지 않는다. | M |
+| FR-INS-10 | hook 명령과 안내 블록에 쓰는 경로(셸 표기)는, 경로가 `$HOME` 아래이면 `~/<나머지>`로 쓰고 아니면 절대 경로로 쓴다. 표기할 부분(`~/` 뒤의 나머지 또는 절대 경로)에 셸에서 그대로 쓸 수 없는 문자가 있으면 그 부분만 작은따옴표로 감싼다. 생성된 설정 파일이나 메모리 파일이 공유되어도 계정 이름이 드러나지 않게 하기 위해서다. Claude Code는 hook 명령을 셸로 실행하므로 `~`가 펼쳐진다(부록 A). 셸을 거치지 않는 launchd plist(IF-CLI-4)는 절대 경로를 쓴다. | M |
 | FR-INS-6 | 기존 파일이 JSON으로 해석되지 않거나, 최상위가 객체가 아니거나, `hooks`가 객체가 아니면 수정하지 않고 오류로 끝낸다. 파일이 없으면 새로 만든다(디렉터리 포함). | M |
 
 #### 3.2.9 임베딩 서버 자동 시작 (EMB)
@@ -388,6 +389,7 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 - `--resume <id> --fork-session`은 새 session id로 새 파일을 만들고 이전 라인을 모두 복사한다. 복사한 라인은 `sessionId`만 새 값이고 `uuid`와 `message.id`는 원본과 같다. `SessionStart`의 `source`는 `fork`이다.
 - 실제 로그 335개에서 assistant `message.id` 24,824개 중 두 파일 이상에 나온 것은 101개였고, 모두 시작 시각이 같은 한 쌍(fork)이었다.
 - `Stop`과 `UserPromptSubmit` 입력의 `prompt_id`는 그 턴 user 라인의 `promptId`와 같다.
+- hook `command`의 `~/…` 경로는 펼쳐져 실행된다(`UserPromptSubmit`, `Stop`에서 확인, 2026-11-03).
 - transcript에 턴 종료를 일정하게 표시하는 라인은 없다(`system` 라인의 `turn_duration`, `stop_hook_summary`는 환경에 따라 있거나 없다).
 
 ## 부록 B. 미해결 항목 (구현 전 또는 구현 중 확인)

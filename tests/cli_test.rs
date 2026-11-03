@@ -81,7 +81,15 @@ fn hooks_config_prints_settings_json() {
     let cmd = v["hooks"]["Stop"][0]["hooks"][0]["command"]
         .as_str()
         .unwrap();
-    assert!(cmd.starts_with('/') && cmd.ends_with(" hook stop"), "{cmd}");
+    assert!(
+        (cmd.starts_with('/') || cmd.starts_with("~/")) && cmd.ends_with(" hook stop"),
+        "{cmd}"
+    );
+    let home = std::env::var("HOME").unwrap();
+    assert!(
+        !cmd.contains(&home),
+        "홈 아래 경로는 ~로 씀 (FR-INS-10): {cmd}"
+    );
     assert!(
         v["hooks"]["UserPromptSubmit"][0]["hooks"][0]["timeout"]
             .as_u64()
@@ -287,14 +295,14 @@ fn install_user_scope_uses_home() {
     assert!(exe.exists(), "실행 파일을 데이터 루트로 복사 (FR-INS-8)");
     let settings = fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
     assert!(
-        settings.contains(&format!("{} hook stop", exe.display())),
+        settings.contains("\"~/root/bin/hippo hook stop\""),
         "hook은 설치 경로: {settings}"
     );
     let memory = dir.path().join(".claude/CLAUDE.md");
     assert!(
         fs::read_to_string(&memory)
             .unwrap()
-            .contains(&format!("{} search", exe.display())),
+            .contains("`~/root/bin/hippo search"),
         "안내 블록도 설치 경로"
     );
     assert!(

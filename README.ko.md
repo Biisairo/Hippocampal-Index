@@ -169,6 +169,7 @@ cargo build --release
 ./target/release/hippo install --scope user --dry-run
 ```
 
+- hook 명령과 Claude 안내문에는 경로를 `~/.hippo/bin/hippo`처럼 `~`로 적습니다. 생성된 설정 파일이 공유되어도 계정 이름이 드러나지 않습니다. (launchd plist는 셸을 거치지 않으므로 절대 경로를 씁니다.)
 - 다시 빌드한 뒤에는 `install`을 다시 실행해야 새 바이너리가 복사됩니다. 내용이 같으면 복사하지 않습니다.
 - 복사는 APFS 파일 복제를 쓰므로 디스크를 거의 더 쓰지 않습니다.
 - 어느 설정 파일에 설치했는지는 `~/.hippo/bin/installs`에 기록됩니다. `uninstall`로 마지막 설치까지 지우면 복사본도 지웁니다.

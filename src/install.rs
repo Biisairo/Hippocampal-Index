@@ -9,6 +9,7 @@ use serde_json::{Map, Value};
 use similar::TextDiff;
 
 use crate::fsutil::{ensure_private_dir, open_private_append};
+use crate::setup::{home_dir, shell_path};
 
 #[derive(Debug, thiserror::Error)]
 pub enum InstallError {
@@ -100,19 +101,10 @@ pub fn memory_file(scope: &Scope) -> Result<PathBuf, InstallError> {
     })
 }
 
-/// 안내 블록. 명령은 hippo 실행 파일의 절대 경로로 쓴다. (FR-INS-7)
+/// 안내 블록. 명령은 hippo 실행 파일 경로의 셸 표기로 쓴다. (FR-INS-7, FR-INS-10)
 pub fn guide_block(exe: &Path) -> String {
-    let body = GUIDE_BODY.replace(EXE_PLACEHOLDER, &shell_quote(&exe.to_string_lossy()));
+    let body = GUIDE_BODY.replace(EXE_PLACEHOLDER, &shell_path(exe, home_dir().as_deref()));
     format!("{GUIDE_BEGIN}\n{body}\n{GUIDE_END}\n")
-}
-
-/// 셸에서 그대로 쓸 수 있는 문자만 있으면 그대로, 아니면 작은따옴표로 감싼다.
-fn shell_quote(text: &str) -> String {
-    let safe = |c: char| c.is_ascii_alphanumeric() || "/._-+".contains(c);
-    if !text.is_empty() && text.chars().all(safe) {
-        return text.to_string();
-    }
-    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 /// 표식 줄의 위치 (시작, 끝). 블록이 없으면 `None`. 끝 표식이 없으면 오류.
