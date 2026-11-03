@@ -158,6 +158,37 @@ pub struct Counts {
     pub embed_jobs: u64,
 }
 
+/// 삭제 대상. 세션은 그 세션 전부, 턴은 같은 `prompt_id`의 반복 전부이다. (FR-DEL-2, FR-DEL-3)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum ForgetTarget {
+    Session(String),
+    Prompt(String),
+}
+
+/// 지울(지운) 세션, 턴, 반복, 결과 수. (FR-DEL-4)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgetCounts {
+    pub sessions: u64,
+    pub turns: u64,
+    pub iterations: u64,
+    pub results: u64,
+}
+
+impl ForgetCounts {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// 삭제 결과. `jobs`는 지운 임베딩 작업, `vector_refs`는 벡터를 지울 레코드이다. (FR-DEL-5, FR-DEL-6)
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ForgetPlan {
+    pub counts: ForgetCounts,
+    pub jobs: Vec<EmbedJob>,
+    pub vector_refs: Vec<(RecordKind, String)>,
+}
+
 pub struct RecordStore {
     conn: Connection,
 }
@@ -524,6 +555,49 @@ impl RecordStore {
             results: count("results")?,
             embed_jobs: count("embed_jobs")?,
         })
+    }
+
+    /// 저장소 전체의 세션, 턴, 반복, 결과 수. 프로젝트 삭제의 미리 보기에 쓴다. (FR-DEL-4)
+    pub fn totals(&self) -> Result<ForgetCounts> {
+        let count = |sql: &str| -> Result<u64> {
+            let n: i64 = self.conn.query_row(sql, [], |r| r.get(0))?;
+            Ok(n.unsigned_abs())
+        };
+        Ok(ForgetCounts {
+            sessions: count(
+                "SELECT COUNT(*) FROM (SELECT session_id FROM iterations UNION SELECT session_id FROM sessions)",
+            )?,
+            turns: count("SELECT COUNT(DISTINCT prompt_id) FROM iterations")?,
+            iterations: count("SELECT COUNT(*) FROM iterations")?,
+            results: count("SELECT COUNT(*) FROM results")?,
+        })
+    }
+
+    /// 삭제 대상이 이 저장소에 있는가. 세션은 반복이나 수집 위치가 있으면 있다. (FR-DEL-2, FR-DEL-3)
+    pub fn contains(&self, target: &ForgetTarget) -> Result<bool> {
+        let (sql, id) = match target {
+            ForgetTarget::Session(id) => (
+                "SELECT EXISTS (SELECT 1 FROM iterations WHERE session_id = ?1)
+                 OR EXISTS (SELECT 1 FROM sessions WHERE session_id = ?1)",
+                id,
+            ),
+            ForgetTarget::Prompt(id) => (
+                "SELECT EXISTS (SELECT 1 FROM iterations WHERE prompt_id = ?1)",
+                id,
+            ),
+        };
+        Ok(self.conn.query_row(sql, [id], |r| r.get(0))?)
+    }
+
+    /// 대상을 한 트랜잭션으로 지운다. `dry_run`이면 같은 과정을 거친 뒤 되돌려, 미리 보기와 실제 삭제가
+    /// 같은 대상 선정 규칙을 쓰게 한다. (FR-DEL-2, FR-DEL-3, FR-DEL-5, FR-DEL-6)
+    pub fn forget(&mut self, target: &ForgetTarget, dry_run: bool) -> Result<ForgetPlan> {
+        let tx = self.conn.transaction()?;
+        let plan = forget_in(&tx, target)?;
+        if !dry_run {
+            tx.commit()?;
+        }
+        Ok(plan)
     }
 
     fn search_fts(
@@ -896,6 +970,135 @@ fn merge_attached(conn: &mut Connection, enqueue: bool) -> Result<MergeReport> {
     )?;
     tx.commit()?;
     Ok(report)
+}
+
+const FORGET_TABLES: &str = "
+DROP TABLE IF EXISTS temp.del_it; DROP TABLE IF EXISTS temp.del_bg; DROP TABLE IF EXISTS temp.del_done;
+DROP TABLE IF EXISTS temp.cand_res; DROP TABLE IF EXISTS temp.del_res;
+";
+
+/// 대상을 임시 테이블로 정한 뒤 지운다. FTS 행은 원래 텍스트와 함께 지우고, 색인에 없는 행
+/// (`indexed = 0`인 결과)에는 delete 명령을 보내지 않는다. (FR-DEL-2, FR-DEL-3, FR-DEL-5)
+fn forget_in(tx: &Transaction, target: &ForgetTarget) -> Result<ForgetPlan> {
+    let (column, id, session) = match target {
+        ForgetTarget::Session(id) => ("session_id", id.as_str(), Some(id.as_str())),
+        ForgetTarget::Prompt(id) => ("prompt_id", id.as_str(), None),
+    };
+    tx.execute_batch(&format!(
+        "{FORGET_TABLES}
+         CREATE TEMP TABLE del_it (id TEXT PRIMARY KEY);
+         CREATE TEMP TABLE del_bg (tool_use_id TEXT PRIMARY KEY);
+         CREATE TEMP TABLE del_done (line_uuid TEXT PRIMARY KEY);
+         CREATE TEMP TABLE cand_res (id TEXT PRIMARY KEY);
+         CREATE TEMP TABLE del_res (id TEXT PRIMARY KEY);"
+    ))?;
+    tx.execute(
+        &format!("INSERT INTO temp.del_it SELECT id FROM iterations WHERE {column} = ?1"),
+        [id],
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO temp.del_bg SELECT tool_use_id FROM bg_tasks
+         WHERE iteration_id IN (SELECT id FROM temp.del_it) OR session_id = ?1",
+        params![session],
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO temp.del_done SELECT line_uuid FROM bg_completions
+         WHERE tool_use_id IN (SELECT tool_use_id FROM temp.del_bg) OR session_id = ?1",
+        params![session],
+    )?;
+    tx.execute_batch(
+        "INSERT OR IGNORE INTO temp.cand_res SELECT result_id FROM iteration_results
+             WHERE iteration_id IN (SELECT id FROM temp.del_it);
+         INSERT OR IGNORE INTO temp.cand_res SELECT result_id FROM bg_completions
+             WHERE line_uuid IN (SELECT line_uuid FROM temp.del_done) AND result_id IS NOT NULL;
+         DELETE FROM iteration_results WHERE iteration_id IN (SELECT id FROM temp.del_it);
+         DELETE FROM bg_completions WHERE line_uuid IN (SELECT line_uuid FROM temp.del_done);
+         DELETE FROM bg_tasks WHERE tool_use_id IN (SELECT tool_use_id FROM temp.del_bg);
+         INSERT INTO temp.del_res SELECT c.id FROM temp.cand_res c
+             WHERE EXISTS (SELECT 1 FROM results WHERE id = c.id)
+               AND NOT EXISTS (SELECT 1 FROM iteration_results WHERE result_id = c.id)
+               AND NOT EXISTS (SELECT 1 FROM bg_completions WHERE result_id = c.id);",
+    )?;
+    let count = |sql: &str| -> Result<u64> {
+        let n: i64 = tx.query_row(sql, [], |r| r.get(0))?;
+        Ok(n.unsigned_abs())
+    };
+    let sessions: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM (SELECT session_id FROM iterations WHERE id IN (SELECT id FROM temp.del_it)
+         UNION SELECT session_id FROM sessions WHERE session_id = ?1)",
+        params![session],
+        |r| r.get(0),
+    )?;
+    let counts = ForgetCounts {
+        sessions: sessions.unsigned_abs(),
+        turns: count(
+            "SELECT COUNT(DISTINCT prompt_id) FROM iterations WHERE id IN (SELECT id FROM temp.del_it)",
+        )?,
+        iterations: count("SELECT COUNT(*) FROM temp.del_it")?,
+        results: count("SELECT COUNT(*) FROM temp.del_res")?,
+    };
+    let ids = |sql: &str| -> Result<Vec<String>> {
+        let mut stmt = tx.prepare(sql)?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
+    };
+    let iterations = ids("SELECT id FROM temp.del_it ORDER BY id")?;
+    let results = ids("SELECT id FROM temp.del_res ORDER BY id")?;
+    let jobs = {
+        let mut stmt = tx.prepare(
+            "SELECT kind, ref_id FROM embed_jobs
+             WHERE (kind = ?1 AND ref_id IN (SELECT id FROM temp.del_it))
+                OR (kind = ?2 AND ref_id IN (SELECT id FROM temp.del_res))
+             ORDER BY enqueued_at, rowid",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                job_kind_str(RecordKind::Iteration),
+                job_kind_str(RecordKind::Result)
+            ],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter_map(|(kind, ref_id)| {
+                Some(EmbedJob {
+                    kind: job_kind_from_str(&kind)?,
+                    ref_id,
+                })
+            })
+            .collect()
+    };
+    tx.execute(
+        "DELETE FROM embed_jobs
+         WHERE (kind = ?1 AND ref_id IN (SELECT id FROM temp.del_it))
+            OR (kind = ?2 AND ref_id IN (SELECT id FROM temp.del_res))",
+        params![
+            job_kind_str(RecordKind::Iteration),
+            job_kind_str(RecordKind::Result)
+        ],
+    )?;
+    tx.execute_batch(&format!(
+        "INSERT INTO iterations_fts (iterations_fts, rowid, embed_text)
+             SELECT 'delete', rowid, embed_text FROM iterations WHERE id IN (SELECT id FROM temp.del_it);
+         INSERT INTO results_fts (results_fts, rowid, text)
+             SELECT 'delete', rowid, text FROM results WHERE id IN (SELECT id FROM temp.del_res) AND indexed = 1;
+         DELETE FROM iterations WHERE id IN (SELECT id FROM temp.del_it);
+         DELETE FROM results WHERE id IN (SELECT id FROM temp.del_res);
+         {FORGET_TABLES}"
+    ))?;
+    if let Some(session) = session {
+        tx.execute("DELETE FROM sessions WHERE session_id = ?1", [session])?;
+    }
+    let vector_refs = iterations
+        .into_iter()
+        .map(|id| (RecordKind::Iteration, id))
+        .chain(results.into_iter().map(|id| (RecordKind::Result, id)))
+        .collect();
+    Ok(ForgetPlan {
+        counts,
+        jobs,
+        vector_refs,
+    })
 }
 
 /// 3자 이상 토큰을 따옴표로 감싸 OR로 묶는다. (FR-STO-8)

@@ -8,15 +8,18 @@ use crate::i18n::Lang;
 use crate::import::Candidate;
 use crate::ingest::{ImportOutcome, IngestRequest};
 use crate::search::{SearchKind, escape_control};
+use crate::store::{ForgetCounts, ForgetTarget};
 use crate::tr;
 
-/// 요청이 다룰 프로젝트. `Project`는 요청의 `cwd`가 속한 프로젝트, `Path`는 그 경로가 속한 프로젝트이다. (IF-CLI-1)
+/// 요청이 다룰 프로젝트. `Project`는 요청의 `cwd`가 속한 프로젝트, `Path`는 그 경로가 속한 프로젝트,
+/// `Id`는 그 id의 프로젝트이다. (IF-CLI-1, IF-SK-2)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "path", rename_all = "snake_case")]
 pub enum Scope {
     Project,
     All,
     Path(String),
+    Id(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -67,6 +70,29 @@ pub enum Request {
     },
     /// 데몬을 유휴 종료와 같은 경로로 끝낸다. (FR-DMN-11)
     Shutdown,
+    /// 프로젝트를 통째로 지운다. `project`는 프로젝트 id 또는 경로이다. (FR-DEL-1, IF-CLI-11)
+    ProjectRemove {
+        project: String,
+        cwd: String,
+        #[serde(default)]
+        dry_run: bool,
+    },
+    /// 세션 또는 턴을 지운다. 프로젝트를 찾는 순서는 `show`와 같다. (FR-DEL-2, FR-DEL-3, IF-CLI-12)
+    Forget {
+        target: ForgetTarget,
+        scope: Option<Scope>,
+        cwd: String,
+        #[serde(default)]
+        dry_run: bool,
+    },
+}
+
+/// 삭제 요청의 응답 내용. (FR-DEL-4)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteReport {
+    pub project_id: String,
+    pub location: String,
+    pub counts: ForgetCounts,
 }
 
 /// `import_session`의 응답. (FR-IMP-7)
@@ -123,6 +149,10 @@ pub enum Response {
         sessions: Vec<Candidate>,
     },
     ImportSession(ImportSessionReport),
+    /// 삭제 미리 보기 또는 결과. 대상이 없으면 `None`. (FR-DEL-4)
+    Delete {
+        report: Option<DeleteReport>,
+    },
     Error {
         message: String,
     },

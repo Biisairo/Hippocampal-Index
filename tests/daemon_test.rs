@@ -2220,3 +2220,327 @@ fn reindexed_lancedb_generation_keeps_one_version() {
     assert_eq!(p.count().unwrap(), 4);
     handle.shutdown();
 }
+
+// ---- SRS 3.2.13 삭제 (FR-DEL), IF-SK-2 ----
+
+use hippo::protocol::DeleteReport;
+use hippo::store::ForgetTarget;
+
+fn delete_report(resp: Response) -> Option<DeleteReport> {
+    match resp {
+        Response::Delete { report } => report,
+        other => panic!("{other:?}"),
+    }
+}
+
+fn forget_req(target: ForgetTarget, scope: Option<Scope>, dry_run: bool) -> Request {
+    Request::Forget {
+        target,
+        scope,
+        cwd: "/".into(),
+        dry_run,
+    }
+}
+
+fn remove_req(project: &str, dry_run: bool) -> Request {
+    Request::ProjectRemove {
+        project: project.into(),
+        cwd: "/".into(),
+        dry_run,
+    }
+}
+
+#[test]
+fn project_remove_deletes_everything_and_same_path_becomes_new_project() {
+    let e = env();
+    let handle = launch_with(
+        &e.paths,
+        Arc::new(MemoryVectorStore::default()),
+        config_with("[index]\njob_batch = 1\n[import]\ntranscripts_dir = \"/nonexistent/hippo-test-transcripts\"\n"),
+    )
+    .unwrap();
+    assert_eq!(
+        ingest(&e.paths, &e.transcript, HookEvent::Stop),
+        Response::Done
+    );
+    let id = only_project(&e.paths);
+    let dir = e.paths.project_dir(&id);
+    assert!(dir.exists());
+
+    let preview =
+        delete_report(request(&e.paths.socket(), &remove_req(&id, true), TIMEOUT).unwrap())
+            .expect("대상 있음");
+    assert_eq!(preview.project_id, id);
+    assert_eq!(preview.location, s2_cwd());
+    assert_eq!(preview.counts.sessions, 1);
+    assert_eq!(preview.counts.iterations, 2);
+    assert_eq!(status(&e.paths).projects.len(), 1, "dry_run은 바꾸지 않음");
+
+    let path_req = Request::ProjectRemove {
+        project: s2_cwd(),
+        cwd: "/".into(),
+        dry_run: false,
+    };
+    let done = delete_report(request(&e.paths.socket(), &path_req, TIMEOUT).unwrap())
+        .expect("경로로도 찾음");
+    assert_eq!(done.counts, preview.counts);
+    assert!(status(&e.paths).projects.is_empty());
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !dir.exists(),
+        "큐에 남은 작업이 디렉터리를 다시 만들지 않음"
+    );
+    assert_eq!(
+        delete_report(request(&e.paths.socket(), &remove_req(&id, false), TIMEOUT).unwrap()),
+        None
+    );
+
+    assert_eq!(
+        ingest(&e.paths, &e.transcript, HookEvent::Stop),
+        Response::Done
+    );
+    let again = only_project(&e.paths);
+    assert_ne!(again, id, "같은 경로의 새 세션은 새 프로젝트");
+    assert_eq!(totals(&status(&e.paths)).0, 2);
+    handle.shutdown();
+}
+
+#[test]
+fn forget_session_removes_records_and_vectors_and_hook_saves_again() {
+    let e = env();
+    let vectors = Arc::new(MemoryVectorStore::default());
+    let handle = launch(&e.paths, vectors.clone()).unwrap();
+    ingest(&e.paths, &e.transcript, HookEvent::Stop);
+    wait_until(|| totals(&status(&e.paths)).1 == 0);
+    assert!(vectors.count().unwrap() > 0);
+    let target = ForgetTarget::Session(S2.into());
+
+    let preview = delete_report(
+        request(
+            &e.paths.socket(),
+            &forget_req(target.clone(), None, true),
+            TIMEOUT,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(preview.counts.sessions, 1);
+    assert_eq!(preview.counts.iterations, 2);
+    assert_eq!(totals(&status(&e.paths)).0, 2, "dry_run은 바꾸지 않음");
+
+    let done = delete_report(
+        request(
+            &e.paths.socket(),
+            &forget_req(target.clone(), None, false),
+            TIMEOUT,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(done.counts, preview.counts);
+    let st = status(&e.paths);
+    assert_eq!(st.projects.len(), 1, "세션 삭제는 프로젝트를 남김");
+    assert_eq!(totals(&st), (0, 0, 0), "반복, 작업, 벡터(모든 청크)");
+    assert_eq!(vectors.count().unwrap(), 0);
+    assert_eq!(st.projects[0].results, 0);
+    assert_eq!(
+        delete_report(
+            request(&e.paths.socket(), &forget_req(target, None, false), TIMEOUT).unwrap()
+        ),
+        None,
+        "대상 없음"
+    );
+
+    assert_eq!(
+        ingest(&e.paths, &e.transcript, HookEvent::Stop),
+        Response::Done
+    );
+    assert_eq!(
+        totals(&status(&e.paths)).0,
+        2,
+        "기준 턴부터 다시 저장 (FR-EXT-12)"
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn forget_prompt_uses_show_lookup_order_and_project_id_scope() {
+    let (e, handle, a, b) = two_project_env();
+    let st = status(&e.paths);
+    let (ia, ib) = (
+        project_at(&st, &a).id.clone(),
+        project_at(&st, &b).id.clone(),
+    );
+    let target = ForgetTarget::Prompt(prompt_of("sa"));
+    assert_eq!(
+        delete_report(
+            request(
+                &e.paths.socket(),
+                &forget_req(target.clone(), Some(Scope::Id(ib.clone())), false),
+                TIMEOUT
+            )
+            .unwrap()
+        ),
+        None,
+        "다른 프로젝트 범위에서는 대상 없음"
+    );
+    let found = Request::Forget {
+        target: target.clone(),
+        scope: None,
+        cwd: s(&b),
+        dry_run: true,
+    };
+    let preview = delete_report(request(&e.paths.socket(), &found, TIMEOUT).unwrap()).unwrap();
+    assert_eq!(
+        preview.project_id, ia,
+        "현재 프로젝트에 없으면 나머지에서 찾음"
+    );
+    let done = delete_report(
+        request(
+            &e.paths.socket(),
+            &forget_req(target, Some(Scope::Id(ia.clone())), false),
+            TIMEOUT,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(done.counts.turns, 1);
+    let st = status(&e.paths);
+    assert_eq!(project_at(&st, &a).iterations, 0);
+    assert_eq!(project_at(&st, &b).iterations, 2, "다른 프로젝트는 그대로");
+    let records = RecordStore::open(&e.paths.project_records(&ia)).unwrap();
+    assert!(
+        records.session_state("sa").unwrap().is_some(),
+        "턴 삭제는 수집 위치를 남김"
+    );
+    assert!(
+        text(
+            request(
+                &e.paths.socket(),
+                &search_req("병렬로", Scope::Id(ib), "/"),
+                TIMEOUT
+            )
+            .unwrap()
+        )
+        .contains("[iteration]"),
+        "프로젝트 id 범위 검색"
+    );
+    assert!(
+        text(
+            request(
+                &e.paths.socket(),
+                &search_req("병렬로", Scope::Id("0".repeat(32)), "/"),
+                TIMEOUT
+            )
+            .unwrap()
+        )
+        .contains("No project")
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn delete_is_rejected_while_reindexing() {
+    let e = env();
+    let embedder: Arc<dyn Embedder> = Arc::new(SlowEmbedder(HashEmbedder::new(256, 8_000)));
+    let handle = start(
+        e.paths.clone(),
+        config(),
+        embedder,
+        memory_source(&e.paths, Arc::new(MemoryVectorStore::default())),
+    )
+    .unwrap();
+    ingest(&e.paths, &e.transcript, HookEvent::Stop);
+    let id = only_project(&e.paths);
+    assert_eq!(
+        request(&e.paths.socket(), &reindex_all(), TIMEOUT).unwrap(),
+        Response::Done
+    );
+    for req in [
+        remove_req(&id, false),
+        forget_req(ForgetTarget::Session(S2.into()), None, false),
+    ] {
+        assert!(
+            matches!(
+                request(&e.paths.socket(), &req, TIMEOUT).unwrap(),
+                Response::Error { .. }
+            ),
+            "{req:?}"
+        );
+    }
+    assert_eq!(wait_reindex(&e.paths).reindex, "done");
+    assert_eq!(totals(&status(&e.paths)).0, 2);
+    handle.shutdown();
+}
+
+/// 웜업이 아닌 첫 임베딩에서 `release`가 참이 될 때까지 멈춘다.
+struct GatedEmbedder {
+    inner: HashEmbedder,
+    entered: Arc<std::sync::atomic::AtomicBool>,
+    release: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Embedder for GatedEmbedder {
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+    fn dimension(&self) -> usize {
+        self.inner.dimension()
+    }
+    fn max_input_tokens(&self) -> usize {
+        self.inner.max_input_tokens()
+    }
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, hippo::embedder::EmbedError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if texts.first().is_some_and(|t| t != "warmup") {
+            self.entered.store(true, SeqCst);
+            while !self.release.load(SeqCst) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        self.inner.embed(texts)
+    }
+}
+
+#[test]
+fn in_flight_embedding_batch_does_not_store_vectors_of_forgotten_records() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    let e = env();
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let vectors = Arc::new(MemoryVectorStore::default());
+    let handle = start(
+        e.paths.clone(),
+        config(),
+        Arc::new(GatedEmbedder {
+            inner: HashEmbedder::new(256, 8_000),
+            entered: entered.clone(),
+            release: release.clone(),
+        }),
+        memory_source(&e.paths, vectors.clone()),
+    )
+    .unwrap();
+    ingest(&e.paths, &e.transcript, HookEvent::Stop);
+    wait_until(|| entered.load(SeqCst));
+    let socket = e.paths.socket();
+    let forget = std::thread::spawn(move || {
+        request(
+            &socket,
+            &forget_req(ForgetTarget::Session(S2.into()), None, false),
+            TIMEOUT,
+        )
+        .unwrap()
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!forget.is_finished(), "처리 중인 묶음이 끝나기를 기다림");
+    release.store(true, SeqCst);
+    assert!(delete_report(forget.join().unwrap()).is_some());
+    wait_until(|| totals(&status(&e.paths)).1 == 0);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        vectors.count().unwrap(),
+        0,
+        "지운 레코드의 벡터가 남지 않음"
+    );
+    handle.shutdown();
+}

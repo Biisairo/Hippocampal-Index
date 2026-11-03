@@ -245,3 +245,38 @@ fn file_registry_persists_and_is_owner_only() {
     let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
 }
+
+// ---- FR-DEL-1, FR-DEL-2 ----
+
+#[test]
+fn remove_project_deletes_rows_and_same_location_becomes_new_project() {
+    let mut r = Registry::open_in_memory().unwrap();
+    let a = r
+        .resolve(&git_loc("/gone/a/.git", "/gone/a", &["root-a"]), 1)
+        .unwrap();
+    let b = r.resolve(&dir_loc("/gone/b"), 2).unwrap();
+    r.bind_session("sa", &a).unwrap();
+    r.bind_session("sb", &b).unwrap();
+    assert!(r.remove_project(&a).unwrap());
+    assert!(r.project(&a).unwrap().is_none());
+    assert!(r.root_commits(&a).unwrap().is_empty());
+    assert_eq!(r.session_project("sa").unwrap(), None);
+    assert_eq!(r.session_project("sb").unwrap(), Some(b.clone()));
+    assert!(!r.remove_project(&a).unwrap(), "두 번째는 대상 없음");
+    let again = r
+        .resolve(&git_loc("/gone/a/.git", "/gone/a", &["root-a"]), 3)
+        .unwrap();
+    assert_ne!(again, a);
+}
+
+#[test]
+fn unbind_session_removes_only_binding_to_that_project() {
+    let mut r = Registry::open_in_memory().unwrap();
+    let a = r.resolve(&dir_loc("/gone/a"), 1).unwrap();
+    let b = r.resolve(&dir_loc("/gone/b"), 2).unwrap();
+    r.bind_session("s", &a).unwrap();
+    r.unbind_session("s", &b).unwrap();
+    assert_eq!(r.session_project("s").unwrap(), Some(a.clone()));
+    r.unbind_session("s", &a).unwrap();
+    assert_eq!(r.session_project("s").unwrap(), None);
+}

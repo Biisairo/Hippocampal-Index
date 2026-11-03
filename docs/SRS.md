@@ -2,7 +2,7 @@
 
 | 항목 | 값 |
 |------|----|
-| 문서 버전 | 0.15 (LanceDB 버전 누적 결함 수정: 묶음 저장과 주기 정리. 0.14의 삭제·기록 탭 요구사항 포함) |
+| 문서 버전 | 0.16 (요청 범위에 프로젝트 id 추가. 0.15의 LanceDB 버전 누적 결함 수정, 0.14의 삭제·기록 탭 요구사항 포함) |
 | 작성일 | 2026-11-04 |
 | 작성자 | biisairo |
 | 준거 표준 | ISO/IEC/IEEE 29148:2018 |
@@ -175,7 +175,7 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 | ID | 요구사항 | 우선순위 |
 |----|----------|----------|
 | IF-SK-1 | 데몬은 `~/.hippo/hippo.sock` Unix socket으로 줄 단위 JSON 요청과 응답을 주고받아야 한다. | M |
-| IF-SK-2 | 요청 종류는 `ingest`(hook 이벤트 전달), `inject`(자동 주입 텍스트 생성), `search`, `show`, `status`, `reindex`, `project_list`, `import_prepare`, `import_session`, `shutdown`, `project_remove`, `forget`(FR-DEL-1~3. 둘 다 `dry_run` 필드를 가진다), `session_list`, `turn_list`, `turn_detail`, `inject_preview`(FR-GUI-13~16)이다. `ingest`와 `shutdown`을 뺀 요청은 판정에 쓸 `cwd`를 담는다. `import_prepare`는 `dry_run`(생략하면 false) 필드를 가진다. 새로 더한 필드는 생략할 수 있어 이전 클라이언트의 요청도 그대로 해석된다. 연결 하나에 요청 하나, 응답 하나를 주고받는다. | M |
+| IF-SK-2 | 요청 종류는 `ingest`(hook 이벤트 전달), `inject`(자동 주입 텍스트 생성), `search`, `show`, `status`, `reindex`, `project_list`, `import_prepare`, `import_session`, `shutdown`, `project_remove`, `forget`(FR-DEL-1~3. 둘 다 `dry_run` 필드를 가진다), `session_list`, `turn_list`, `turn_detail`, `inject_preview`(FR-GUI-13~16)이다. `ingest`와 `shutdown`을 뺀 요청은 판정에 쓸 `cwd`를 담는다. 요청의 범위(`scope`)는 `project`, `all`, 경로 외에 프로젝트 id(`id`)도 받는다. 프로젝트 id 범위는 목록 DB에 그 id가 있으면 그 프로젝트이고, 없으면 "프로젝트 없음"이다. GUI는 선택한 프로젝트를 이 범위로 지정한다. `import_prepare`는 `dry_run`(생략하면 false) 필드를 가진다. 새로 더한 필드는 생략할 수 있어 이전 클라이언트의 요청도 그대로 해석된다. 연결 하나에 요청 하나, 응답 하나를 주고받는다. | M |
 
 #### 3.1.4 Claude 안내문
 | ID | 요구사항 | 우선순위 |

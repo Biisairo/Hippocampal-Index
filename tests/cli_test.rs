@@ -576,3 +576,106 @@ fn project_commands_and_scopes_use_current_directory() {
         "{status}"
     );
 }
+
+// ---- IF-CLI-11, IF-CLI-12, FR-DEL-4 ----
+
+#[test]
+fn forget_and_project_remove_confirm_and_report() {
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let root = dir.path().join("root");
+    let work = fs::canonicalize(dir.path()).unwrap().join("work");
+    fs::create_dir_all(&work).unwrap();
+    let _daemon = spawn_daemon(&root);
+    let session = "afd070e6-4625-4b31-8c43-f1f553949222";
+    let prompt = "8f64252a-0037-484d-a451-35aa2c0076ed";
+    let fixture = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/s2_tools.jsonl"),
+    )
+    .unwrap();
+    let body: String = fixture
+        .lines()
+        .map(|l| {
+            let mut v: Value = serde_json::from_str(l).unwrap();
+            if v.get("cwd").is_some() {
+                v["cwd"] = Value::String(work.to_string_lossy().into_owned());
+            }
+            format!("{v}\n")
+        })
+        .collect();
+    let transcript = dir.path().join("s.jsonl");
+    fs::write(&transcript, &body).unwrap();
+    let input = serde_json::json!({"session_id": session, "transcript_path": transcript, "cwd": work, "prompt_id": prompt}).to_string();
+    assert!(hippo(&root, &["hook", "stop"], &input).status.success());
+    let iterations = |n: u32| {
+        let list = stdout(&hippo(&root, &["project", "list"], ""));
+        assert!(list.contains(&format!("iterations={n}")), "{list}");
+    };
+    iterations(2);
+
+    let preview = stdout(&hippo(
+        &root,
+        &["forget", "--session", session, "--dry-run"],
+        "",
+    ));
+    assert!(preview.contains(&*work.to_string_lossy()), "{preview}");
+    assert!(preview.contains("iterations: 2"), "{preview}");
+    iterations(2);
+
+    let refused = hippo(&root, &["forget", "--session", session], "y\n");
+    assert_eq!(refused.status.code(), Some(1), "터미널이 아니고 --yes 없음");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("--yes"),
+        "{refused:?}"
+    );
+    iterations(2);
+
+    let both = hippo(
+        &root,
+        &["forget", "--session", session, "--prompt", prompt],
+        "",
+    );
+    assert!(!both.status.success(), "둘 중 하나만 받음");
+    assert!(!hippo(&root, &["forget"], "").status.success());
+
+    let done = stdout(&hippo_in(
+        &root,
+        &work,
+        &["forget", "--prompt", prompt, "--scope", "project", "--yes"],
+        "",
+    ));
+    assert!(done.contains("Deleted"), "{done}");
+    iterations(0);
+    let none = stdout(&hippo(&root, &["forget", "--prompt", prompt, "--yes"], ""));
+    assert!(none.contains("Nothing to delete"), "{none}");
+
+    let project_preview = stdout(&hippo_in(
+        &root,
+        &work,
+        &["project", "remove", ".", "--dry-run"],
+        "",
+    ));
+    assert!(
+        project_preview.contains("sessions: 1"),
+        "수집 위치는 남아 있음: {project_preview}"
+    );
+    let removed = stdout(&hippo_in(
+        &root,
+        &work,
+        &["project", "remove", ".", "--yes"],
+        "",
+    ));
+    assert!(removed.contains("Deleted"), "{removed}");
+    let list = stdout(&hippo(&root, &["project", "list"], ""));
+    assert!(list.contains("No project"), "{list}");
+    let missing = stdout(&hippo(
+        &root,
+        &[
+            "project",
+            "remove",
+            "0123456789abcdef0123456789abcdef",
+            "--yes",
+        ],
+        "",
+    ));
+    assert!(missing.contains("Nothing to delete"), "{missing}");
+}

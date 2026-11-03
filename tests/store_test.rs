@@ -825,3 +825,324 @@ fn merge_keeps_hippo_call_results_unindexed() {
         .count();
     assert_eq!(queued_results, 1, "hippo 결과는 임베딩 작업도 만들지 않음");
 }
+
+// ---- FR-DEL-2, FR-DEL-3, FR-DEL-5, FR-DEL-6 ----
+
+use hippo::store::{ForgetCounts, ForgetTarget};
+
+fn with_prompt(mut it: NewIteration, prompt: &str, index: u32) -> NewIteration {
+    it.iteration.prompt_id = Some(prompt.into());
+    it.iteration.iteration_index = index;
+    it
+}
+
+/// FTS 색인이 원본 테이블과 일치하는지. 색인에 없는 행을 delete 명령으로 지우면 실패한다.
+/// `indexed = 0`인 결과는 원래 색인에 없으므로, 그런 행이 있으면 `results_fts`는 색인 자체만 검사한다.
+fn assert_fts_intact(path: &std::path::Path) {
+    let conn = Connection::open(path).unwrap();
+    let unindexed: i64 = conn
+        .query_row("SELECT COUNT(*) FROM results WHERE indexed = 0", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    for (fts, rank) in [
+        ("iterations_fts", 1),
+        ("results_fts", i32::from(unindexed == 0)),
+    ] {
+        conn.execute(
+            &format!("INSERT INTO {fts}({fts}, rank) VALUES('integrity-check', {rank})"),
+            [],
+        )
+        .unwrap_or_else(|e| panic!("{fts}: {e}"));
+    }
+}
+
+fn count(path: &std::path::Path, sql: &str) -> i64 {
+    Connection::open(path)
+        .unwrap()
+        .query_row(sql, [], |r| r.get(0))
+        .unwrap()
+}
+
+/// s1: 턴 pa(반복 2개), pb(반복 1개). s2: 턴 pa의 fork 복사본(반복 1개), 턴 pc.
+/// `sharedOut`은 s1과 s2가 함께 참조하고, `onlyS1Out`은 s1만 참조한다.
+fn forget_store(dir: &std::path::Path) -> (std::path::PathBuf, RecordStore) {
+    let path = dir.join("records.sqlite");
+    let mut store = RecordStore::open(&path).unwrap();
+    store
+        .apply(&batch(
+            "s1",
+            vec![
+                with_prompt(
+                    synthetic(
+                        "s1",
+                        "m1",
+                        "/w",
+                        "alphaTurnText",
+                        &[("t1", "sharedOut body")],
+                    ),
+                    "pa",
+                    0,
+                ),
+                with_prompt(
+                    synthetic("s1", "m2", "/w", "alphaSecond", &[("t2", "onlyS1Out body")]),
+                    "pa",
+                    1,
+                ),
+                with_prompt(synthetic("s1", "m3", "/w", "betaTurnText", &[]), "pb", 0),
+                hippo_iteration("s1", "m4"),
+            ],
+            vec![],
+        ))
+        .unwrap();
+    store
+        .apply(&batch(
+            "s2",
+            vec![
+                with_prompt(
+                    synthetic(
+                        "s2",
+                        "f1",
+                        "/w",
+                        "alphaForkCopy",
+                        &[("t3", "sharedOut body")],
+                    ),
+                    "pa",
+                    0,
+                ),
+                with_prompt(synthetic("s2", "m5", "/w", "gammaTurnText", &[]), "pc", 0),
+            ],
+            vec![],
+        ))
+        .unwrap();
+    (path, store)
+}
+
+fn fts_ids(store: &RecordStore, q: &str) -> Vec<String> {
+    ids(store
+        .search_iterations_fts(q, &FtsFilter::default(), 50)
+        .unwrap())
+}
+
+#[test]
+fn forget_session_removes_its_records_and_keeps_shared_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, mut store) = forget_store(dir.path());
+    let shared_id = store.iteration("s2:f1").unwrap().unwrap().tool_calls[0]
+        .result_id
+        .clone()
+        .unwrap();
+    let only_id = store.iteration("s1:m2").unwrap().unwrap().tool_calls[0]
+        .result_id
+        .clone()
+        .unwrap();
+    let target = ForgetTarget::Session("s1".into());
+    assert!(store.contains(&target).unwrap());
+
+    let plan = store.forget(&target, false).unwrap();
+    assert_eq!(
+        plan.counts,
+        ForgetCounts {
+            sessions: 1,
+            turns: 3,
+            iterations: 4,
+            results: 3,
+        },
+        "결과: onlyS1Out, hippo 결과 2개(Bash, Read). sharedOut은 s2가 참조"
+    );
+    for id in ["s1:m1", "s1:m2", "s1:m3", "s1:m4"] {
+        assert!(store.iteration(id).unwrap().is_none(), "{id}");
+        assert!(
+            plan.vector_refs
+                .contains(&(RecordKind::Iteration, id.to_string())),
+            "{id}"
+        );
+    }
+    assert!(
+        plan.vector_refs
+            .contains(&(RecordKind::Result, only_id.clone()))
+    );
+    assert!(
+        !plan
+            .vector_refs
+            .contains(&(RecordKind::Result, shared_id.clone()))
+    );
+    assert!(store.result(&only_id).unwrap().is_none());
+    assert!(store.result(&shared_id).unwrap().is_some());
+    assert_eq!(
+        store.iterations_referencing_result(&shared_id).unwrap(),
+        vec!["s2:f1"]
+    );
+    assert!(
+        store.session_state("s1").unwrap().is_none(),
+        "수집 위치 삭제"
+    );
+    assert!(store.session_state("s2").unwrap().is_some());
+    assert!(fts_ids(&store, "alphaTurnText").is_empty());
+    assert_eq!(fts_ids(&store, "alphaForkCopy"), vec!["s2:f1"]);
+    let results_fts = |q: &str| {
+        store
+            .search_results_fts(q, &FtsFilter::default(), 10)
+            .unwrap()
+            .len()
+    };
+    assert_eq!(results_fts("onlyS1Out"), 0);
+    assert_eq!(results_fts("sharedOut"), 1);
+    let jobs: Vec<String> = store
+        .embed_jobs(100)
+        .unwrap()
+        .into_iter()
+        .map(|j| j.ref_id)
+        .collect();
+    assert!(
+        jobs.iter().all(|j| !j.starts_with("s1:") && *j != only_id),
+        "{jobs:?}"
+    );
+    let removed_jobs: Vec<&str> = plan.jobs.iter().map(|j| j.ref_id.as_str()).collect();
+    assert!(removed_jobs.contains(&"s1:m1") && removed_jobs.contains(&only_id.as_str()));
+    assert_eq!(
+        count(
+            &path,
+            "SELECT COUNT(*) FROM iteration_results WHERE iteration_id LIKE 's1:%'"
+        ),
+        0
+    );
+    assert_fts_intact(&path);
+}
+
+#[test]
+fn forget_prompt_removes_turn_in_every_session_and_keeps_session_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, mut store) = forget_store(dir.path());
+    let shared_id = store.iteration("s2:f1").unwrap().unwrap().tool_calls[0]
+        .result_id
+        .clone()
+        .unwrap();
+    let plan = store
+        .forget(&ForgetTarget::Prompt("pa".into()), false)
+        .unwrap();
+    assert_eq!(
+        plan.counts,
+        ForgetCounts {
+            sessions: 2,
+            turns: 1,
+            iterations: 3,
+            results: 2,
+        }
+    );
+    assert!(store.iterations_for_prompt("pa").unwrap().is_empty());
+    assert_eq!(store.iterations_for_prompt("pb").unwrap().len(), 1);
+    assert_eq!(store.iterations_for_prompt("pc").unwrap().len(), 1);
+    assert!(
+        store.result(&shared_id).unwrap().is_none(),
+        "참조가 모두 없어짐"
+    );
+    assert!(store.session_state("s1").unwrap().is_some());
+    assert!(store.session_state("s2").unwrap().is_some());
+    assert_fts_intact(&path);
+}
+
+#[test]
+fn forget_dry_run_changes_nothing_and_reports_same_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, mut store) = forget_store(dir.path());
+    let before = store.counts().unwrap();
+    for target in [
+        ForgetTarget::Session("s1".into()),
+        ForgetTarget::Prompt("pa".into()),
+    ] {
+        let preview = store.forget(&target, true).unwrap();
+        assert_eq!(store.counts().unwrap(), before);
+        assert_eq!(fts_ids(&store, "alphaTurnText"), vec!["s1:m1"]);
+        let (path2, mut fresh) = forget_store(&dir.path().join(format!("{target:?}")));
+        let real = fresh.forget(&target, false).unwrap();
+        assert_eq!(preview.counts, real.counts, "{target:?}");
+        let mut a = preview.vector_refs.clone();
+        let mut b = real.vector_refs.clone();
+        a.sort();
+        b.sort();
+        assert_eq!(a, b);
+        assert_fts_intact(&path2);
+    }
+    assert_fts_intact(&path);
+}
+
+#[test]
+fn forget_missing_target_reports_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, mut store) = forget_store(dir.path());
+    for target in [
+        ForgetTarget::Session("nope".into()),
+        ForgetTarget::Prompt("nope".into()),
+    ] {
+        assert!(!store.contains(&target).unwrap());
+        let plan = store.forget(&target, false).unwrap();
+        assert_eq!(plan.counts, ForgetCounts::default());
+        assert!(plan.vector_refs.is_empty() && plan.jobs.is_empty());
+    }
+}
+
+#[test]
+fn forget_removes_background_start_and_completion_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("records.sqlite");
+    let mut store = RecordStore::open(&path).unwrap();
+    let b = batch_from_fixture("s5_bg_bash.jsonl");
+    store.apply(&b).unwrap();
+    let tool_use_id = "toolu_01D9M8zTeQeTTXW1FhAmqgRV";
+    store
+        .apply(&batch(
+            &b.session_id,
+            vec![],
+            vec![completion(
+                "n1",
+                tool_use_id,
+                Some("bgOnlyOutput\n[exited with code 0]"),
+            )],
+        ))
+        .unwrap();
+    let result_id = store.bg_completions(tool_use_id).unwrap()[0]
+        .result_id
+        .clone()
+        .unwrap();
+    let prompt = b.iterations[0].iteration.prompt_id.clone().unwrap();
+    let plan = store.forget(&ForgetTarget::Prompt(prompt), false).unwrap();
+    assert!(plan.counts.results >= 1);
+    assert!(store.bg_task(tool_use_id).unwrap().is_none());
+    assert!(store.bg_completions(tool_use_id).unwrap().is_empty());
+    assert!(store.result(&result_id).unwrap().is_none());
+    assert!(plan.vector_refs.contains(&(RecordKind::Result, result_id)));
+    assert_fts_intact(&path);
+
+    let session = b.session_id.clone();
+    store.apply(&b).unwrap();
+    store
+        .apply(&batch(
+            &session,
+            vec![],
+            vec![completion("n2", tool_use_id, Some("bgOnlyOutput2"))],
+        ))
+        .unwrap();
+    store
+        .forget(&ForgetTarget::Session(session), false)
+        .unwrap();
+    assert!(store.bg_task(tool_use_id).unwrap().is_none());
+    assert!(store.bg_completions(tool_use_id).unwrap().is_empty());
+    assert_eq!(store.counts().unwrap().results, 0);
+    assert_fts_intact(&path);
+}
+
+#[test]
+fn totals_count_sessions_turns_iterations_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, store) = forget_store(dir.path());
+    assert_eq!(
+        store.totals().unwrap(),
+        ForgetCounts {
+            sessions: 2,
+            turns: 4,
+            iterations: 6,
+            results: 4,
+        }
+    );
+}

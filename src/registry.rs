@@ -210,6 +210,25 @@ impl Registry {
         tx.commit()?;
         Ok(())
     }
+
+    /// 프로젝트와 그 루트 커밋, 세션 고정값을 지운다. 프로젝트가 없었으면 false. (FR-DEL-1)
+    pub fn remove_project(&mut self, id: &str) -> Result<bool> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM session_projects WHERE project_id = ?1", [id])?;
+        tx.execute("DELETE FROM project_roots WHERE project_id = ?1", [id])?;
+        let removed = tx.execute("DELETE FROM projects WHERE id = ?1", [id])?;
+        tx.commit()?;
+        Ok(removed > 0)
+    }
+
+    /// 세션이 그 프로젝트에 고정되어 있으면 고정값을 지운다. (FR-DEL-2)
+    pub fn unbind_session(&mut self, session_id: &str, project_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM session_projects WHERE session_id = ?1 AND project_id = ?2",
+            params![session_id, project_id],
+        )?;
+        Ok(())
+    }
 }
 
 fn row_to_project(r: &rusqlite::Row) -> rusqlite::Result<ProjectRow> {

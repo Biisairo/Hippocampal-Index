@@ -28,8 +28,8 @@ use crate::ingest::{
 };
 use crate::project::{Location, locate, normalize};
 use crate::protocol::{
-    COMPAT_MISMATCH, ImportSessionReport, ProjectStatus, REINDEX_RUNNING, Request, Response, Scope,
-    StatusInfo, missing_location,
+    COMPAT_MISMATCH, DeleteReport, ImportSessionReport, ProjectStatus, REINDEX_RUNNING, Request,
+    Response, Scope, StatusInfo, missing_location,
 };
 use crate::queue::{EmbedQueue, Lane, LaneQueue};
 use crate::redact::Redactor;
@@ -40,7 +40,7 @@ use crate::search::{
     search, search_projects,
 };
 use crate::spool;
-use crate::store::{EmbedJob, RecordStore};
+use crate::store::{EmbedJob, ForgetCounts, ForgetTarget, RecordStore};
 use crate::tr;
 use crate::vector::VectorStore;
 
@@ -91,6 +91,14 @@ fn reindex_busy(lang: Lang) -> String {
     )
 }
 
+fn delete_busy(lang: Lang) -> String {
+    tr!(
+        lang,
+        "Cannot delete while reindexing",
+        "재색인 중에는 지울 수 없습니다"
+    )
+}
+
 fn shutdown_busy(lang: Lang) -> String {
     tr!(
         lang,
@@ -115,13 +123,15 @@ enum WriteJob {
         transcript_path: PathBuf,
         reply: Reply,
     },
+    /// 삭제 요청. 미리 보기도 같은 경로로 처리한다. (FR-DEL-6)
+    Delete(Request, Reply),
 }
 
 impl WriteJob {
     fn lane(&self) -> Lane {
         match self {
             Self::ImportSession { .. } => Lane::Bulk,
-            Self::Ingest(..) | Self::ImportPrepare { .. } => Lane::Normal,
+            Self::Ingest(..) | Self::ImportPrepare { .. } | Self::Delete(..) => Lane::Normal,
         }
     }
 }
@@ -264,6 +274,30 @@ impl Shared {
             Scope::All => self.project_ids(),
             Scope::Project => Ok(self.lookup(cwd)?.into_iter().collect()),
             Scope::Path(path) => Ok(self.lookup(path)?.into_iter().collect()),
+            Scope::Id(id) => Ok(lock(&self.registry)?
+                .project(id)
+                .map_err(|e| e.to_string())?
+                .map(|row| row.id)
+                .into_iter()
+                .collect()),
+        }
+    }
+
+    /// `scope`가 없으면 현재 프로젝트를 먼저, 그다음 나머지를 최근 활동 순으로 둔다. (FR-RET-7, IF-CLI-12)
+    fn lookup_order(&self, scope: Option<&Scope>, cwd: &str) -> Result<Vec<String>, String> {
+        match scope {
+            Some(scope @ (Scope::Project | Scope::Path(_) | Scope::Id(_))) => {
+                self.scope_projects(scope, cwd)
+            }
+            None | Some(Scope::All) => {
+                let mut ids: Vec<String> = self.lookup(cwd)?.into_iter().collect();
+                for id in self.project_ids()? {
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+                Ok(ids)
+            }
         }
     }
 
@@ -649,6 +683,15 @@ fn spawn_writer(shared: Arc<Shared>, redactor: Redactor, rx: Receiver<WriteJob>)
                     });
                     let _ = reply.send(resp);
                 }
+                Some(WriteJob::Delete(req, reply)) => {
+                    let resp = delete(&shared, req)
+                        .map(|report| Response::Delete { report })
+                        .unwrap_or_else(|message| {
+                            shared.log(&format!("delete failed: {message}"));
+                            Response::Error { message }
+                        });
+                    let _ = reply.send(resp);
+                }
                 None if disconnected => break,
                 None => {}
             }
@@ -1011,7 +1054,127 @@ fn merge(shared: &Shared, source: &str, target: &str) -> Result<String, String> 
     ))
 }
 
+/// 삭제 요청을 처리한다. 대상이 없으면 `None`. 재색인 중이면 오류이다. (FR-DEL-1~6)
+fn delete(shared: &Shared, req: Request) -> Result<Option<DeleteReport>, String> {
+    if shared.reindexing.load(Ordering::SeqCst) {
+        return Err(delete_busy(shared.lang()));
+    }
+    match req {
+        Request::ProjectRemove {
+            project,
+            cwd: _,
+            dry_run,
+        } => remove_project(shared, &project, dry_run),
+        Request::Forget {
+            target,
+            scope,
+            cwd,
+            dry_run,
+        } => forget(shared, &target, scope.as_ref(), &cwd, dry_run),
+        other => Err(format!("not a delete request: {other:?}")),
+    }
+}
+
+fn report(shared: &Shared, id: &str, counts: ForgetCounts) -> Result<DeleteReport, String> {
+    let location = lock(&shared.registry)?
+        .project(id)
+        .map_err(|e| e.to_string())?
+        .map(|row| row.location)
+        .unwrap_or_default();
+    Ok(DeleteReport {
+        project_id: id.to_string(),
+        location,
+        counts,
+    })
+}
+
+/// 프로젝트 id, 또는 경로의 조회 전용 판정으로 찾은 프로젝트를 통째로 지운다. (FR-DEL-1, IF-CLI-11)
+fn remove_project(
+    shared: &Shared,
+    project: &str,
+    dry_run: bool,
+) -> Result<Option<DeleteReport>, String> {
+    let by_id = is_project_id(project)
+        && lock(&shared.registry)?
+            .project(project)
+            .map_err(|e| e.to_string())?
+            .is_some();
+    let found = if by_id {
+        Some(project.to_string())
+    } else {
+        shared.lookup(project)?
+    };
+    let Some(id) = found else {
+        return Ok(None);
+    };
+    let counts = shared.records(&id)?.totals().map_err(|e| e.to_string())?;
+    let report = report(shared, &id, counts)?;
+    if dry_run {
+        return Ok(Some(report));
+    }
+    lock(&shared.queue)?.remove_project(&id);
+    let _embedding = lock(&shared.embed_lock)?;
+    lock(&shared.open)?.remove(&id);
+    lock(&shared.registry)?
+        .remove_project(&id)
+        .map_err(|e| e.to_string())?;
+    if let Ok(mut log) = shared.embed_log.lock() {
+        log.remove(&id);
+    }
+    let dir = shared.paths.project_dir(&id);
+    if dir.exists() {
+        fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
+    }
+    shared.log(&format!("project {id} removed"));
+    Ok(Some(report))
+}
+
+/// 세션 또는 턴을 지운다. 큐에서 대상 작업을 뺀 뒤 처리 중인 임베딩 묶음을 기다렸다가
+/// 원본 저장소와 벡터를 지운다. (FR-DEL-2, FR-DEL-3, FR-DEL-6, IF-CLI-12)
+fn forget(
+    shared: &Shared,
+    target: &ForgetTarget,
+    scope: Option<&Scope>,
+    cwd: &str,
+    dry_run: bool,
+) -> Result<Option<DeleteReport>, String> {
+    let mut found = None;
+    for id in shared.lookup_order(scope, cwd)? {
+        let records = shared.records(&id)?;
+        if records.contains(target).map_err(|e| e.to_string())? {
+            found = Some((id, records));
+            break;
+        }
+    }
+    let Some((id, mut records)) = found else {
+        return Ok(None);
+    };
+    let preview = records.forget(target, true).map_err(|e| e.to_string())?;
+    if dry_run {
+        return report(shared, &id, preview.counts).map(Some);
+    }
+    lock(&shared.queue)?.remove(&id, &preview.jobs);
+    let _embedding = lock(&shared.embed_lock)?;
+    let plan = records.forget(target, false).map_err(|e| e.to_string())?;
+    let handle = shared.project(&id)?;
+    handle
+        .vectors
+        .replace(&plan.vector_refs, &[])
+        .map_err(|e| e.to_string())?;
+    if let Err(e) = optimize_if_due(handle.vectors.as_ref(), shared.config.index.optimize_every) {
+        shared.log(&format!("project {id}: vector optimize failed: {e}"));
+    }
+    handle.refresh(shared.embedder.as_ref());
+    if let ForgetTarget::Session(session_id) = target {
+        lock(&shared.registry)?
+            .unbind_session(session_id, &id)
+            .map_err(|e| e.to_string())?;
+    }
+    report(shared, &id, plan.counts).map(Some)
+}
+
 enum EmbedFailure {
+    /// 벡터 저장소가 호환되지 않거나 프로젝트가 지워졌다. 그 프로젝트의 작업을 큐에서 뺀다.
     Incompatible,
     Failed(String),
 }
@@ -1077,6 +1240,14 @@ fn embed_batch(
 ) -> Result<usize, EmbedFailure> {
     let failed = EmbedFailure::Failed;
     let _embedding = lock(&shared.embed_lock).map_err(failed)?;
+    if lock(&shared.registry)
+        .map_err(failed)?
+        .project(project)
+        .map_err(|e| failed(e.to_string()))?
+        .is_none()
+    {
+        return Err(EmbedFailure::Incompatible);
+    }
     let handle = shared.project(project).map_err(failed)?;
     if handle.is_mismatch() {
         return Err(EmbedFailure::Incompatible);
@@ -1318,6 +1489,9 @@ fn handle_request(shared: &Arc<Shared>, req: Request) -> Response {
         Request::Status => status(shared).map(Response::Status),
         Request::ProjectList => project_list(shared).map(|text| Response::Text { text }),
         Request::Shutdown => request_shutdown(shared),
+        req @ (Request::ProjectRemove { .. } | Request::Forget { .. }) => {
+            return send_write(shared, |reply| WriteJob::Delete(req, reply), "delete");
+        }
     };
     result.unwrap_or_else(|message| {
         shared.log(&format!("request failed: {message}"));
@@ -1477,19 +1651,7 @@ fn show(
     scope: Option<&Scope>,
     cwd: &str,
 ) -> Result<String, String> {
-    let candidates = match scope {
-        Some(scope @ (Scope::Project | Scope::Path(_))) => shared.scope_projects(scope, cwd)?,
-        None | Some(Scope::All) => {
-            let mut ids: Vec<String> = shared.lookup(cwd)?.into_iter().collect();
-            for id in shared.project_ids()? {
-                if !ids.contains(&id) {
-                    ids.push(id);
-                }
-            }
-            ids
-        }
-    };
-    for id in candidates {
+    for id in shared.lookup_order(scope, cwd)? {
         let records = shared.records(&id)?;
         let found = !records
             .iterations_for_prompt(prompt_id)

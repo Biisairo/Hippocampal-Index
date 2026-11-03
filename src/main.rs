@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -7,8 +7,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use hippo::backends::{build_embedder, vector_source};
 use hippo::client::{STARTUP_WAIT, ensure_daemon, request, run_hook};
 use hippo::commands::{
-    self, ImportTally, SCOPE_ALL, SCOPE_PROJECT, absolute, hook_settings, launcher, project_scope,
-    scope_arg, session_line,
+    self, Confirm, ImportTally, SCOPE_ALL, SCOPE_PROJECT, absolute, confirm_delete, hook_settings,
+    launcher, project_scope, render_delete_report, scope_arg, session_line,
 };
 use hippo::config::{Config, Paths};
 use hippo::daemon;
@@ -19,6 +19,7 @@ use hippo::protocol::{Request, Response, embed_progress};
 use hippo::registry::is_project_id;
 use hippo::search::{SearchKind, escape_control};
 use hippo::setup::launchd_plist;
+use hippo::store::ForgetTarget;
 use hippo::tr;
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -90,6 +91,25 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Delete one session or one turn (all iterations with the prompt id) from memory
+    #[command(group(clap::ArgGroup::new("target").required(true).args(["session", "prompt"])))]
+    Forget {
+        /// Session id to delete
+        #[arg(long)]
+        session: Option<String>,
+        /// Prompt id of the turn to delete
+        #[arg(long)]
+        prompt: Option<String>,
+        /// project or a path. Without it, the current project is searched first, then the others
+        #[arg(long)]
+        scope: Option<String>,
+        /// Delete without asking
+        #[arg(long)]
+        yes: bool,
+        /// Only show what would be deleted
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Open the GUI window (settings, status, import, search, Claude setup)
     Gui,
     /// Print the hook settings for settings.json
@@ -106,6 +126,17 @@ enum Command {
 enum ProjectCommand {
     /// List projects
     List,
+    /// Delete a project and all its records
+    Remove {
+        /// Project id or path
+        project: String,
+        /// Delete without asking
+        #[arg(long)]
+        yes: bool,
+        /// Only show what would be deleted
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(clap::Args)]
@@ -214,6 +245,58 @@ fn main() -> ExitCode {
             Err(e) => fail(&e),
         },
         Command::Project(ProjectCommand::List) => query_daemon(&paths, &Request::ProjectList),
+        Command::Project(ProjectCommand::Remove {
+            project,
+            yes,
+            dry_run,
+        }) => match current_dir() {
+            Ok(cwd) => {
+                let project = if is_project_id(&project) {
+                    project
+                } else {
+                    absolute(&cwd, &project)
+                };
+                run_delete(
+                    &paths,
+                    |dry_run| Request::ProjectRemove {
+                        project: project.clone(),
+                        cwd: cwd.clone(),
+                        dry_run,
+                    },
+                    yes,
+                    dry_run,
+                )
+            }
+            Err(e) => fail(&e),
+        },
+        Command::Forget {
+            session,
+            prompt,
+            scope,
+            yes,
+            dry_run,
+        } => match current_dir() {
+            Ok(cwd) => {
+                let target = match (session, prompt) {
+                    (Some(id), _) => ForgetTarget::Session(id),
+                    (None, Some(id)) => ForgetTarget::Prompt(id),
+                    (None, None) => return fail("--session or --prompt is required"),
+                };
+                let scope = scope.map(|s| scope_arg(&cwd, &s));
+                run_delete(
+                    &paths,
+                    |dry_run| Request::Forget {
+                        target: target.clone(),
+                        scope: scope.clone(),
+                        cwd: cwd.clone(),
+                        dry_run,
+                    },
+                    yes,
+                    dry_run,
+                )
+            }
+            Err(e) => fail(&e),
+        },
         Command::Import {
             from,
             to,
@@ -320,6 +403,65 @@ fn query_daemon(paths: &Paths, req: &Request) -> ExitCode {
         Ok(Response::Error { message }) => fail(&message),
         Ok(other) => fail(&format!("unexpected response: {other:?}")),
         Err(e) => fail(&e.to_string()),
+    }
+}
+
+/// `dry_run` 요청으로 미리 보기를 출력하고, 확인을 거쳐 삭제를 요청한다. (FR-DEL-4)
+fn run_delete(paths: &Paths, make: impl Fn(bool) -> Request, yes: bool, dry_run: bool) -> ExitCode {
+    let config = match Config::load(&paths.config()) {
+        Ok(c) => c,
+        Err(e) => return fail(&e.to_string()),
+    };
+    let lang = config.ui.language;
+    ensure_daemon(paths, launcher(&config), STARTUP_WAIT);
+    let send = |dry_run: bool| match request(&paths.socket(), &make(dry_run), QUERY_TIMEOUT) {
+        Ok(Response::Delete { report }) => Ok(report),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(other) => Err(format!("unexpected response: {other:?}")),
+        Err(e) => Err(e.to_string()),
+    };
+    let report = match send(true) {
+        Ok(Some(report)) => report,
+        Ok(None) => {
+            println!("{}", tr!(lang, "Nothing to delete.", "대상 없음"));
+            return ExitCode::SUCCESS;
+        }
+        Err(message) => return fail(&message),
+    };
+    print!("{}", render_delete_report(&report, lang));
+    if dry_run {
+        return ExitCode::SUCCESS;
+    }
+    let ask = || {
+        print!("{}", tr!(lang, "Delete? [y/N] ", "지울까요? [y/N] "));
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).ok().map(|_| line)
+    };
+    match confirm_delete(yes, std::io::stdin().is_terminal(), ask) {
+        Confirm::Proceed => {}
+        Confirm::Cancel => {
+            println!("{}", tr!(lang, "Cancelled.", "취소했습니다."));
+            return ExitCode::SUCCESS;
+        }
+        Confirm::NeedYes => {
+            return fail(&tr!(
+                lang,
+                "stdin is not a terminal; pass --yes to delete",
+                "표준 입력이 터미널이 아닙니다. 지우려면 --yes를 주십시오"
+            ));
+        }
+    }
+    match send(false) {
+        Ok(Some(_)) => {
+            println!("{}", tr!(lang, "Deleted.", "지웠습니다."));
+            ExitCode::SUCCESS
+        }
+        Ok(None) => {
+            println!("{}", tr!(lang, "Nothing to delete.", "대상 없음"));
+            ExitCode::SUCCESS
+        }
+        Err(message) => fail(&message),
     }
 }
 

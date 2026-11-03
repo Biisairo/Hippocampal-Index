@@ -14,7 +14,7 @@ use crate::install::{
     Action, Outcome, Scope, apply, apply_memory, forget_install, guide_block, install_binary,
     installed_exe, memory_file, record_install, target_file, warn_untracked,
 };
-use crate::protocol::{ImportSessionReport, Request, Response, Scope as QueryScope};
+use crate::protocol::{DeleteReport, ImportSessionReport, Request, Response, Scope as QueryScope};
 use crate::search::escape_control;
 use crate::setup::hooks_config;
 use crate::tr;
@@ -280,4 +280,48 @@ pub fn session_line(
         }
     };
     escape_control(&format!("[{n}/{total}] {short} {line}"))
+}
+
+/// 삭제를 진행할지. (FR-DEL-4)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confirm {
+    Proceed,
+    Cancel,
+    /// 표준 입력이 터미널이 아니고 `--yes`도 없다.
+    NeedYes,
+}
+
+/// `--yes`면 묻지 않고 진행한다. 터미널이면 `answer`로 한 줄을 읽어 `y`일 때만 진행한다. (FR-DEL-4)
+pub fn confirm_delete(
+    yes: bool,
+    terminal: bool,
+    answer: impl FnOnce() -> Option<String>,
+) -> Confirm {
+    if yes {
+        return Confirm::Proceed;
+    }
+    if !terminal {
+        return Confirm::NeedYes;
+    }
+    match answer() {
+        Some(line) if line.trim().eq_ignore_ascii_case("y") => Confirm::Proceed,
+        _ => Confirm::Cancel,
+    }
+}
+
+/// 삭제 미리 보기. 프로젝트 id와 위치, 세션·턴·반복·결과 수. (FR-DEL-4)
+pub fn render_delete_report(report: &DeleteReport, lang: Lang) -> String {
+    let c = &report.counts;
+    let text = tr!(
+        lang,
+        "Project {} ({})\n  sessions: {}  turns: {}  iterations: {}  results: {}\nAll vectors of these iterations and results are deleted too.\n",
+        "프로젝트 {} ({})\n  세션 {}개, 턴 {}개, 반복 {}개, 결과 {}개\n이 반복과 결과의 벡터도 모두 지웁니다.\n",
+        report.project_id,
+        report.location,
+        c.sessions,
+        c.turns,
+        c.iterations,
+        c.results
+    );
+    escape_control(&text)
 }
