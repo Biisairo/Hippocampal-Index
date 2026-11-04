@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="600" viewBox="0 0 960 600" font-family="-apple-system, 'Apple SD Gothic Neo', 'Noto Sans KR', 'Malgun Gothic', 'Segoe UI', Helvetica, Arial, sans-serif">
+  <style>
+    .title { font-size: 20px; font-weight: 700; fill: #3B3654; }
+    .head { font-size: 15px; font-weight: 700; fill: #3B3654; }
+    .body { font-size: 13px; fill: #3B3654; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; font-weight: 700; fill: #3B3654; }
+    .note { font-size: 12.5px; fill: #6E6786; }
+    .tag { font-size: 11.5px; fill: #5B4BA6; }
+    .num { font-size: 12px; font-weight: 700; fill: #FFFDF9; }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8E7CC3"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="960" height="600" rx="18" fill="#FDF6EC"/>
+  <text class="title" x="32" y="44">반복을 수집하는 방법</text>
+  <text class="note" x="32" y="66">hook은 "무언가 일어났다"는 신호일 뿐입니다. 내용은 데몬이 세션 transcript에서 한 줄씩 한 번만 읽습니다.</text>
+
+  <!-- Claude Code -->
+  <rect x="32" y="92" width="236" height="150" rx="14" fill="#FFFDF9" stroke="#D9D1F2" stroke-width="2"/>
+  <text class="head" x="50" y="120">Claude Code 세션</text>
+  <text class="note" x="50" y="144">transcript를 기록</text>
+  <text class="mono" x="50" y="162">~/.claude/projects/</text>
+  <text class="mono" x="50" y="178">  &lt;folder&gt;/&lt;session&gt;.jsonl</text>
+  <text class="note" x="50" y="206">도구 묶음이 끝날 때와</text>
+  <text class="note" x="50" y="223">턴이 끝날 때 hook 실행</text>
+
+  <!-- hook client -->
+  <rect x="320" y="92" width="236" height="150" rx="14" fill="#FFFDF9" stroke="#D9D1F2" stroke-width="2"/>
+  <text class="mono" x="338" y="120">hippo hook &lt;event&gt;</text>
+  <text class="note" x="338" y="144">비동기: 세션을 느리게 하지 않음</text>
+  <text class="note" x="338" y="166">세션 id, transcript 경로,</text>
+  <text class="note" x="338" y="183">prompt id를 데몬에 보냄</text>
+  <text class="note" x="338" y="211">데몬이 꺼져 있으면</text>
+  <text class="note" x="338" y="228">먼저 띄움</text>
+
+  <path d="M268 167 L318 167" stroke="#8E7CC3" stroke-width="2" marker-end="url(#arrow)"/>
+  <text class="tag" x="50" y="266">hook: PostToolBatch · Stop · StopFailure · SessionEnd</text>
+
+  <!-- fallback -->
+  <rect x="320" y="296" width="236" height="96" rx="12" fill="#FBE9DC"/>
+  <text class="head" x="338" y="322">데몬을 띄울 수 없으면</text>
+  <text class="note" x="338" y="344">요청을 여기에 저장하고</text>
+  <text class="mono" x="338" y="362">spool/pending.jsonl</text>
+  <text class="note" x="338" y="381">다음에 데몬이 시작될 때 처리</text>
+  <path d="M438 244 L438 294" stroke="#E0A27C" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arrow)"/>
+
+  <!-- import -->
+  <rect x="32" y="420" width="524" height="88" rx="12" fill="#EFE8F7"/>
+  <text class="mono" x="50" y="448">hippo import --from &lt;old path&gt; --to &lt;project&gt;</text>
+  <text class="note" x="50" y="470">hook을 설치하기 전에 기록된 과거 세션을 가져옵니다.</text>
+  <text class="note" x="50" y="488">요청 하나에 세션 하나씩, 실시간 작업보다 뒤에 처리</text>
+
+  <!-- daemon -->
+  <rect x="604" y="92" width="324" height="476" rx="14" fill="#FFFDF9" stroke="#8E7CC3" stroke-width="2"/>
+  <text class="mono" x="622" y="120">hippo daemon</text>
+  <text class="note" x="736" y="120">컴퓨터마다 하나</text>
+
+  <path d="M556 167 L602 167" stroke="#8E7CC3" stroke-width="2" marker-end="url(#arrow)"/>
+  <text class="tag" x="560" y="158">소켓</text>
+  <path d="M556 344 C 580 344, 580 200, 602 200" fill="none" stroke="#E0A27C" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arrow)"/>
+  <path d="M556 464 C 584 464, 584 230, 602 230" fill="none" stroke="#8E7CC3" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <circle cx="632" cy="156" r="11" fill="#8E7CC3"/><text class="num" x="628" y="160">1</text>
+  <text class="head" x="652" y="161">쓰기 스레드</text>
+  <text class="note" x="652" y="182">저장한 위치부터 새 줄을 읽고</text>
+  <text class="note" x="652" y="200">반복과 도구 결과를</text>
+  <text class="note" x="652" y="218">SQLite 트랜잭션 하나로 저장한 뒤</text>
+  <text class="note" x="652" y="236">embed_jobs에 작업을 넣음</text>
+
+  <circle cx="632" cy="276" r="11" fill="#8E7CC3"/><text class="num" x="628" y="280">2</text>
+  <text class="head" x="652" y="281">임베딩 큐</text>
+  <rect x="652" y="294" width="74" height="26" rx="13" fill="#D9D1F2"/>
+  <text class="body" x="672" y="312">실시간</text>
+  <rect x="736" y="294" width="86" height="26" rx="13" fill="#EFE8F7"/>
+  <text class="body" x="755" y="312">가져오기</text>
+  <text class="note" x="652" y="340">실시간 작업을 먼저 처리</text>
+
+  <circle cx="632" cy="380" r="11" fill="#8E7CC3"/><text class="num" x="628" y="384">3</text>
+  <text class="head" x="652" y="385">임베딩 스레드</text>
+  <text class="note" x="652" y="406">작업을 최대 64개씩 묶어</text>
+  <text class="note" x="652" y="424">→ 로컬 Ollama 임베딩 모델</text>
+  <text class="note" x="652" y="442">→ LanceDB에 묶음마다 한 번 저장</text>
+
+  <rect x="622" y="470" width="288" height="80" rx="10" fill="#FDF6EC"/>
+  <text class="tag" x="636" y="494">프롬프트 주입과 삭제가 먼저입니다.</text>
+  <text class="tag" x="636" y="512">임베딩 스레드는 임베딩 호출 사이에서</text>
+  <text class="tag" x="636" y="530">이들에게 차례를 넘깁니다.</text>
+</svg>

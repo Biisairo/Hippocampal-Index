@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="640" viewBox="0 0 960 640" font-family="-apple-system, 'Apple SD Gothic Neo', 'Noto Sans KR', 'Malgun Gothic', 'Segoe UI', Helvetica, Arial, sans-serif">
+  <style>
+    .title { font-size: 20px; font-weight: 700; fill: #3B3654; }
+    .head { font-size: 15px; font-weight: 700; fill: #3B3654; }
+    .body { font-size: 13px; fill: #3B3654; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; font-weight: 700; fill: #3B3654; }
+    .note { font-size: 12.5px; fill: #6E6786; }
+    .tag { font-size: 11.5px; fill: #5B4BA6; }
+    .num { font-size: 12px; font-weight: 700; fill: #FFFDF9; }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8E7CC3"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="960" height="640" rx="18" fill="#FDF6EC"/>
+  <text class="title" x="32" y="44">기억을 찾아 주입하는 방법</text>
+  <text class="note" x="32" y="66">프롬프트를 보낼 때마다 UserPromptSubmit hook이 같은 프로젝트의 지난 세션에서 관련 턴을 찾아 달라고 데몬에 요청합니다.</text>
+
+  <!-- row 1 -->
+  <rect x="32" y="90" width="272" height="132" rx="14" fill="#FFFDF9" stroke="#D9D1F2" stroke-width="2"/>
+  <circle cx="56" cy="116" r="11" fill="#8E7CC3"/><text class="num" x="52" y="120">1</text>
+  <text class="head" x="76" y="121">프롬프트 보내기</text>
+  <text class="note" x="50" y="150">hook은 최대 800ms 기다립니다</text>
+  <text class="note" x="50" y="168">(데몬이나 모델이 내려가 있으면</text>
+  <text class="note" x="50" y="186">2.5초). 늦으면 프롬프트를</text>
+  <text class="note" x="50" y="204">늦추지 않고 기억 없이 진행합니다.</text>
+
+  <rect x="344" y="90" width="272" height="132" rx="14" fill="#FFFDF9" stroke="#D9D1F2" stroke-width="2"/>
+  <circle cx="368" cy="116" r="11" fill="#8E7CC3"/><text class="num" x="364" y="120">2</text>
+  <text class="head" x="388" y="121">주입하지 않는 경우</text>
+  <text class="note" x="362" y="150">· 백그라운드 작업 완료 알림</text>
+  <text class="note" x="362" y="170">· 11자 미만의 짧은 프롬프트</text>
+  <text class="note" x="362" y="188">  ("진행", "그거 알려줘" 등)</text>
+  <text class="note" x="362" y="208">· 이 폴더의 프로젝트가 없음</text>
+
+  <rect x="656" y="90" width="272" height="132" rx="14" fill="#FFFDF9" stroke="#D9D1F2" stroke-width="2"/>
+  <circle cx="680" cy="116" r="11" fill="#8E7CC3"/><text class="num" x="676" y="120">3</text>
+  <text class="head" x="700" y="121">질의 임베딩</text>
+  <text class="mono" x="674" y="150">query_prefix + prompt</text>
+  <text class="note" x="674" y="172">로컬 Ollama 모델을 씁니다.</text>
+  <text class="note" x="674" y="190">백그라운드 임베딩보다 먼저 처리합니다.</text>
+
+  <path d="M304 156 L342 156" stroke="#8E7CC3" stroke-width="2" marker-end="url(#arrow)"/>
+  <path d="M616 156 L654 156" stroke="#8E7CC3" stroke-width="2" marker-end="url(#arrow)"/>
+  <path d="M792 222 L792 252" stroke="#8E7CC3" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- row 2: search -->
+  <rect x="32" y="254" width="896" height="150" rx="14" fill="#FFFDF9" stroke="#8E7CC3" stroke-width="2"/>
+  <circle cx="56" cy="280" r="11" fill="#8E7CC3"/><text class="num" x="52" y="284">4</text>
+  <text class="head" x="76" y="285">하이브리드 검색</text>
+  <text class="note" x="212" y="285">현재 프로젝트의 다른 세션만</text>
+
+  <rect x="50" y="300" width="300" height="88" rx="10" fill="#EFE8F7"/>
+  <text class="head" x="66" y="324">의미</text>
+  <text class="note" x="66" y="346">LanceDB 벡터 유사도</text>
+  <text class="note" x="66" y="366">말은 달라도 뜻이 같은 기록을 찾음</text>
+
+  <rect x="368" y="300" width="300" height="88" rx="10" fill="#EFE8F7"/>
+  <text class="head" x="384" y="324">키워드</text>
+  <text class="note" x="384" y="346">SQLite FTS5 (trigram)</text>
+  <text class="note" x="384" y="366">validateToken 같은 이름을 정확히 찾음</text>
+
+  <rect x="686" y="300" width="226" height="88" rx="10" fill="#D9D1F2"/>
+  <text class="head" x="702" y="324">RRF로 합치기</text>
+  <text class="mono" x="702" y="348">Σ 1 / (60 + rank)</text>
+  <text class="note" x="702" y="370">순위 목록 하나</text>
+  <text class="head" x="354" y="349">+</text>
+  <path d="M668 344 L684 344" stroke="#8E7CC3" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <path d="M792 404 L792 434" stroke="#8E7CC3" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- row 3 -->
+  <rect x="500" y="436" width="428" height="150" rx="14" fill="#FFFDF9" stroke="#D9D1F2" stroke-width="2"/>
+  <circle cx="524" cy="462" r="11" fill="#8E7CC3"/><text class="num" x="520" y="466">5</text>
+  <text class="head" x="544" y="467">턴 고르기</text>
+  <text class="note" x="518" y="496">· 유사도 0.50 이상인 반복만 남김</text>
+  <text class="note" x="518" y="516">  (키워드로만 찾은 반복은 주입하지 않음)</text>
+  <text class="note" x="518" y="536">· 턴(같은 prompt id)으로 묶음</text>
+  <text class="note" x="518" y="556">· 최대 3턴, 12,000자 이하</text>
+
+  <path d="M500 511 L464 511" stroke="#8E7CC3" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="32" y="436" width="430" height="150" rx="14" fill="#FBE9DC"/>
+  <circle cx="56" cy="462" r="11" fill="#8E7CC3"/><text class="num" x="52" y="466">6</text>
+  <text class="head" x="76" y="467">Claude가 답하기 전에 주입</text>
+  <text class="mono" x="50" y="496">&lt;memory ts="…" prompt="…"&gt;</text>
+  <text class="mono" x="50" y="514">  [input] … [response] …</text>
+  <text class="mono" x="50" y="532">&lt;/memory&gt;</text>
+  <text class="note" x="50" y="558">오래된 것부터 놓고, 지시가 아닌</text>
+  <text class="note" x="50" y="576">과거 기록임을 밝힘. 도구 호출은 뺌</text>
+
+  <text class="tag" x="32" y="616">필요할 때: hippo search는 같은 하이브리드 검색을 합니다(--scope all이면 모든 프로젝트). hippo show는 턴 하나를 통째로 보여 줍니다.</text>
+</svg>

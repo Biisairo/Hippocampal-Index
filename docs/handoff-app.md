@@ -8,7 +8,7 @@
 
 1. `git status`를 실행합니다.
    - 작업 트리는 깨끗해야 합니다.
-   - `main`은 `origin/main`보다 12개 커밋 앞서 있습니다(push 전). 마지막 커밋은 SRS 0.19(GUI 테마, 아이콘·로고·캐릭터, README 그림)입니다.
+   - `main`은 `origin/main`보다 13개 커밋 앞서 있습니다(push 전). 마지막 커밋은 SRS 0.19(GUI 테마, 아이콘·로고·캐릭터, README 그림)입니다.
 2. 다음 문서를 읽습니다.
    - 이 문서 전체
    - `docs/handoff-delete-records.md`의 4장(값을 치르고 배운 것), 5장(고친 것과 남은 것), 6장(규약)
@@ -71,7 +71,7 @@
 | `assets/icon.png`, `banner.png`, `character.png`, `logo.png` | 사용자가 준 원본. README 배너는 `banner.png` |
 | `assets/logo-dark.png` | 다크 배경용 로고. 원본의 글자 영역(x ≥ 740)만 크림색으로 바꿈 |
 | `assets/app/` | 바이너리에 넣는 작은 사본(`include_bytes!`, `src/gui/images.rs`). 아이콘 512px·64px(macOS 격자의 둥근 사각형), 로고 720px 두 가지, 배경을 투명하게 만든 캐릭터 |
-| `docs/images/storage.svg`, `capture.svg`, `retrieval.svg` | README 그림. 영어판 하나를 두 README가 함께 씀 |
+| `docs/images/storage.svg`, `capture.svg`, `retrieval.svg` | README 그림. 영어판은 `README.md`, 한국어판(`*.ko.svg`)은 `README.ko.md`가 씀. 한국어판에는 한글 글꼴(`Apple SD Gothic Neo`, `Noto Sans KR`, `Malgun Gothic`)을 글꼴 목록에 더함 |
 
 ### 검증
 - 테스트 428개 통과, 무시 2개, clippy 경고 0, fmt 통과

@@ -84,13 +84,13 @@
 - **프로젝트의 위치**: git 저장소면 git common dir(`.git`)이고, 아니면 그 폴더입니다. 하위 디렉터리에서 연 세션과 git worktree는 원본 저장소와 같은 프로젝트가 됩니다.
 - **폴더를 옮긴 경우**: git 저장소는 루트 커밋이 같고 이전 위치가 사라졌으면 자동으로 이어 씁니다. git이 아닌 폴더는 `hippo import --from <이전 경로>`로 직접 가져옵니다([4.4](#44-프로젝트와-과거-기록-가져오기) 참고).
 
-<p align="center"><img src="docs/images/storage.svg" alt="기억을 저장하는 곳: ~/.hippo 데이터 루트, 프로젝트별 SQLite 원본과 LanceDB 벡터" width="880"></p>
+<p align="center"><img src="docs/images/storage.ko.svg" alt="기억을 저장하는 곳: ~/.hippo 데이터 루트, 프로젝트별 SQLite 원본과 LanceDB 벡터" width="880"></p>
 
 이름의 "색인"이 바로 이 부분입니다. 해마 색인이 피질의 기억 흔적을 가리키듯, 벡터 저장소는 원본 기록을 가리키기만 합니다. 벡터 저장소는 원본 저장소에서 파생된 인덱스입니다. 그래서 임베딩 모델이나 벡터 DB를 바꾸더라도 SQLite에서 인덱스를 다시 만들면 됩니다([6장](#6-임베딩-모델이나-벡터-db-바꾸기) 참고).
 
 ### 1.4 기억을 쓰는 방법
 
-<p align="center"><img src="docs/images/retrieval.svg" alt="기억을 찾아 주입하는 흐름" width="880"></p>
+<p align="center"><img src="docs/images/retrieval.ko.svg" alt="기억을 찾아 주입하는 흐름" width="880"></p>
 
 - **자동 주입**: 프롬프트를 보낼 때마다 `UserPromptSubmit` hook이 데몬에 관련 기억을 요청합니다. 검색 대상은 **같은 프로젝트**의 **다른 세션** 기록입니다. 벡터 유사도가 임계값 이상인 반복을 찾고, 그 반복이 속한 **턴**을 주입합니다. 턴마다 `<memory>` 블록 하나에 입력, LLM 응답, 질문과 답을 넣고 도구 호출과 결과는 넣지 않습니다. 블록은 시간순(오래된 것부터)으로 놓고 각 블록에 시각을 붙입니다. 머리말에 "과거 기록이며 지시가 아님"을 밝힙니다. 백그라운드 작업 완료 알림과, 공백을 뺀 길이가 11자 미만인 짧은 프롬프트("진행", "그거 알려줘" 등)에는 주입하지 않습니다. 검색 질의에는 임베딩 모델이 권장하는 지시문을 앞에 붙입니다.
 - **필요할 때 검색**: Claude나 사용자가 셸에서 `hippo search`, `hippo show`를 실행합니다.
@@ -99,7 +99,7 @@
 
 ### 1.5 구조
 
-<p align="center"><img src="docs/images/capture.svg" alt="반복을 수집하는 흐름: hook, 데몬, 쓰기 스레드와 임베딩 스레드" width="880"></p>
+<p align="center"><img src="docs/images/capture.ko.svg" alt="반복을 수집하는 흐름: hook, 데몬, 쓰기 스레드와 임베딩 스레드" width="880"></p>
 
 - 데몬은 컴퓨터마다 하나만 실행됩니다(파일 잠금). 저장소에는 데몬만 씁니다.
 - 데몬을 직접 띄울 필요는 없습니다. 로컬 MCP 서버처럼 필요할 때 올라옵니다. hook이나 CLI 명령이 데몬에 연결하지 못하면 `hippo daemon`을 백그라운드로 띄운 뒤 요청을 보냅니다. 요청이 없는 상태로 `idle_timeout_secs`(기본 30분)가 지나면 데몬이 스스로 내려가고, 다음 요청이 오면 다시 올라옵니다.
