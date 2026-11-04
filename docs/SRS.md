@@ -109,7 +109,7 @@ Claude (Bash) ──▶ hippo search ... ──Unix socket───────�
 - C-2 원본 저장소는 SQLite(FTS5)로 한다. 벡터 저장소의 기본 백엔드는 LanceDB Rust SDK(임베디드)로 한다.
 - C-3 임베더의 기본 백엔드는 Ollama `qwen3-embedding:0.6b`, 출력 차원 1024로 한다.
 - C-4 데이터를 로컬 장비 밖으로 전송하지 않는다. 네트워크 통신은 `localhost`의 Ollama로 한정한다. 임베더 URL은 URL 파서로 해석하며, 스킴이 `http`/`https`가 아니거나, host가 `localhost`, `127.0.0.1`, `::1`이 아니거나, userinfo(`@`)·쿼리·프래그먼트가 있으면 거부한다. 이 검사는 설정을 읽을 때와 임베더를 만들 때 모두 수행한다. HTTP 리다이렉트는 따르지 않는다.
-- C-5 MCP 서버를 사용하지 않는다. (사내 규정상 새 MCP 서버는 정보보호팀 승인 대상)
+- C-5 MCP 서버를 사용하지 않는다. 별도 서버를 띄우지 않고 hook과 CLI만으로 동작하게 하기 위해서다.
 - C-6 1차 대상 플랫폼은 macOS(darwin)이다.
 - C-7 Claude Code 설정 파일, 메모리 파일(FR-INS-7), PATH 링크(FR-INS-11)는 사용자가 `hippo install`/`hippo uninstall`/`hippo purge`를 실행하거나 GUI에서 적용·해제·완전 삭제를 확인했을 때(FR-GUI-10)만 수정한다. 그 밖의 명령, GUI 동작, 데몬은 이 파일들을 수정하지 않는다. 셸 설정 파일(`~/.zshrc` 등)은 어떤 경우에도 수정하지 않는다.
 - C-8 GUI는 egui/eframe로 만든 네이티브 창이다. 웹뷰, 브라우저, GUI용 HTTP 서버를 쓰지 않는다. GUI는 `hippo` 바이너리에 항상 포함한다(별도 바이너리나 cargo feature로 나누지 않는다). 근거: egui를 링크해도 프로세스 시작 시간은 약 1ms(2.4→3.4ms, p50) 늘어날 뿐이다(2026-11-03 실측, 최소 예제).

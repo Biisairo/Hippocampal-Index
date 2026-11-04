@@ -139,7 +139,7 @@ Hooks and CLI commands never open the database. They only talk to the daemon thr
 
 ```bash
 brew install protobuf            # if protoc is missing or broken: brew reinstall protobuf
-git clone git@github.com:Biisairo/Hippocampal-Index.git hippo && cd hippo
+git clone https://github.com/Biisairo/Hippocampal-Index.git hippo && cd hippo
 cargo build --release
 ```
 

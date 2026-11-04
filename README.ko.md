@@ -139,7 +139,7 @@ hook과 CLI 명령은 DB를 직접 열지 않고, 소켓으로 데몬에 요청�
 
 ```bash
 brew install protobuf            # protoc가 없거나 깨졌으면: brew reinstall protobuf
-git clone git@github.com:Biisairo/Hippocampal-Index.git hippo && cd hippo
+git clone https://github.com/Biisairo/Hippocampal-Index.git hippo && cd hippo
 cargo build --release
 ```
 
