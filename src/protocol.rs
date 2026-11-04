@@ -149,6 +149,9 @@ pub struct ProjectStatus {
     pub iterations: u64,
     pub results: u64,
     pub embed_jobs: u64,
+    /// `embed_jobs` 중 가져오기 작업 수. 나머지는 실시간 작업이다. (IF-CLI-5)
+    #[serde(default)]
+    pub embed_jobs_import: u64,
     pub vectors: u64,
     /// `empty`, `compatible`, `mismatch`
     pub compatibility: String,
@@ -232,12 +235,13 @@ impl StatusInfo {
                 missing_location(lang)
             };
             out.push_str(&format!(
-                "[{}] {}{missing}\n  iterations: {}  results: {}  embed_jobs: {}{}  vectors: {}  compatibility: {}\n",
+                "[{}] {}{missing}\n  iterations: {}  results: {}  embed_jobs: {}{}{}  vectors: {}  compatibility: {}\n",
                 p.id,
                 p.location,
                 p.iterations,
                 p.results,
                 p.embed_jobs,
+                queue_split(p, lang),
                 embed_progress(p.embed_jobs, p.embed_per_min, lang),
                 p.vectors,
                 p.compatibility
@@ -282,6 +286,20 @@ pub fn embed_progress(pending: u64, per_min: Option<u64>, lang: Lang) -> String 
         lang,
         " ({rate}/min, about {minutes} min left)",
         " (분당 {rate}건, 약 {minutes}분 남음)"
+    )
+}
+
+/// 임베딩 대기의 실시간·가져오기 구분. 대기가 없으면 비운다. (IF-CLI-5)
+fn queue_split(p: &ProjectStatus, lang: Lang) -> String {
+    if p.embed_jobs == 0 {
+        return String::new();
+    }
+    let import = p.embed_jobs_import.min(p.embed_jobs);
+    let live = p.embed_jobs - import;
+    tr!(
+        lang,
+        " [live {live}, import {import}]",
+        " [실시간 {live}, 가져오기 {import}]"
     )
 }
 

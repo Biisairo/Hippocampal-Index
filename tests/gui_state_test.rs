@@ -3,8 +3,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use hippo::gui::state::{
-    ImportForm, ImportProgress, InstallAction, InstallForm, PollGate, purge_may_start,
-    resolve_import_args, run_import, should_poll,
+    ImportForm, ImportProgress, InstallAction, InstallForm, PollGate, QueueSummary,
+    purge_may_start, queue_summary, resolve_import_args, run_import, should_poll,
 };
 use hippo::i18n::Lang;
 use hippo::import::{Candidate, ImportStatus};
@@ -681,4 +681,55 @@ fn purge_waits_for_running_status_request() {
     assert!(!purge_may_start(false, false), "확인 전");
     assert!(!purge_may_start(true, true), "상태 요청이 끝나기를 기다림");
     assert!(purge_may_start(true, false));
+}
+
+// ---- FR-GUI-3: 임베딩 큐 요약 ----
+
+fn project(jobs: u64, import: u64, rate: Option<u64>) -> hippo::protocol::ProjectStatus {
+    hippo::protocol::ProjectStatus {
+        id: "p".into(),
+        location: "/w".into(),
+        exists: true,
+        iterations: 0,
+        results: 0,
+        embed_jobs: jobs,
+        embed_jobs_import: import,
+        vectors: 0,
+        compatibility: "compatible".into(),
+        embed_per_min: rate,
+    }
+}
+
+#[test]
+fn queue_summary_adds_live_import_and_rates() {
+    let st = hippo::protocol::StatusInfo {
+        spool_pending: 0,
+        embed_model: "m".into(),
+        reindex: "idle".into(),
+        projects: vec![
+            project(10, 7, Some(100)),
+            project(5, 0, Some(20)),
+            project(0, 0, None),
+        ],
+    };
+    assert_eq!(
+        queue_summary(&st),
+        QueueSummary {
+            live: 8,
+            import: 7,
+            per_min: Some(120),
+        }
+    );
+    let idle = hippo::protocol::StatusInfo {
+        projects: vec![project(0, 0, None)],
+        ..st
+    };
+    assert_eq!(
+        queue_summary(&idle),
+        QueueSummary {
+            live: 0,
+            import: 0,
+            per_min: None,
+        }
+    );
 }

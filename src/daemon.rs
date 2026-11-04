@@ -1918,6 +1918,7 @@ fn status(shared: &Shared) -> Result<StatusInfo, String> {
             iterations: counts.iterations,
             results: counts.results,
             embed_jobs: counts.embed_jobs,
+            embed_jobs_import: counts.embed_jobs_import,
             vectors: handle.vectors.count().map_err(|e| e.to_string())?,
             compatibility: compatibility.to_string(),
         });

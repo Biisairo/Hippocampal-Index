@@ -424,6 +424,7 @@ fn status_info(iterations: u64, vectors: u64, compatibility: &str, reindex: &str
             iterations,
             results: 0,
             embed_jobs: 0,
+            embed_jobs_import: 0,
             vectors,
             compatibility: compatibility.into(),
             embed_per_min: None,
@@ -656,4 +657,21 @@ fn pause_switches_skip_only_their_hooks() {
         !hook_paused(&no_capture, "user-prompt-submit"),
         "주입은 계속"
     );
+}
+
+// ---- IF-CLI-5: 실시간·가져오기 구분 ----
+
+#[test]
+fn status_render_splits_live_and_import_jobs() {
+    let mut st = status_info(3, 5, "compatible", "idle");
+    assert!(
+        !st.render(Lang::En).contains("import"),
+        "대기가 없으면 구분하지 않음"
+    );
+    st.projects[0].embed_jobs = 10;
+    st.projects[0].embed_jobs_import = 7;
+    let en = st.render(Lang::En);
+    assert!(en.contains("embed_jobs: 10 [live 3, import 7]"), "{en}");
+    let ko = st.render(Lang::Ko);
+    assert!(ko.contains("embed_jobs: 10 [실시간 3, 가져오기 7]"), "{ko}");
 }

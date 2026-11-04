@@ -25,7 +25,7 @@ use crate::gui::images;
 use crate::gui::state::{
     DeleteTarget, ImportForm, ImportProgress, InstallAction, InstallForm, PollGate, PreviewKey,
     RecordsView, Reload, Toast, Toasts, default_project, embed_state, page_count, purge_may_start,
-    resolve_import_args, run_import, should_poll, skip_label, verdict_label,
+    queue_summary, resolve_import_args, run_import, should_poll, skip_label, verdict_label,
 };
 use crate::gui::text::describe;
 use crate::gui::theme;
@@ -716,6 +716,8 @@ impl App {
             "마지막 갱신: {}",
             self.status_at
         ));
+        ui.add_space(4.0);
+        queue_card(ui, st, lang);
         ui.add_space(4.0);
         card(ui, &tr!(lang, "Projects", "프로젝트"), |ui| {
             project_table(ui, st, lang, self.art.character.as_ref());
@@ -2394,7 +2396,9 @@ fn project_table(
         tr!(lang, "location", "위치"),
         tr!(lang, "iterations", "반복"),
         tr!(lang, "results", "결과"),
-        tr!(lang, "pending embeddings", "임베딩 대기"),
+        tr!(lang, "live queue", "실시간 대기"),
+        tr!(lang, "import queue", "가져오기 대기"),
+        tr!(lang, "rate · time left", "속도 · 남은 시간"),
         tr!(lang, "vectors", "벡터"),
         tr!(lang, "compatibility", "호환성"),
     ];
@@ -2405,8 +2409,8 @@ fn project_table(
         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
         .column(Column::auto().at_least(80.0))
         .column(Column::remainder().at_least(200.0).clip(true))
-        .columns(Column::auto().at_least(70.0), 2)
-        .column(Column::auto().at_least(150.0))
+        .columns(Column::auto().at_least(70.0), 4)
+        .column(Column::auto().at_least(170.0))
         .columns(Column::auto().at_least(70.0), 2)
         .header(ROW_HEIGHT, |mut header| {
             for head in &heads {
@@ -2430,21 +2434,62 @@ fn project_table(
                     });
                     row.col(|ui| cell(ui, &p.iterations.to_string()));
                     row.col(|ui| cell(ui, &p.results.to_string()));
-                    row.col(|ui| {
-                        cell(
-                            ui,
-                            &format!(
-                                "{}{}",
-                                p.embed_jobs,
-                                embed_progress(p.embed_jobs, p.embed_per_min, lang)
-                            ),
-                        )
-                    });
+                    let import = p.embed_jobs_import.min(p.embed_jobs);
+                    row.col(|ui| cell(ui, &(p.embed_jobs - import).to_string()));
+                    row.col(|ui| cell(ui, &import.to_string()));
+                    row.col(|ui| cell(ui, &rate_text(p.embed_jobs, p.embed_per_min, lang)));
                     row.col(|ui| cell(ui, &p.vectors.to_string()));
                     row.col(|ui| cell(ui, &p.compatibility));
                 });
             }
         });
+}
+
+/// 속도와 남은 시간. 대기가 없거나 속도를 모르면 `-`. (FR-GUI-3)
+fn rate_text(pending: u64, per_min: Option<u64>, lang: Lang) -> String {
+    match per_min.filter(|r| *r > 0 && pending > 0) {
+        Some(rate) => {
+            let minutes = pending.div_ceil(rate);
+            tr!(
+                lang,
+                "{rate}/min · about {minutes} min",
+                "분당 {rate}건 · 약 {minutes}분"
+            )
+        }
+        None => "-".to_string(),
+    }
+}
+
+/// 모든 프로젝트의 임베딩 큐 요약. (FR-GUI-3)
+fn queue_card(ui: &mut egui::Ui, st: &StatusInfo, lang: Lang) {
+    let q = queue_summary(st);
+    let pending = q.live + q.import;
+    ui.horizontal(|ui| {
+        stat(
+            ui,
+            &tr!(lang, "Embedding queue", "임베딩 큐"),
+            if pending == 0 {
+                RichText::new(tr!(lang, "empty", "대기 없음")).color(ok_color(ui))
+            } else {
+                RichText::new(tr!(lang, "embedding", "임베딩 중")).color(warn_color(ui))
+            },
+        );
+        stat(
+            ui,
+            &tr!(lang, "Live", "실시간"),
+            RichText::new(q.live.to_string()),
+        );
+        stat(
+            ui,
+            &tr!(lang, "Import", "가져오기"),
+            RichText::new(q.import.to_string()),
+        );
+        stat(
+            ui,
+            &tr!(lang, "Rate · time left", "속도 · 남은 시간"),
+            RichText::new(rate_text(pending, q.per_min, lang)),
+        );
+    });
 }
 
 fn candidate_table(ui: &mut egui::Ui, form: &mut ImportForm, lang: Lang) {

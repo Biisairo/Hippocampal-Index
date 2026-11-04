@@ -242,6 +242,21 @@ pub fn stop_ollama(root: &Path) -> bool {
     unsafe { libc::kill(pid, libc::SIGTERM) == 0 }
 }
 
+/// 데몬은 끝날 때까지 `hippo.lock`을 쥔다. 다른 프로세스가 쥐고 있으면 true. (FR-DMN-12)
+pub fn daemon_lock_held(root: &Path) -> bool {
+    let Ok(file) = fs::File::open(crate::config::Paths::new(root.to_path_buf()).lock()) else {
+        return false;
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(fs::TryLockError::WouldBlock) => true,
+        Err(fs::TryLockError::Error(_)) => false,
+    }
+}
+
 /// FR-EMB-1로 띄운 Ollama 서버의 pid를 기록한다. (FR-EMB-4)
 pub fn record_ollama_pid(root: &Path, pid: u32) -> io::Result<()> {
     let file = root.join(OLLAMA_PID);

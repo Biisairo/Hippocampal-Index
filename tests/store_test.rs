@@ -107,6 +107,7 @@ fn stores_iterations_and_results_from_fixture() {
         (counts.iterations, counts.results, counts.embed_jobs),
         (2, 2, 4)
     );
+    assert_eq!(counts.embed_jobs_import, 0, "실시간 작업");
 
     let first = &b.iterations[0].iteration;
     let id = format!("{}:{}", first.session_id, first.message_id);
@@ -1299,4 +1300,16 @@ fn turn_page_is_oldest_first_with_embedding_state() {
     );
     assert_eq!(store.turn_page("sa", "", 1, 1).unwrap().items.len(), 1);
     assert_eq!(store.turn_page("nope", "", 0, 50).unwrap().total, 0);
+}
+
+// ---- IF-CLI-5: 가져오기 작업 수 ----
+
+#[test]
+fn counts_separate_import_jobs_from_live_jobs() {
+    let mut store = RecordStore::open_in_memory().unwrap();
+    let mut b = batch_from_fixture("s2_tools.jsonl");
+    b.bulk = true;
+    store.apply(&b).unwrap();
+    let counts = store.counts().unwrap();
+    assert_eq!((counts.embed_jobs, counts.embed_jobs_import), (4, 4));
 }

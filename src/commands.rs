@@ -16,8 +16,8 @@ use crate::install::{
     settings_file,
 };
 use crate::layout::{
-    LinkState, create_link, forget_claude_dir, link_state, path_has_dir, path_link,
-    record_claude_dir, remove_link, remove_root, stop_ollama,
+    LinkState, create_link, daemon_lock_held, forget_claude_dir, link_state, path_has_dir,
+    path_link, record_claude_dir, remove_link, remove_root, stop_ollama,
 };
 use crate::protocol::{DeleteReport, ImportSessionReport, Request, Response, Scope as QueryScope};
 use crate::search::escape_control;
@@ -26,8 +26,8 @@ use crate::tr;
 
 /// 실행 파일을 바꾼 뒤 이전 데몬에 보내는 종료 요청의 응답 대기 시간. (FR-INS-8)
 const SHUTDOWN_REPLY: Duration = Duration::from_secs(5);
-/// 수동 중지가 데몬 종료를 기다리는 시간. (FR-DMN-12)
-const STOP_DAEMON_WAIT: Duration = Duration::from_secs(10);
+/// 수동 중지가 데몬 프로세스 종료를 기다리는 시간. 처리 중인 임베딩 묶음을 마칠 시간을 준다. (FR-DMN-12)
+const STOP_DAEMON_WAIT: Duration = Duration::from_secs(120);
 const STOP_POLL: Duration = Duration::from_millis(50);
 /// UserPromptSubmit hook timeout(초)은 시간 예산보다 이만큼 여유를 둔다.
 const INJECT_TIMEOUT_MARGIN_SECS: u64 = 2;
@@ -277,10 +277,10 @@ fn shutdown_daemon(root: &Path) -> Result<bool, String> {
 /// 데몬과 hippo가 띄운 Ollama를 멈춘다. 데몬은 소켓 파일이 없어질 때까지 기다린다. (FR-DMN-12)
 pub fn stop_services(root: &Path, lang: Lang, out: &mut String) -> Result<(), String> {
     let socket = Paths::new(root.to_path_buf()).socket();
-    let daemon = shutdown_daemon(root)?;
+    let daemon = shutdown_daemon(root)? || daemon_lock_held(root);
     if daemon {
         let deadline = std::time::Instant::now() + STOP_DAEMON_WAIT;
-        while socket.exists() {
+        while socket.exists() || daemon_lock_held(root) {
             if std::time::Instant::now() >= deadline {
                 return Err(tr!(
                     lang,

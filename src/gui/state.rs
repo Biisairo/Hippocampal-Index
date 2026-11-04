@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crate::commands::{ImportTally, absolute, session_line};
 use crate::i18n::Lang;
 use crate::import::{Candidate, ImportStatus};
-use crate::protocol::{Request, Response, Scope};
+use crate::protocol::{Request, Response, Scope, StatusInfo};
 use crate::registry::is_project_id;
 use crate::search::{SkipReason, Verdict};
 use crate::store::ForgetTarget;
@@ -251,6 +251,32 @@ impl InstallForm {
     pub fn can_run(&self, action: InstallAction) -> bool {
         self.previewed.as_ref() == Some(&self.key(action))
     }
+}
+
+/// 모든 프로젝트의 임베딩 큐 합계. (FR-GUI-3)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueSummary {
+    pub live: u64,
+    pub import: u64,
+    /// 처리 속도 합계(분당 작업 수). 최근에 처리한 작업이 없으면 없다.
+    pub per_min: Option<u64>,
+}
+
+pub fn queue_summary(st: &StatusInfo) -> QueueSummary {
+    let mut sum = QueueSummary {
+        live: 0,
+        import: 0,
+        per_min: None,
+    };
+    for p in &st.projects {
+        let import = p.embed_jobs_import.min(p.embed_jobs);
+        sum.import += import;
+        sum.live += p.embed_jobs - import;
+        if let Some(rate) = p.embed_per_min {
+            sum.per_min = Some(sum.per_min.unwrap_or(0) + rate);
+        }
+    }
+    sum
 }
 
 /// 상태 폴링을 막는 조건들. (FR-GUI-3, FR-GUI-10)

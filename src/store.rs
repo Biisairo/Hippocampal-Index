@@ -156,6 +156,8 @@ pub struct Counts {
     pub iterations: u64,
     pub results: u64,
     pub embed_jobs: u64,
+    /// `embed_jobs` 중 가져오기로 등록한 작업(`bulk = 1`) 수. (IF-CLI-5, FR-IMP-5)
+    pub embed_jobs_import: u64,
 }
 
 /// 삭제 대상. 세션은 그 세션 전부, 턴은 같은 `prompt_id`의 반복 전부이다. (FR-DEL-2, FR-DEL-3)
@@ -586,6 +588,7 @@ impl RecordStore {
             iterations: count("iterations")?,
             results: count("results")?,
             embed_jobs: count("embed_jobs")?,
+            embed_jobs_import: count("embed_jobs WHERE bulk = 1")?,
         })
     }
 

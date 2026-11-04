@@ -4,10 +4,10 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
 use hippo::layout::{
-    InstallState, LinkState, OLLAMA_PID, create_link, default_claude_dir, default_gui_root,
-    forget_claude_dir, install_state, is_app_exe, link_state, path_has_dir, path_link,
-    read_claude_dir, record_claude_dir, remove_link, remove_root, root_from_link, root_of_exe,
-    stop_ollama,
+    InstallState, LinkState, OLLAMA_PID, create_link, daemon_lock_held, default_claude_dir,
+    default_gui_root, forget_claude_dir, install_state, is_app_exe, link_state, path_has_dir,
+    path_link, read_claude_dir, record_claude_dir, remove_link, remove_root, root_from_link,
+    root_of_exe, stop_ollama,
 };
 
 fn real(dir: &Path) -> PathBuf {
@@ -249,4 +249,22 @@ fn stop_ollama_ignores_missing_or_foreign_pid() {
     child.wait().unwrap();
     fs::write(root.join(OLLAMA_PID), "garbage").unwrap();
     assert!(!stop_ollama(root));
+}
+
+// ---- FR-DMN-12: 데몬 프로세스가 끝났는지 ----
+
+#[test]
+fn daemon_lock_shows_whether_daemon_process_is_alive() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    assert!(!daemon_lock_held(root), "잠금 파일 없음");
+    let file = fs::File::create(root.join("hippo.lock")).unwrap();
+    assert!(!daemon_lock_held(root), "파일만 있고 잠금 없음");
+    file.try_lock().unwrap();
+    assert!(
+        daemon_lock_held(root),
+        "다른 프로세스(여기서는 다른 열린 파일)가 쥐고 있음"
+    );
+    file.unlock().unwrap();
+    assert!(!daemon_lock_held(root), "풀림");
 }
