@@ -16,16 +16,33 @@
 
 ## 빠른 시작
 
-macOS, Rust, `protoc`, Ollama가 필요합니다([2. 요구 사항](#2-요구-사항)).
+macOS(Apple Silicon)와 Ollama가 필요합니다. 직접 빌드하려면 Rust와 `protoc`도 필요합니다([2. 요구 사항](#2-요구-사항)).
+
+```bash
+brew install ollama
+ollama serve &                      # 모델을 처음 받을 때만 필요합니다
+ollama pull qwen3-embedding:0.6b
+```
+
+**방법 A: 릴리스에서 받기.** [Releases](https://github.com/Biisairo/Hippocampal-Index/releases)에서 `hippo-<버전>-macos-arm64.zip`을 받아 압축을 풉니다. 이 앱은 Apple 개발자 서명과 공증을 받지 않았으므로, macOS가 내려받은 앱의 실행을 막습니다. 처음 열기 전에 격리 속성을 지웁니다.
+
+```bash
+xattr -dr com.apple.quarantine hippo.app
+open hippo.app                      # 원하면 /Applications로 옮겨도 됩니다
+```
+
+격리 속성을 지우지 않고 시스템 설정의 "그래도 열기"로 열면, 설치가 복사한 `~/.hippo/bin/hippo`에 격리 속성이 남아 hook 실행이 막힐 수 있습니다.
+
+**방법 B: 직접 빌드하기.**
 
 ```bash
 git clone https://github.com/Biisairo/Hippocampal-Index.git hippo && cd hippo
-brew install protobuf ollama
-ollama serve &                      # 모델을 처음 받을 때만 필요합니다
-ollama pull qwen3-embedding:0.6b
+brew install protobuf
 scripts/bundle-app.sh               # target/hippo.app을 만듭니다. 처음 빌드는 몇 분 걸립니다
-open target/hippo.app               # 원하면 /Applications로 옮겨도 됩니다
+open target/hippo.app
 ```
+
+앱을 연 뒤에는 다음과 같습니다.
 
 1. 창의 **Claude 적용** 탭에서 데이터 루트(기본 `~/.hippo`)와 Claude 폴더(기본 `~/.claude`)를 확인합니다.
 2. **적용** 카드의 **미리 보기**로 바뀔 내용을 확인한 뒤 **적용**을 누릅니다.

@@ -16,16 +16,33 @@ All data stays on your machine. Embeddings come from a local Ollama model, and v
 
 ## Quick start
 
-You need macOS, Rust, `protoc`, and Ollama ([2. Requirements](#2-requirements)).
+You need macOS (Apple Silicon) and Ollama. To build it yourself, you also need Rust and `protoc` ([2. Requirements](#2-requirements)).
+
+```bash
+brew install ollama
+ollama serve &                      # needed only to pull the model the first time
+ollama pull qwen3-embedding:0.6b
+```
+
+**Option A: download a release.** From [Releases](https://github.com/Biisairo/Hippocampal-Index/releases), download `hippo-<version>-macos-arm64.zip` and unzip it. The app is not signed or notarized with an Apple developer ID, so macOS blocks a downloaded copy. Before you open it the first time, remove the quarantine attribute:
+
+```bash
+xattr -dr com.apple.quarantine hippo.app
+open hippo.app                      # you can move it to /Applications if you like
+```
+
+If you open it with "Open Anyway" in System Settings instead, the copy that install makes at `~/.hippo/bin/hippo` can keep the quarantine attribute, and the hooks may be blocked.
+
+**Option B: build it yourself.**
 
 ```bash
 git clone https://github.com/Biisairo/Hippocampal-Index.git hippo && cd hippo
-brew install protobuf ollama
-ollama serve &                      # needed only to pull the model the first time
-ollama pull qwen3-embedding:0.6b
+brew install protobuf
 scripts/bundle-app.sh               # makes target/hippo.app; the first build takes a few minutes
-open target/hippo.app               # you can move it to /Applications if you like
+open target/hippo.app
 ```
+
+After the app opens:
 
 1. In the window's **Claude setup** tab, check the data root (default `~/.hippo`) and the Claude folder (default `~/.claude`).
 2. In the **Apply** card, press **Preview** to see the changes, then press **Apply**.
