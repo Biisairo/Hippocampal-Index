@@ -5,7 +5,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
@@ -59,6 +59,8 @@ pub enum DaemonError {
 const POLL: Duration = Duration::from_millis(20);
 const WRITE_POLL: Duration = Duration::from_millis(100);
 const EMBED_IDLE: Duration = Duration::from_secs(1);
+/// 기다리는 삭제가 있을 때 임베딩 스레드가 다음 묶음 전에 쉬는 간격. (FR-DEL-6)
+const DELETE_YIELD: Duration = Duration::from_millis(10);
 const EMBED_RETRY: Duration = Duration::from_secs(5);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const REINDEX_PAGE: usize = 256;
@@ -223,6 +225,8 @@ struct Shared {
     embed_log: Mutex<HashMap<String, VecDeque<(Instant, usize)>>>,
     /// 임베딩 처리와 프로젝트 병합을 서로 막는다. 병합이 지운 프로젝트를 임베딩 스레드가 다시 만들지 않게 한다.
     embed_lock: Mutex<()>,
+    /// 임베딩 잠금을 기다리는 삭제 수. 임베딩 스레드는 이 값이 있으면 양보한다. (FR-DEL-6)
+    deletes_waiting: AtomicUsize,
     write_tx: Sender<WriteJob>,
     notify_tx: Sender<()>,
     reindexing: AtomicBool,
@@ -563,6 +567,7 @@ pub fn start(
         inject_gate: InjectGate::default(),
         embed_log: Mutex::new(HashMap::new()),
         embed_lock: Mutex::new(()),
+        deletes_waiting: AtomicUsize::new(0),
         write_tx,
         notify_tx,
         reindexing: AtomicBool::new(false),
@@ -846,7 +851,7 @@ fn import_plan(shared: &Shared, from: String, to: String) -> Result<Response, St
         shared,
         |reply| WriteJob::ImportPrepare { from, to, reply },
         "import",
-        Some(CONNECTION_TIMEOUT),
+        None,
     );
     let Response::ImportPlan {
         project_id,
@@ -1114,7 +1119,7 @@ fn remove_project(
         return Ok(Some(report));
     }
     lock(&shared.queue)?.remove_project(&id);
-    let _embedding = lock(&shared.embed_lock)?;
+    let _embedding = lock_for_delete(shared)?;
     lock(&shared.open)?.remove(&id);
     lock(&shared.registry)?
         .remove_project(&id)
@@ -1155,7 +1160,7 @@ fn forget(
         return report(shared, &id, preview.counts).map(Some);
     }
     lock(&shared.queue)?.remove(&id, &preview.jobs);
-    let _embedding = lock(&shared.embed_lock)?;
+    let _embedding = lock_for_delete(shared)?;
     let plan = records.forget(target, false).map_err(|e| e.to_string())?;
     let handle = shared.project(&id)?;
     handle
@@ -1191,6 +1196,10 @@ fn spawn_embed(shared: Arc<Shared>, notify: Receiver<()>) -> JoinHandle<()> {
             loop {
                 if shared.stop.load(Ordering::SeqCst) || shared.reindexing.load(Ordering::SeqCst) {
                     break;
+                }
+                if shared.deletes_waiting.load(Ordering::SeqCst) > 0 {
+                    thread::sleep(DELETE_YIELD);
+                    continue;
                 }
                 let Some((project, jobs, from_bulk)) = shared.queue.lock().ok().and_then(|q| {
                     let from_bulk = q.lane_counts().0 == 0;
@@ -1231,7 +1240,16 @@ fn spawn_embed(shared: Arc<Shared>, notify: Receiver<()>) -> JoinHandle<()> {
     })
 }
 
-/// 처리한 작업 수를 돌려준다. `bulk` 작업을 처리하는 중에 일반 작업이 들어오면 작업 1건 뒤 멈춘다. (FR-DMN-6 (b))
+/// 처리한 작업 수를 돌려준다. 삭제가 기다리거나, `bulk` 작업을 처리하는 중에 일반 작업이 들어오면
+/// 작업 1건 뒤 멈춘다. (FR-DMN-6 (b), FR-DEL-6)
+/// 삭제가 임베딩 잠금을 얻는다. 기다리는 동안 임베딩 스레드는 묶음을 멈추고 양보한다. (FR-DEL-6)
+fn lock_for_delete(shared: &Shared) -> Result<MutexGuard<'_, ()>, String> {
+    shared.deletes_waiting.fetch_add(1, Ordering::SeqCst);
+    let guard = lock(&shared.embed_lock);
+    shared.deletes_waiting.fetch_sub(1, Ordering::SeqCst);
+    guard
+}
+
 fn embed_batch(
     shared: &Shared,
     project: &str,
@@ -1258,14 +1276,17 @@ fn embed_batch(
         inner: shared.embedder.as_ref(),
         gate: &shared.inject_gate,
     };
-    let live_waiting = || from_bulk && shared.queue.lock().is_ok_and(|q| q.lane_counts().0 > 0);
+    let yield_now = || {
+        shared.deletes_waiting.load(Ordering::SeqCst) > 0
+            || (from_bulk && shared.queue.lock().is_ok_and(|q| q.lane_counts().0 > 0))
+    };
     let done = process_jobs_until(
         &mut records,
         &embedder,
         handle.vectors.as_ref(),
         shared.chunking(),
         jobs,
-        &live_waiting,
+        &yield_now,
     )
     .map_err(|e| failed(e.to_string()))?;
     if let Err(e) = optimize_if_due(handle.vectors.as_ref(), shared.config.index.optimize_every) {
@@ -1473,7 +1494,7 @@ fn handle_request(shared: &Arc<Shared>, req: Request) -> Response {
                     reply,
                 },
                 "import",
-                Some(CONNECTION_TIMEOUT),
+                None,
             );
         }
         Request::Reindex { scope, cwd } => return start_reindex(shared, &scope, &cwd),
@@ -1544,6 +1565,9 @@ fn handle_request(shared: &Arc<Shared>, req: Request) -> Response {
         Request::InjectPreview { scope, cwd, prompt } => {
             inject_preview(shared, &scope, &cwd, &prompt)
         }
+        Request::CurrentProject { cwd } => shared
+            .lookup(&cwd)
+            .map(|id| Response::CurrentProject { id }),
         Request::Show {
             prompt_id,
             with_results,

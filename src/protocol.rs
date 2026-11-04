@@ -117,6 +117,10 @@ pub enum Request {
         cwd: String,
         prompt: String,
     },
+    /// `cwd`의 프로젝트. 조회 전용 판정이다. (FR-GUI-18)
+    CurrentProject {
+        cwd: String,
+    },
 }
 
 /// 삭제 요청의 응답 내용. (FR-DEL-4)
@@ -201,6 +205,10 @@ pub enum Response {
     InjectPreview {
         plan: InjectionPlan,
         elapsed_ms: u64,
+    },
+    /// 프로젝트가 없으면 `None`. (FR-GUI-18)
+    CurrentProject {
+        id: Option<String>,
     },
     Error {
         message: String,

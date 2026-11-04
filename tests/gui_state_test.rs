@@ -495,3 +495,62 @@ fn labels_follow_the_srs_wording() {
         "벡터 검색 불가"
     );
 }
+
+// ---- FR-GUI-18, FR-GUI-19 ----
+
+use hippo::gui::state::{SUCCESS_TOAST_FOR, Toast, Toasts, default_project};
+
+#[test]
+fn default_project_is_current_project_else_first() {
+    let ids = ["p1".to_string(), "p2".to_string()];
+    assert_eq!(default_project(&ids, Some("p2")).as_deref(), Some("p2"));
+    assert_eq!(default_project(&ids, None).as_deref(), Some("p1"));
+    assert_eq!(
+        default_project(&ids, Some("gone")).as_deref(),
+        Some("p1"),
+        "현재 프로젝트가 목록에 없으면 첫 항목"
+    );
+    assert_eq!(default_project(&[], Some("p1")), None);
+}
+
+#[test]
+fn select_project_reports_whether_the_project_changed() {
+    let mut v = RecordsView::default();
+    assert!(v.select_project("p1"));
+    assert!(!v.select_project("p1"), "같은 프로젝트는 바뀐 것이 아님");
+    assert!(v.select_project("p2"));
+}
+
+#[test]
+fn success_toast_expires_and_error_toast_stays() {
+    let now = std::time::Instant::now();
+    let ok = Toast::success("done".into(), now);
+    assert!(ok.visible(now));
+    assert!(ok.visible(now + SUCCESS_TOAST_FOR - std::time::Duration::from_millis(1)));
+    assert!(!ok.visible(now + SUCCESS_TOAST_FOR));
+    let err = Toast::error("bad".into(), now);
+    assert!(err.is_error());
+    assert!(err.visible(now + std::time::Duration::from_secs(3_600)));
+    assert_eq!(SUCCESS_TOAST_FOR, std::time::Duration::from_secs(5));
+}
+
+#[test]
+fn error_toast_stays_until_closed_even_when_new_messages_arrive() {
+    let now = std::time::Instant::now();
+    let mut toasts = Toasts::default();
+    toasts.push(Toast::error("bad".into(), now));
+    toasts.push(Toast::success("done".into(), now));
+    toasts.expire(now);
+    assert_eq!(texts(&toasts), ["bad", "done"], "새 메시지는 따로 더함");
+    toasts.expire(now + SUCCESS_TOAST_FOR);
+    assert_eq!(texts(&toasts), ["bad"], "성공만 사라짐");
+    toasts.push(Toast::success("again".into(), now + SUCCESS_TOAST_FOR));
+    toasts.close(1);
+    assert_eq!(texts(&toasts), ["bad"], "성공은 5초 전에도 닫을 수 있음");
+    toasts.close(0);
+    assert!(toasts.items().is_empty(), "오류는 닫아야 사라짐");
+}
+
+fn texts(toasts: &Toasts) -> Vec<&str> {
+    toasts.items().iter().map(|t| t.text.as_str()).collect()
+}

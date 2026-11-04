@@ -2614,6 +2614,171 @@ fn delete_waits_for_long_embedding_batch_and_reports_success() {
     handle.shutdown();
 }
 
+#[test]
+fn import_prepare_waits_behind_blocked_writer_and_reports_result() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    let e = env();
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let handle = start(
+        e.paths.clone(),
+        import_config(&e),
+        Arc::new(GatedEmbedder {
+            inner: HashEmbedder::new(256, 8_000),
+            entered: entered.clone(),
+            release: release.clone(),
+        }),
+        memory_source(&e.paths, Arc::new(MemoryVectorStore::default())),
+    )
+    .unwrap();
+    let a = mkdir(&e, "a");
+    ingest_session(&e.paths, "sa", &past(&e, "slug-a", "sa", &a));
+    let other = mkdir(&e, "o");
+    ingest_session(&e.paths, "so", &past(&e, "slug-o", "so", &other));
+    wait_until(|| entered.load(SeqCst));
+    let socket = e.paths.socket();
+    // 묶음을 기다리는 삭제가 쓰기 스레드를 막는다.
+    let forget = std::thread::spawn(move || {
+        request_until_reply(
+            &socket,
+            &forget_req(ForgetTarget::Session("so".into()), None, false),
+        )
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    let b = e._dir.path().join("b");
+    fs::rename(&a, &b).unwrap();
+    let b = fs::canonicalize(&b).unwrap();
+    let socket = e.paths.socket();
+    let (from, to) = (s(&a), s(&b));
+    let prepare = std::thread::spawn(move || {
+        request_until_reply(
+            &socket,
+            &Request::ImportPrepare {
+                from,
+                to,
+                dry_run: false,
+            },
+        )
+    });
+    std::thread::sleep(LONGER_THAN_QUERY_TIMEOUT);
+    assert!(
+        !prepare.is_finished(),
+        "쓰기 스레드가 풀릴 때까지 오류 없이 기다림"
+    );
+    release.store(true, SeqCst);
+    assert!(delete_report(forget.join().unwrap().unwrap()).is_some());
+    match prepare.join().unwrap().unwrap() {
+        Response::ImportPlan { summary, .. } => {
+            assert!(summary.contains("Moved project"), "{summary}")
+        }
+        other => panic!("{other:?}"),
+    }
+    project_at(&status(&e.paths), &b);
+    handle.shutdown();
+}
+
+#[test]
+fn current_project_resolves_cwd_without_registering() {
+    let e = env();
+    let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
+    let current = |cwd: &str| match request(
+        &e.paths.socket(),
+        &Request::CurrentProject { cwd: cwd.into() },
+        TIMEOUT,
+    )
+    .unwrap()
+    {
+        Response::CurrentProject { id } => id,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(current(&s2_cwd()), None, "수집 전에는 프로젝트 없음");
+    assert!(status(&e.paths).projects.is_empty(), "조회는 등록하지 않음");
+    ingest(&e.paths, &e.transcript, HookEvent::Stop);
+    assert_eq!(current(&s2_cwd()), Some(only_project(&e.paths)));
+    handle.shutdown();
+}
+
+/// 웜업이 아닌 임베딩 호출마다 허가 하나를 써야 진행한다.
+struct SteppedEmbedder {
+    inner: HashEmbedder,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    permits: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Embedder for SteppedEmbedder {
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+    fn dimension(&self) -> usize {
+        self.inner.dimension()
+    }
+    fn max_input_tokens(&self) -> usize {
+        self.inner.max_input_tokens()
+    }
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, hippo::embedder::EmbedError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if texts.first().is_some_and(|t| t != "warmup") {
+            self.calls.fetch_add(1, SeqCst);
+            while self
+                .permits
+                .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                .is_err()
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        self.inner.embed(texts)
+    }
+}
+
+#[test]
+fn waiting_delete_preempts_another_projects_batch_after_one_job() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let e = env();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let permits = Arc::new(AtomicUsize::new(0));
+    let handle = start(
+        e.paths.clone(),
+        import_config(&e),
+        Arc::new(SteppedEmbedder {
+            inner: HashEmbedder::new(256, 8_000),
+            calls: calls.clone(),
+            permits: permits.clone(),
+        }),
+        memory_source(&e.paths, Arc::new(MemoryVectorStore::default())),
+    )
+    .unwrap();
+    let a = mkdir(&e, "a");
+    ingest_session(&e.paths, "sa", &past(&e, "slug-a", "sa", &a));
+    wait_until(|| calls.load(SeqCst) == 1);
+    let b = mkdir(&e, "b");
+    ingest_session(&e.paths, "sb", &past(&e, "slug-b", "sb", &b));
+    let jobs_of = |dir: &Path| project_at(&status(&e.paths), dir).embed_jobs;
+    let a_jobs = jobs_of(&a);
+    assert!(a_jobs > 1, "A의 묶음에 작업이 여럿 있어야 함");
+    let socket = e.paths.socket();
+    let forget = std::thread::spawn(move || {
+        request_until_reply(
+            &socket,
+            &forget_req(ForgetTarget::Session("sb".into()), None, false),
+        )
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    permits.store(1, SeqCst);
+    let deadline = Instant::now() + TIMEOUT;
+    while !forget.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let finished = forget.is_finished();
+    let a_left = jobs_of(&a);
+    permits.store(usize::MAX, SeqCst);
+    assert!(finished, "작업 1건 뒤 묶음이 멈추고 삭제가 끝남");
+    assert!(delete_report(forget.join().unwrap().unwrap()).is_some());
+    assert_eq!(a_left, a_jobs - 1, "A의 남은 작업은 큐에 남음");
+    wait_until(|| jobs_of(&a) == 0);
+    handle.shutdown();
+}
+
 // ---- FR-GUI-13~17 (데몬 요청 단위) ----
 
 use hippo::search::{InjectionPlan, SkipReason, Verdict};

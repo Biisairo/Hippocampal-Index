@@ -128,6 +128,14 @@ fn join_lines(lines: &[&str]) -> String {
     text
 }
 
+/// `text`의 끝 줄바꿈 유무를 `original`에 맞춘다. (FR-INS-7)
+fn keep_final_newline(mut text: String, original: &str) -> String {
+    if !original.is_empty() && !original.ends_with('\n') && text.ends_with('\n') {
+        text.pop();
+    }
+    text
+}
+
 /// 블록이 있으면 교체하고, 없으면 빈 줄 하나를 두고 끝에 덧붙인다. (FR-INS-7)
 pub fn upsert_block(text: &str, block: &str) -> Result<String, InstallError> {
     let block = block.to_string();
@@ -141,10 +149,13 @@ pub fn upsert_block(text: &str, block: &str) -> Result<String, InstallError> {
                 .chain(lines[end + 1..].iter())
                 .copied()
                 .collect();
-            Ok(join_lines(&next))
+            Ok(keep_final_newline(join_lines(&next), text))
         }
         None if text.trim().is_empty() => Ok(block),
-        None => Ok(format!("{}\n{block}", join_lines(&lines))),
+        None => Ok(keep_final_newline(
+            format!("{}\n{block}", join_lines(&lines)),
+            text,
+        )),
     }
 }
 
@@ -163,7 +174,7 @@ pub fn remove_block(text: &str) -> Result<String, InstallError> {
     if begin > 0 && next[begin - 1].trim().is_empty() && after_blank {
         next.remove(begin - 1);
     }
-    Ok(join_lines(&next))
+    Ok(keep_final_newline(join_lines(&next), text))
 }
 
 /// 메모리 파일에 안내 블록을 넣거나(`Some`) 지운다(`None`). 공백만 남으면 파일을 지운다. (FR-INS-7)

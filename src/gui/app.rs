@@ -21,7 +21,8 @@ use crate::config_edit::{
 };
 use crate::gui::state::{
     DeleteTarget, ImportForm, ImportProgress, InstallAction, InstallForm, PreviewKey, RecordsView,
-    Reload, embed_state, page_count, resolve_import_args, run_import, skip_label, verdict_label,
+    Reload, Toast, Toasts, default_project, embed_state, page_count, resolve_import_args,
+    run_import, skip_label, verdict_label,
 };
 use crate::gui::text::describe;
 use crate::gui::widgets::{
@@ -226,13 +227,18 @@ struct Records {
     preview_mode: bool,
     query_out: Option<Result<QueryOut, String>>,
     confirm: Option<DeletePreview>,
-    message: Option<String>,
+    toasts: Toasts,
+    /// 실행 경로의 프로젝트. 아직 묻지 않았으면 `None`. (FR-GUI-18)
+    current: Option<Option<String>>,
+    delete_started: Option<Instant>,
     sessions_task: Task<Reply>,
     turns_task: Task<Reply>,
     detail_task: Task<Reply>,
-    query_task: Task<Reply>,
+    /// 질의한 프로젝트와 응답.
+    query_task: Task<(String, Reply)>,
     preview_task: Task<(DeleteTarget, Reply)>,
     delete_task: Task<(DeleteTarget, Reply)>,
+    current_task: Task<Reply>,
 }
 
 #[derive(Default)]
@@ -278,7 +284,9 @@ impl Records {
                 other => Err(error_of(other)),
             });
         }
-        if let Some(reply) = self.query_task.poll() {
+        if let Some((project, reply)) = self.query_task.poll()
+            && self.view.project.as_deref() == Some(project.as_str())
+        {
             self.query_out = Some(match reply {
                 Ok(Response::Hits { hits, notes }) => Ok(QueryOut::Hits(hits, notes)),
                 Ok(Response::InjectPreview { plan, elapsed_ms }) => {
@@ -296,14 +304,26 @@ impl Records {
                 },
             ));
         }
+        if let Some(reply) = self.current_task.poll() {
+            self.current = Some(match reply {
+                Ok(Response::CurrentProject { id }) => id,
+                _ => None,
+            });
+        }
         if let Some((target, reply)) = self.delete_task.poll() {
+            self.delete_started = None;
             match reply {
                 Ok(Response::Delete { .. }) => {
                     self.view.after_delete(&target);
-                    self.message = Some(tr!(lang, "Deleted.", "지웠습니다."));
+                    self.toasts.push(Toast::success(
+                        tr!(lang, "Deleted.", "지웠습니다."),
+                        Instant::now(),
+                    ));
                     return matches!(target, DeleteTarget::Project(_));
                 }
-                other => self.message = Some(error_of(other)),
+                other => self
+                    .toasts
+                    .push(Toast::error(error_of(other), Instant::now())),
             }
         }
         false
@@ -345,7 +365,6 @@ impl Records {
         if self.delete_task.running {
             return;
         }
-        self.message = None;
         let req = target.request(cwd, true);
         let paths = paths.clone();
         self.preview_task
@@ -869,7 +888,8 @@ impl App {
         let stop = Arc::clone(&self.stop);
         let lang = self.lang;
         thread::spawn(move || {
-            let mut send = |req: &Request| query(&paths, req, QUERY_TIMEOUT);
+            // 실제 가져오기 요청은 끝날 때까지 기다린다. (FR-GUI-7)
+            let mut send = |req: &Request| query_until_reply(&paths, req);
             run_import(&mut send, &from, &to, &selected, &stop, &progress, lang);
         });
     }
@@ -1014,7 +1034,11 @@ impl App {
         if let Some(hit) = open
             && let Some(prompt_id) = &hit.prompt_id
         {
+            let before = self.records.view.project.clone();
             self.records.view.open_turn(&hit.project_id, prompt_id);
+            if before != self.records.view.project {
+                self.records.query_out = None;
+            }
             self.tab = Tab::Records;
         }
     }
@@ -1037,14 +1061,25 @@ impl App {
         if r.poll(lang) {
             self.next_poll = Instant::now();
         }
-        if r.view
-            .project
-            .as_ref()
-            .is_none_or(|p| !projects.iter().any(|(id, _)| id == p))
-            && let Some((id, _)) = projects.first()
-        {
-            r.view.select_project(id);
+        if r.current.is_none() {
+            let (paths, req) = (paths.clone(), Request::CurrentProject { cwd: cwd.clone() });
+            r.current_task
+                .start(&ctx, move || query(&paths, &req, QUERY_TIMEOUT));
         }
+        if let Some(current) = &r.current
+            && r.view
+                .project
+                .as_ref()
+                .is_none_or(|p| !projects.iter().any(|(id, _)| id == p))
+        {
+            let ids: Vec<String> = projects.iter().map(|(id, _)| id.clone()).collect();
+            if let Some(id) = default_project(&ids, current.as_deref())
+                && r.view.select_project(&id)
+            {
+                r.query_out = None;
+            }
+        }
+        let deleting = r.delete_task.running;
         let mut delete = None;
         ui.horizontal(|ui| {
             ui.label(tr!(lang, "Project", "프로젝트"));
@@ -1063,8 +1098,9 @@ impl App {
                         if ui
                             .selectable_label(on, project_label(&projects, id))
                             .clicked()
+                            && r.view.select_project(id)
                         {
-                            r.view.select_project(id);
+                            r.query_out = None;
                         }
                     }
                 });
@@ -1077,14 +1113,42 @@ impl App {
             }
             if let Some(id) = &r.view.project
                 && ui
-                    .add(button(tr!(lang, "Delete project", "프로젝트 삭제")))
+                    .add_enabled(
+                        !deleting,
+                        button(tr!(lang, "Delete project", "프로젝트 삭제")),
+                    )
                     .clicked()
             {
                 delete = Some(DeleteTarget::Project(id.clone()));
             }
-            if let Some(message) = &r.message {
+            if let Some(started) = r.delete_started {
                 ui.separator();
-                ui.label(message);
+                ui.spinner();
+                let secs = started.elapsed().as_secs();
+                ui.label(tr!(
+                    lang,
+                    "Deleting… {secs}s (waiting for the embedding job in progress)",
+                    "지우는 중… {secs}초 (처리 중인 임베딩 작업이 끝나기를 기다립니다)"
+                ));
+                ctx.request_repaint_after(Duration::from_secs(1));
+            }
+            let now = Instant::now();
+            r.toasts.expire(now);
+            let mut close = None;
+            for (i, toast) in r.toasts.items().iter().enumerate() {
+                ui.separator();
+                if toast.is_error() {
+                    ui.colored_label(ui.visuals().error_fg_color, &toast.text);
+                } else {
+                    ui.label(&toast.text);
+                    ctx.request_repaint_after(Duration::from_millis(500));
+                }
+                if ui.small_button("×").clicked() {
+                    close = Some(i);
+                }
+            }
+            if let Some(i) = close {
+                r.toasts.close(i);
             }
         });
         if projects.is_empty() {
@@ -1118,7 +1182,7 @@ impl App {
                     {
                         let req = if r.preview_mode {
                             Request::InjectPreview {
-                                scope: QueryScope::Id(id),
+                                scope: QueryScope::Id(id.clone()),
                                 cwd: cwd.clone(),
                                 prompt: r.query.clone(),
                             }
@@ -1127,14 +1191,14 @@ impl App {
                                 query: r.query.clone(),
                                 kind: SearchKind::Iteration,
                                 limit: RECORDS_SEARCH_LIMIT,
-                                scope: QueryScope::Id(id),
+                                scope: QueryScope::Id(id.clone()),
                                 cwd: cwd.clone(),
                                 structured: true,
                             }
                         };
                         let paths = paths.clone();
                         r.query_task
-                            .start(&ctx, move || query(&paths, &req, QUERY_TIMEOUT));
+                            .start(&ctx, move || (id, query(&paths, &req, QUERY_TIMEOUT)));
                     }
                     if r.query_task.running {
                         ui.spinner();
@@ -1169,7 +1233,12 @@ impl App {
             ui.horizontal(|ui| {
                 ui.strong(tr!(lang, "Sessions", "세션"));
                 if let Some(session_id) = &r.view.session
-                    && ui.small_button(tr!(lang, "Delete", "삭제")).clicked()
+                    && ui
+                        .add_enabled(
+                            !deleting,
+                            egui::Button::new(tr!(lang, "Delete", "삭제")).small(),
+                        )
+                        .clicked()
                 {
                     delete = Some(DeleteTarget::Session {
                         project: project.clone(),
@@ -1233,7 +1302,12 @@ impl App {
                 ui.strong(tr!(lang, "Turns", "턴"));
                 if r.view.session.is_some()
                     && let Some(prompt_id) = &r.view.prompt
-                    && ui.small_button(tr!(lang, "Delete", "삭제")).clicked()
+                    && ui
+                        .add_enabled(
+                            !deleting,
+                            egui::Button::new(tr!(lang, "Delete", "삭제")).small(),
+                        )
+                        .clicked()
                 {
                     delete = Some(DeleteTarget::Turn {
                         project: project.clone(),
@@ -1293,7 +1367,12 @@ impl App {
                 ui.strong(tr!(lang, "Turn detail", "턴 상세"));
                 if r.view.session.is_none()
                     && let Some(prompt_id) = &r.view.prompt
-                    && ui.small_button(tr!(lang, "Delete", "삭제")).clicked()
+                    && ui
+                        .add_enabled(
+                            !deleting,
+                            egui::Button::new(tr!(lang, "Delete", "삭제")).small(),
+                        )
+                        .clicked()
                 {
                     delete = Some(DeleteTarget::Turn {
                         project: project.clone(),
@@ -1317,12 +1396,15 @@ impl App {
                         .id_salt("records-detail")
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            if iterations.is_empty() {
-                                ui.weak(tr!(lang, "No records.", "기록 없음"));
-                            }
-                            for it in iterations {
-                                iteration_view(ui, it, lang);
-                            }
+                            // 열 레이아웃의 가로 정렬을 물려받으면 Label이 양쪽 정렬되어 글자 간격이 벌어진다.
+                            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                                if iterations.is_empty() {
+                                    ui.weak(tr!(lang, "No records.", "기록 없음"));
+                                }
+                                for it in iterations {
+                                    iteration_view(ui, it, lang);
+                                }
+                            });
                         });
                 }
             }
@@ -1372,6 +1454,7 @@ impl App {
             if confirmed {
                 let req = target.request(&cwd, false);
                 let paths = paths.clone();
+                r.delete_started = Some(Instant::now());
                 r.delete_task
                     .start(&ctx, move || (target, query_until_reply(&paths, &req)));
             }

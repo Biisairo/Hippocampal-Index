@@ -495,11 +495,14 @@ fn run_import(
     };
     let lang = config.ui.language;
     ensure_daemon(paths, launcher(&config), STARTUP_WAIT);
-    let (project_id, summary, sessions) = match request(
-        &paths.socket(),
-        &Request::ImportPrepare { from, to, dry_run },
-        QUERY_TIMEOUT,
-    ) {
+    // 실제 준비와 세션 가져오기는 끝날 때까지 기다린다. (FR-IMP-1)
+    let prepare = Request::ImportPrepare { from, to, dry_run };
+    let reply = if dry_run {
+        request(&paths.socket(), &prepare, QUERY_TIMEOUT)
+    } else {
+        request_until_reply(&paths.socket(), &prepare)
+    };
+    let (project_id, summary, sessions) = match reply {
         Ok(Response::ImportPlan {
             project_id,
             summary,
@@ -527,7 +530,7 @@ fn run_import(
             session_id: c.session_id.clone(),
             transcript_path: c.transcript_path,
         };
-        let line = match request(&paths.socket(), &req, QUERY_TIMEOUT) {
+        let line = match request_until_reply(&paths.socket(), &req) {
             Ok(Response::ImportSession(r)) => {
                 session_line(n + 1, total, &c.session_id, Ok(&r), &mut tally, lang)
             }

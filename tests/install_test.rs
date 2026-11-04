@@ -335,6 +335,23 @@ fn guide_block_is_english_and_marked() {
 }
 
 #[test]
+fn install_then_remove_keeps_a_file_without_final_newline_byte_identical() {
+    let block = guide_block(Path::new(EXE));
+    let original = "# Mine\nlast line";
+    let installed = upsert_block(original, &block).unwrap();
+    assert!(!installed.ends_with('\n'), "끝 줄바꿈 없음을 유지");
+    assert_eq!(
+        upsert_block(&installed, &block).unwrap(),
+        installed,
+        "다시 넣어도 같음"
+    );
+    assert_eq!(remove_block(&installed).unwrap(), original);
+
+    let middle = format!("top\n\n{block}\nbottom");
+    assert_eq!(remove_block(&middle).unwrap(), "top\n\nbottom");
+}
+
+#[test]
 fn block_is_appended_replaced_and_removed_without_touching_other_text() {
     let original = "# Mine\nkeep this\n";
     let installed = upsert_block(original, &guide_block(Path::new(EXE))).unwrap();

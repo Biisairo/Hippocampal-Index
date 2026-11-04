@@ -175,6 +175,7 @@ fn protocol_roundtrip() {
             session_id: "s".into(),
             transcript_path: PathBuf::from("/t/s.jsonl"),
         },
+        Request::CurrentProject { cwd: "/w".into() },
     ];
     for r in requests {
         let line = serde_json::to_string(&r).unwrap();
@@ -208,6 +209,10 @@ fn protocol_roundtrip() {
             fork_skipped: 1,
             pending_embeds: 3,
         }),
+        Response::CurrentProject { id: None },
+        Response::CurrentProject {
+            id: Some("0123".into()),
+        },
         Response::Error {
             message: "e".into(),
         },

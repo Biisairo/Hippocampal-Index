@@ -2,6 +2,7 @@
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::commands::{ImportTally, absolute, session_line};
 use crate::i18n::Lang;
@@ -308,9 +309,10 @@ pub struct RecordsView {
 }
 
 impl RecordsView {
-    pub fn select_project(&mut self, id: &str) {
+    /// 다른 프로젝트를 골랐으면 참이다. (FR-GUI-16)
+    pub fn select_project(&mut self, id: &str) -> bool {
         if self.project.as_deref() == Some(id) {
-            return;
+            return false;
         }
         self.project = Some(id.to_string());
         self.session = None;
@@ -321,6 +323,7 @@ impl RecordsView {
             sessions: true,
             ..Reload::default()
         };
+        true
     }
 
     pub fn select_session(&mut self, id: &str) {
@@ -429,6 +432,76 @@ pub fn page_count(total: u64) -> usize {
     usize::try_from(total.div_ceil(PAGE_SIZE as u64))
         .unwrap_or(usize::MAX)
         .max(1)
+}
+
+/// 기록 탭이 고를 프로젝트. 현재 프로젝트가 목록에 있으면 그것, 없으면 첫 항목. (FR-GUI-18)
+pub fn default_project(ids: &[String], current: Option<&str>) -> Option<String> {
+    current
+        .and_then(|c| ids.iter().find(|id| id.as_str() == c))
+        .or_else(|| ids.first())
+        .cloned()
+}
+
+/// 성공 토스트가 보이는 시간. (FR-GUI-19)
+pub const SUCCESS_TOAST_FOR: Duration = Duration::from_secs(5);
+
+/// 작업 결과 메시지. 성공은 잠시 뒤 사라지고 오류는 닫을 때까지 남는다. (FR-GUI-19)
+#[derive(Debug, Clone)]
+pub struct Toast {
+    pub text: String,
+    error: bool,
+    shown_at: Instant,
+}
+
+impl Toast {
+    pub fn success(text: String, now: Instant) -> Self {
+        Self {
+            text,
+            error: false,
+            shown_at: now,
+        }
+    }
+
+    pub fn error(text: String, now: Instant) -> Self {
+        Self {
+            text,
+            error: true,
+            shown_at: now,
+        }
+    }
+
+    pub fn is_error(&self) -> bool {
+        self.error
+    }
+
+    pub fn visible(&self, now: Instant) -> bool {
+        self.error || now.duration_since(self.shown_at) < SUCCESS_TOAST_FOR
+    }
+}
+
+/// 떠 있는 토스트들. 새 메시지는 따로 더하고, 오류는 닫을 때만 지운다. (FR-GUI-19)
+#[derive(Debug, Default)]
+pub struct Toasts(Vec<Toast>);
+
+impl Toasts {
+    pub fn push(&mut self, toast: Toast) {
+        self.0.push(toast);
+    }
+
+    /// 시간이 지난 성공 메시지를 지운다.
+    pub fn expire(&mut self, now: Instant) {
+        self.0.retain(|t| t.visible(now));
+    }
+
+    pub fn close(&mut self, index: usize) {
+        if index < self.0.len() {
+            self.0.remove(index);
+        }
+    }
+
+    pub fn items(&self) -> &[Toast] {
+        &self.0
+    }
 }
 
 /// 턴의 임베딩 상태. (FR-GUI-13)
