@@ -112,6 +112,8 @@ pub struct DaemonSection {
     pub idle_timeout_secs: u64,
     /// 열어 둘 프로젝트 저장소 수. (FR-DMN-9)
     pub max_open_projects: usize,
+    /// 처리할 작업이 있는 동안 시스템 유휴 잠자기를 막는다. (FR-DMN-13)
+    pub prevent_sleep: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -362,6 +364,7 @@ impl Default for DaemonSection {
             autostart: true,
             idle_timeout_secs: 1_800,
             max_open_projects: 8,
+            prevent_sleep: true,
         }
     }
 }

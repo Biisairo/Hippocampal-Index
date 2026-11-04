@@ -34,6 +34,7 @@ fn defaults_match_srs() {
     assert!(c.redact.patterns.is_empty());
     assert!(c.daemon.autostart);
     assert_eq!(c.daemon.idle_timeout_secs, 1_800);
+    assert!(c.daemon.prevent_sleep);
 }
 
 #[test]
@@ -48,8 +49,12 @@ fn query_prefix_and_min_prompt_chars_override() {
 
 #[test]
 fn daemon_section_override() {
-    let c = Config::parse("[daemon]\nautostart = false\nidle_timeout_secs = 0\n").unwrap();
+    let c = Config::parse(
+        "[daemon]\nautostart = false\nidle_timeout_secs = 0\nprevent_sleep = false\n",
+    )
+    .unwrap();
     assert!(!c.daemon.autostart);
+    assert!(!c.daemon.prevent_sleep);
     assert_eq!(c.daemon.idle_timeout_secs, 0);
 }
 

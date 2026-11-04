@@ -108,6 +108,10 @@ pub fn describe(section: &str, key: &str, lang: Lang) -> &'static str {
             "Project vector stores kept open at once",
             "동시에 열어 둘 프로젝트 벡터 저장소 수",
         ),
+        ("daemon", "prevent_sleep") => (
+            "Keep the Mac from idle sleep while work is pending",
+            "처리할 작업이 남은 동안 Mac의 유휴 잠자기를 막음",
+        ),
         ("project", "git_timeout_ms") => (
             "git time limit. Over it, the folder counts as non-git",
             "git 실행 시간 제한. 넘으면 git이 아닌 폴더로 봄",

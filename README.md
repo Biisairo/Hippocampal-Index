@@ -149,7 +149,7 @@ Search is **hybrid**: vector similarity plus SQLite FTS5 keyword search, merged 
 
 | Component | Opened | Closed |
 |-----------|--------|--------|
-| Daemon | Automatically, by the first hook or CLI command that cannot reach it | After `idle_timeout_secs` with no requests (never during a reindex), or when you stop it |
+| Daemon | Automatically, by the first hook or CLI command that cannot reach it | After `idle_timeout_secs` with no requests (never while work is pending), or when you stop it |
 | SQLite | For each operation | When the operation ends |
 | LanceDB (per project) | When the project is first used | The least recently used project is closed when more than `max_open_projects` (default 8) are open. All are closed when the daemon exits |
 | Embedding model | By Ollama, at the first embedding request (about 1 s) | By Ollama, `keep_alive` (30 minutes) after the last request |
@@ -470,6 +470,7 @@ optimize_every = 20                 # after this many vector store changes, merg
 autostart = true                   # hooks and CLI start the daemon when it is not running
 idle_timeout_secs = 1800           # stop after this many seconds without requests (0 = never)
 max_open_projects = 8              # project vector stores kept open at the same time
+prevent_sleep = true               # keep the Mac from idle sleep while work is pending (closing the lid still sleeps)
 
 [project]
 git_timeout_ms = 1000              # time limit for git; if exceeded, the folder is treated as non-git

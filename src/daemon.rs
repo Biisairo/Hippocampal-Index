@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::awake::SleepGuard;
 use crate::backends::VectorSource;
 use crate::config::{Config, Paths};
 use crate::embed_text::chunk_limit;
@@ -62,6 +63,7 @@ const EMBED_IDLE: Duration = Duration::from_secs(1);
 /// 기다리는 삭제가 있을 때 임베딩 스레드가 다음 묶음 전에 쉬는 간격. (FR-DEL-6)
 const DELETE_YIELD: Duration = Duration::from_millis(10);
 const EMBED_RETRY: Duration = Duration::from_secs(5);
+const AWAKE_POLL: Duration = Duration::from_secs(1);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const REINDEX_PAGE: usize = 256;
 const LOG_FILE: &str = "hippo.log";
@@ -228,6 +230,10 @@ struct Shared {
     /// 임베딩 잠금을 기다리는 삭제 수. 임베딩 스레드는 이 값이 있으면 양보한다. (FR-DEL-6)
     deletes_waiting: AtomicUsize,
     write_tx: Sender<WriteJob>,
+    /// 쓰기 스레드에 보냈지만 아직 처리를 마치지 않은 작업 수. (FR-DMN-13)
+    writes_pending: AtomicUsize,
+    /// 마지막 임베딩 시도가 실패해 재시도를 기다리는 중. (FR-DMN-13)
+    embed_failing: AtomicBool,
     notify_tx: Sender<()>,
     reindexing: AtomicBool,
     /// 재색인 중인 프로젝트. 이 프로젝트를 다시 열 때는 세대를 정리하지 않는다. (FR-SWP-9)
@@ -467,15 +473,24 @@ impl Shared {
         }
     }
 
-    /// 마지막 요청 후 유휴 시간이 지났고 재색인 중이 아니면 true. (FR-DMN-8)
+    /// 마지막 요청 후 유휴 시간이 지났고 처리할 작업이 없으면 true. (FR-DMN-8)
     fn idle_expired(&self) -> bool {
         let timeout = self.config.daemon.idle_timeout_secs;
-        if timeout == 0 || self.reindexing.load(Ordering::SeqCst) {
+        if timeout == 0 {
             return false;
         }
         self.last_activity
             .lock()
             .is_ok_and(|last| last.elapsed() >= Duration::from_secs(timeout))
+            && !self.busy()
+    }
+
+    /// 처리할 작업이 있으면 true. 재색인을 포함한다. (FR-DMN-8, FR-DMN-13)
+    fn busy(&self) -> bool {
+        self.writes_pending.load(Ordering::SeqCst) > 0
+            || self.reindexing.load(Ordering::SeqCst)
+            || (!self.embed_failing.load(Ordering::SeqCst)
+                && self.queue.lock().is_ok_and(|q| !q.is_empty()))
     }
 
     fn log(&self, message: &str) {
@@ -569,6 +584,8 @@ pub fn start(
         embed_lock: Mutex::new(()),
         deletes_waiting: AtomicUsize::new(0),
         write_tx,
+        writes_pending: AtomicUsize::new(0),
+        embed_failing: AtomicBool::new(false),
         notify_tx,
         reindexing: AtomicBool::new(false),
         reindex_project: Mutex::new(None),
@@ -581,11 +598,14 @@ pub fn start(
     }
     spawn_warmup(Arc::clone(&shared));
 
-    let threads = vec![
+    let mut threads = vec![
         spawn_writer(Arc::clone(&shared), redactor, write_rx),
         spawn_embed(Arc::clone(&shared), notify_rx),
         spawn_accept(Arc::clone(&shared), listener),
     ];
+    if shared.config.daemon.prevent_sleep {
+        threads.push(spawn_awake(Arc::clone(&shared)));
+    }
     Ok(DaemonHandle {
         shared,
         threads,
@@ -600,6 +620,22 @@ fn spawn_warmup(shared: Arc<Shared>) {
             shared.log(&format!("embedder warmup failed: {e}"));
         }
     });
+}
+
+/// 처리할 작업이 있는 동안 유휴 잠자기를 막는다. 데몬이 멈추면 놓는다. (FR-DMN-13)
+fn spawn_awake(shared: Arc<Shared>) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut guard = SleepGuard::caffeinate(std::process::id());
+        while !shared.stop.load(Ordering::SeqCst) {
+            if let Some(message) = guard.update(shared.busy()) {
+                shared.log(&message);
+            }
+            let deadline = Instant::now() + AWAKE_POLL;
+            while Instant::now() < deadline && !shared.stop.load(Ordering::SeqCst) {
+                thread::sleep(WRITE_POLL);
+            }
+        }
+    })
 }
 
 /// 수집과 프로젝트 가져오기는 이 스레드 하나가 요청 순서대로 처리한다. 시작할 때 스풀을 먼저 비운다. (FR-DMN-6, FR-CAP-6)
@@ -620,6 +656,10 @@ fn spawn_writer(shared: Arc<Shared>, redactor: Redactor, rx: Receiver<WriteJob>)
         };
         match spool::take_all(&shared.paths.spool()) {
             Ok(files) => {
+                let spooled = !files.is_empty();
+                if spooled {
+                    shared.writes_pending.fetch_add(1, Ordering::SeqCst);
+                }
                 for (file, requests) in files {
                     for req in &requests {
                         run(req);
@@ -627,6 +667,9 @@ fn spawn_writer(shared: Arc<Shared>, redactor: Redactor, rx: Receiver<WriteJob>)
                     if let Err(e) = spool::finish(&file) {
                         shared.log(&format!("spool cleanup failed: {e}"));
                     }
+                }
+                if spooled {
+                    shared.writes_pending.fetch_sub(1, Ordering::SeqCst);
                 }
             }
             Err(e) => shared.log(&format!("spool read failed: {e}")),
@@ -657,7 +700,9 @@ fn spawn_writer(shared: Arc<Shared>, redactor: Redactor, rx: Receiver<WriteJob>)
                     }
                 }
             }
-            match pending.pop() {
+            let job = pending.pop();
+            let handled = job.is_some();
+            match job {
                 Some(WriteJob::Ingest(req, reply)) => {
                     let _ = reply.send(run(&req));
                 }
@@ -699,6 +744,9 @@ fn spawn_writer(shared: Arc<Shared>, redactor: Redactor, rx: Receiver<WriteJob>)
                 }
                 None if disconnected => break,
                 None => {}
+            }
+            if handled {
+                shared.writes_pending.fetch_sub(1, Ordering::SeqCst);
             }
         }
     })
@@ -1210,6 +1258,7 @@ fn spawn_embed(shared: Arc<Shared>, notify: Receiver<()>) -> JoinHandle<()> {
                 };
                 match embed_batch(&shared, &project, &jobs, from_bulk, &mut next_index_at) {
                     Ok(done) => {
+                        shared.embed_failing.store(false, Ordering::SeqCst);
                         shared.record_embedded(&project, done);
                         if let Ok(mut q) = shared.queue.lock() {
                             q.remove(&project, &jobs[..done]);
@@ -1221,6 +1270,7 @@ fn spawn_embed(shared: Arc<Shared>, notify: Receiver<()>) -> JoinHandle<()> {
                         }
                     }
                     Err(EmbedFailure::Failed(message)) => {
+                        shared.embed_failing.store(true, Ordering::SeqCst);
                         shared.log(&format!("embedding failed: {message}"));
                         wait = EMBED_RETRY;
                         break;
@@ -1449,7 +1499,9 @@ fn send_write(
     wait: Option<Duration>,
 ) -> Response {
     let (tx, rx) = mpsc::channel();
+    shared.writes_pending.fetch_add(1, Ordering::SeqCst);
     if shared.write_tx.send(make(tx)).is_err() {
+        shared.writes_pending.fetch_sub(1, Ordering::SeqCst);
         return Response::Error {
             message: "write worker stopped".into(),
         };

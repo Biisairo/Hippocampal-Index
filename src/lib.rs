@@ -1,3 +1,4 @@
+pub mod awake;
 pub mod backends;
 pub mod bg;
 pub mod client;

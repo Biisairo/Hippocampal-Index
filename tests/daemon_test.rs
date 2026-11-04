@@ -2,7 +2,8 @@ mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use common::*;
@@ -773,6 +774,78 @@ fn reindex_blocks_idle_exit() {
         "재색인 중에는 유휴 종료하지 않음"
     );
     assert!(exits_within(handle, Duration::from_secs(20)));
+}
+
+/// `open`이 거짓이면 임베딩을 막고 기다린다. `failing`이 참이면 실패한다.
+struct GateEmbedder {
+    inner: HashEmbedder,
+    open: Arc<AtomicBool>,
+    failing: bool,
+}
+
+impl Embedder for GateEmbedder {
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+    fn dimension(&self) -> usize {
+        self.inner.dimension()
+    }
+    fn max_input_tokens(&self) -> usize {
+        self.inner.max_input_tokens()
+    }
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, hippo::embedder::EmbedError> {
+        while !self.open.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if self.failing {
+            return Err(hippo::embedder::EmbedError::Unavailable("test".into()));
+        }
+        self.inner.embed(texts)
+    }
+}
+
+fn gated_idle_daemon(e: &Env, open: &Arc<AtomicBool>, failing: bool) -> mpsc::Receiver<()> {
+    let embedder: Arc<dyn Embedder> = Arc::new(GateEmbedder {
+        inner: HashEmbedder::new(256, 8_000),
+        open: Arc::clone(open),
+        failing,
+    });
+    let handle = start(
+        e.paths.clone(),
+        config_with("[daemon]\nidle_timeout_secs = 1\n"),
+        embedder,
+        memory_source(&e.paths, Arc::new(MemoryVectorStore::default())),
+    )
+    .unwrap();
+    ingest(&e.paths, &e.transcript, HookEvent::Stop);
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        handle.wait();
+        let _ = tx.send(());
+    });
+    rx
+}
+
+#[test]
+fn pending_embeddings_block_idle_exit() {
+    let e = env();
+    let open = Arc::new(AtomicBool::new(false));
+    let exited = gated_idle_daemon(&e, &open, false);
+    assert!(
+        exited.recv_timeout(Duration::from_millis(2_500)).is_err(),
+        "임베딩 대기 작업이 있으면 유휴 종료하지 않음"
+    );
+    assert!(e.paths.socket().exists());
+    open.store(true, Ordering::SeqCst);
+    assert!(exited.recv_timeout(Duration::from_secs(10)).is_ok());
+}
+
+#[test]
+fn failing_embedder_allows_idle_exit() {
+    let e = env();
+    let open = Arc::new(AtomicBool::new(true));
+    let exited = gated_idle_daemon(&e, &open, true);
+    assert!(exited.recv_timeout(Duration::from_secs(10)).is_ok());
 }
 
 // ---- FR-RET-8 ----

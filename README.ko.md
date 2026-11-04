@@ -149,7 +149,7 @@ open target/hippo.app
 
 | 구성 요소 | 여는 시점 | 닫는 시점 |
 |-----------|-----------|-----------|
-| 데몬 | 데몬에 연결하지 못한 첫 hook이나 CLI 명령이 자동으로 띄움 | 요청 없이 `idle_timeout_secs`가 지났을 때(재색인 중에는 내려가지 않음), 또는 직접 멈출 때 |
+| 데몬 | 데몬에 연결하지 못한 첫 hook이나 CLI 명령이 자동으로 띄움 | 요청 없이 `idle_timeout_secs`가 지났을 때(처리할 작업이 남아 있으면 끝날 때까지 내려가지 않음), 또는 직접 멈출 때 |
 | SQLite | 작업마다 엶 | 작업이 끝날 때 |
 | LanceDB (프로젝트별) | 그 프로젝트를 처음 쓸 때 | 열어 둔 프로젝트가 `max_open_projects`(기본 8)를 넘으면 가장 오래 쓰지 않은 것부터 닫음. 데몬이 종료할 때 모두 닫음 |
 | 임베딩 모델 | 첫 임베딩 요청 때 Ollama가 올림(약 1초) | 마지막 요청 후 `keep_alive`(30분)가 지나면 Ollama가 내림 |
@@ -470,6 +470,7 @@ optimize_every = 20                 # 벡터 저장소를 이만큼 수정하면
 autostart = true                   # 데몬이 없으면 hook과 CLI가 띄움
 idle_timeout_secs = 1800           # 요청 없이 이 시간(초)이 지나면 종료 (0이면 종료하지 않음)
 max_open_projects = 8              # 동시에 열어 둘 프로젝트 벡터 저장소 수
+prevent_sleep = true               # 처리할 작업이 남은 동안 Mac의 유휴 잠자기를 막음 (덮개를 닫으면 잠듦)
 
 [project]
 git_timeout_ms = 1000              # git 실행 시간 제한. 넘으면 git이 아닌 폴더로 봄

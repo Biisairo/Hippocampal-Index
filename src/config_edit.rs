@@ -131,6 +131,11 @@ pub fn fields(c: &Config) -> Vec<Field> {
             "max_open_projects",
             int(c.daemon.max_open_projects),
         ),
+        (
+            "daemon",
+            "prevent_sleep",
+            FieldValue::Bool(c.daemon.prevent_sleep),
+        ),
         ("project", "git_timeout_ms", int(c.project.git_timeout_ms)),
         (
             "import",

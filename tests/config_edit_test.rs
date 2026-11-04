@@ -47,6 +47,7 @@ optimize_every = 7
 autostart = false
 idle_timeout_secs = 0
 max_open_projects = 2
+prevent_sleep = false
 [project]
 git_timeout_ms = 3
 [import]
@@ -88,10 +89,10 @@ fn fields_read_every_key_and_save_round_trips() {
     let all = Config::parse(ALL_KEYS).unwrap();
     let defaults = fields(&Config::default());
     let set = fields(&all);
-    assert_eq!(set.len(), 35);
+    assert_eq!(set.len(), 36);
     assert_eq!(
         changed(&defaults, &set).len(),
-        35,
+        36,
         "모든 키가 설정값을 읽음"
     );
     let d = dir();
