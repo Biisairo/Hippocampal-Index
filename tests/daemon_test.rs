@@ -27,6 +27,7 @@ fn s2_cwd() -> String {
     fixture_cwd("s2_tools.jsonl")
 }
 const TIMEOUT: Duration = Duration::from_secs(10);
+const RELAUNCH_WAIT: Duration = Duration::from_secs(2);
 
 fn hook_no_autostart(paths: &Paths, budget: Duration, event: &str, input: &str) -> Option<String> {
     run_hook(paths, budget, budget, event, input, &launch_disabled)
@@ -88,6 +89,22 @@ fn launch_with(
         embedder,
         memory_source(paths, vectors),
     )
+}
+
+/// 같은 루트에서 데몬을 다시 띄운다. 다른 테스트 스레드가 자식 프로세스를 띄우는 동안에는
+/// 그 자식이 닫힌 잠금 fd를 exec 전까지 잠깐 쥐므로, `AlreadyRunning`이면 잠시 다시 시도한다.
+fn relaunch(
+    launch: impl Fn() -> Result<DaemonHandle, DaemonError>,
+) -> Result<DaemonHandle, DaemonError> {
+    let deadline = Instant::now() + RELAUNCH_WAIT;
+    loop {
+        match launch() {
+            Err(DaemonError::AlreadyRunning) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
 }
 
 fn status(paths: &Paths) -> StatusInfo {
@@ -303,7 +320,7 @@ fn second_instance_is_rejected_and_lock_released_on_shutdown() {
         Err(DaemonError::AlreadyRunning)
     ));
     first.shutdown();
-    let again = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
+    let again = relaunch(|| launch(&e.paths, Arc::new(MemoryVectorStore::default()))).unwrap();
     assert!(status(&e.paths).projects.is_empty());
     again.shutdown();
 }
@@ -558,12 +575,14 @@ fn lancedb_reindex_switches_generation_and_survives_restart() {
     assert_eq!(totals(&status(&e.paths)).2, 4);
     handle.shutdown();
 
-    let handle = start(
-        e.paths.clone(),
-        config.clone(),
-        embedder,
-        vector_source(&config).unwrap(),
-    )
+    let handle = relaunch(|| {
+        start(
+            e.paths.clone(),
+            config.clone(),
+            embedder.clone(),
+            vector_source(&config).unwrap(),
+        )
+    })
     .unwrap();
     let st = status(&e.paths);
     assert_eq!(
@@ -1758,7 +1777,9 @@ fn cold_start_hook_uses_cold_budget_and_daemon_honors_request_budget() {
     let vectors = Arc::new(MemoryVectorStore::default());
     let prompt = indexed_then_stopped(&e, &vectors);
     let slot: Mutex<Option<DaemonHandle>> = Mutex::new(None);
-    let launcher = |paths: &Paths| match launch_with(paths, vectors.clone(), zero_budget_config()) {
+    let launcher = |paths: &Paths| match relaunch(|| {
+        launch_with(paths, vectors.clone(), zero_budget_config())
+    }) {
         Ok(handle) => {
             *slot.lock().unwrap() = Some(handle);
             Ok(())
@@ -1869,12 +1890,14 @@ fn daemon_uses_cold_budget_when_model_is_not_loaded() {
     let e = env();
     let vectors = Arc::new(MemoryVectorStore::default());
     let prompt = indexed_then_stopped(&e, &vectors);
-    let handle = start(
-        e.paths.clone(),
-        zero_budget_config(),
-        Arc::new(UnloadedEmbedder(HashEmbedder::new(256, 8_000))),
-        memory_source(&e.paths, vectors),
-    )
+    let handle = relaunch(|| {
+        start(
+            e.paths.clone(),
+            zero_budget_config(),
+            Arc::new(UnloadedEmbedder(HashEmbedder::new(256, 8_000))),
+            memory_source(&e.paths, vectors.clone()),
+        )
+    })
     .unwrap();
     assert!(
         matches!(
@@ -1965,7 +1988,7 @@ fn pending_jobs_survive_shutdown_request() {
         "남은 작업은 원본 저장소에 남음"
     );
 
-    let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
+    let handle = relaunch(|| launch(&e.paths, Arc::new(MemoryVectorStore::default()))).unwrap();
     wait_until(|| {
         let (_, jobs, vectors) = totals(&status(&e.paths));
         jobs == 0 && vectors > 0
