@@ -50,6 +50,7 @@ git_timeout_ms = 3
 transcripts_dir = "/t"
 [ui]
 language = "ko"
+theme = "dark"
 [[redact.patterns]]
 kind = "k"
 pattern = 'P-\d+'
@@ -84,10 +85,10 @@ fn fields_read_every_key_and_save_round_trips() {
     let all = Config::parse(ALL_KEYS).unwrap();
     let defaults = fields(&Config::default());
     let set = fields(&all);
-    assert_eq!(set.len(), 32);
+    assert_eq!(set.len(), 33);
     assert_eq!(
         changed(&defaults, &set).len(),
-        32,
+        33,
         "모든 키가 설정값을 읽음"
     );
     let d = dir();
@@ -234,6 +235,12 @@ fn restart_and_reindex_needs_follow_changed_keys() {
     let one = |s, k, v| vec![field(s, k, v)];
     let lang = one("ui", "language", FieldValue::Text("ko".into()));
     assert_eq!((needs_restart(&lang), needs_reindex(&lang)), (false, false));
+    let theme = one("ui", "theme", FieldValue::Text("dark".into()));
+    assert_eq!(
+        (needs_restart(&theme), needs_reindex(&theme)),
+        (false, false),
+        "테마는 GUI만 쓴다"
+    );
     let threshold = one("inject", "threshold", FieldValue::Float(0.5));
     assert_eq!(
         (needs_restart(&threshold), needs_reindex(&threshold)),

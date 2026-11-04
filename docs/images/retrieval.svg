@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="640" viewBox="0 0 960 640" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <style>
+    .title { font-size: 20px; font-weight: 700; fill: #3B3654; }
+    .head { font-size: 15px; font-weight: 700; fill: #3B3654; }
+    .body { font-size: 13px; fill: #3B3654; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; font-weight: 700; fill: #3B3654; }
+    .note { font-size: 12.5px; fill: #6E6786; }
+    .tag { font-size: 11.5px; fill: #5B4BA6; }
+    .num { font-size: 12px; font-weight: 700; fill: #FFFDF9; }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8E7CC3"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="960" height="640" rx="18" fill="#FDF6EC"/>
+  <text class="title" x="32" y="44">How memory is found and injected</text>
+  <text class="note" x="32" y="66">On every prompt, the UserPromptSubmit hook asks the daemon for related turns from earlier sessions of the same project.</text>
+
+  <!-- row 1 -->
+  <rect x="32" y="90" width="272" height="132" rx="14" fill="#FFFDF9" stroke="#D9D1F2" stroke-width="2"/>
+  <circle cx="56" cy="116" r="11" fill="#8E7CC3"/><text class="num" x="52" y="120">1</text>
+  <text class="head" x="76" y="121">You send a prompt</text>
+  <text class="note" x="50" y="150">The hook waits at most 800 ms</text>
+  <text class="note" x="50" y="168">(2.5 s when the daemon or model</text>
+  <text class="note" x="50" y="186">is cold). Too slow means no</text>
+  <text class="note" x="50" y="204">memory, never a slow prompt.</text>
+
+  <rect x="344" y="90" width="272" height="132" rx="14" fill="#FFFDF9" stroke="#D9D1F2" stroke-width="2"/>
+  <circle cx="368" cy="116" r="11" fill="#8E7CC3"/><text class="num" x="364" y="120">2</text>
+  <text class="head" x="388" y="121">Skip when not useful</text>
+  <text class="note" x="362" y="150">· background task notifications</text>
+  <text class="note" x="362" y="170">· prompts under 11 characters</text>
+  <text class="note" x="362" y="188">  such as "go on"</text>
+  <text class="note" x="362" y="208">· no project for this folder</text>
+
+  <rect x="656" y="90" width="272" height="132" rx="14" fill="#FFFDF9" stroke="#D9D1F2" stroke-width="2"/>
+  <circle cx="680" cy="116" r="11" fill="#8E7CC3"/><text class="num" x="676" y="120">3</text>
+  <text class="head" x="700" y="121">Embed the query</text>
+  <text class="mono" x="674" y="150">query_prefix + prompt</text>
+  <text class="note" x="674" y="172">local Ollama model. It goes</text>
+  <text class="note" x="674" y="190">ahead of background embedding.</text>
+
+  <path d="M304 156 L342 156" stroke="#8E7CC3" stroke-width="2" marker-end="url(#arrow)"/>
+  <path d="M616 156 L654 156" stroke="#8E7CC3" stroke-width="2" marker-end="url(#arrow)"/>
+  <path d="M792 222 L792 252" stroke="#8E7CC3" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- row 2: search -->
+  <rect x="32" y="254" width="896" height="150" rx="14" fill="#FFFDF9" stroke="#8E7CC3" stroke-width="2"/>
+  <circle cx="56" cy="280" r="11" fill="#8E7CC3"/><text class="num" x="52" y="284">4</text>
+  <text class="head" x="76" y="285">Hybrid search</text>
+  <text class="note" x="196" y="285">current project only, other sessions only</text>
+
+  <rect x="50" y="300" width="300" height="88" rx="10" fill="#EFE8F7"/>
+  <text class="head" x="66" y="324">Meaning</text>
+  <text class="note" x="66" y="346">vector similarity in LanceDB</text>
+  <text class="note" x="66" y="366">finds "the same idea, other words"</text>
+
+  <rect x="368" y="300" width="300" height="88" rx="10" fill="#EFE8F7"/>
+  <text class="head" x="384" y="324">Keywords</text>
+  <text class="note" x="384" y="346">SQLite FTS5 (trigram)</text>
+  <text class="note" x="384" y="366">finds exact names like validateToken</text>
+
+  <rect x="686" y="300" width="226" height="88" rx="10" fill="#D9D1F2"/>
+  <text class="head" x="702" y="324">Merge with RRF</text>
+  <text class="mono" x="702" y="348">Σ 1 / (60 + rank)</text>
+  <text class="note" x="702" y="370">one ranked list</text>
+  <text class="head" x="354" y="349">+</text>
+  <path d="M668 344 L684 344" stroke="#8E7CC3" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <path d="M792 404 L792 434" stroke="#8E7CC3" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- row 3 -->
+  <rect x="500" y="436" width="428" height="150" rx="14" fill="#FFFDF9" stroke="#D9D1F2" stroke-width="2"/>
+  <circle cx="524" cy="462" r="11" fill="#8E7CC3"/><text class="num" x="520" y="466">5</text>
+  <text class="head" x="544" y="467">Choose turns</text>
+  <text class="note" x="518" y="496">· keep iterations with similarity ≥ 0.50</text>
+  <text class="note" x="518" y="516">  (keyword-only hits are not injected)</text>
+  <text class="note" x="518" y="536">· group them by turn (same prompt id)</text>
+  <text class="note" x="518" y="556">· up to 3 turns, at most 12,000 characters</text>
+
+  <path d="M500 511 L464 511" stroke="#8E7CC3" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="32" y="436" width="430" height="150" rx="14" fill="#FBE9DC"/>
+  <circle cx="56" cy="462" r="11" fill="#8E7CC3"/><text class="num" x="52" y="466">6</text>
+  <text class="head" x="76" y="467">Inject before Claude answers</text>
+  <text class="mono" x="50" y="496">&lt;memory ts="…" prompt="…"&gt;</text>
+  <text class="mono" x="50" y="514">  [input] … [response] …</text>
+  <text class="mono" x="50" y="532">&lt;/memory&gt;</text>
+  <text class="note" x="50" y="558">oldest first, marked as past records,</text>
+  <text class="note" x="50" y="576">not instructions; tool calls left out</text>
+
+  <text class="tag" x="32" y="616">On demand: hippo search runs the same hybrid search (--scope all for every project), and hippo show prints a whole turn.</text>
+</svg>

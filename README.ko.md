@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/banner.png" alt="Hippocampal Index" width="720"></p>
+
 # Hippocampal Index (해마 색인, `hippo`)
 
 **Claude Code 세션을 위한 장기 기억.**
@@ -82,27 +84,13 @@
 - **프로젝트의 위치**: git 저장소면 git common dir(`.git`)이고, 아니면 그 폴더입니다. 하위 디렉터리에서 연 세션과 git worktree는 원본 저장소와 같은 프로젝트가 됩니다.
 - **폴더를 옮긴 경우**: git 저장소는 루트 커밋이 같고 이전 위치가 사라졌으면 자동으로 이어 씁니다. git이 아닌 폴더는 `hippo import --from <이전 경로>`로 직접 가져옵니다([4.4](#44-프로젝트와-과거-기록-가져오기) 참고).
 
-```
-~/.hippo/registry.sqlite      목록 DB: 프로젝트, 위치, 루트 커밋, 세션 → 프로젝트
-~/.hippo/projects/<id>/       프로젝트 하나 = 아래 원본 저장소 + 벡터 저장소
-```
-
-```
-원본 저장소 (SQLite, 기준 데이터)
- ├─ iterations          반복마다 한 행 (+ 전문 검색 인덱스)
- ├─ results             도구 출력. SHA-256으로 중복 제거 (+ 전문 검색 인덱스)
- ├─ iteration_results   반복과 결과의 연결
- ├─ bg_tasks / bg_completions
- ├─ embed_jobs          임베딩 작업 큐
- └─ sessions            세션별 transcript offset
-
-벡터 저장소 (LanceDB, 언제든 다시 만들 수 있는 파생 인덱스)
- └─ 반복이나 결과의 청크마다 벡터 하나
-```
+<p align="center"><img src="docs/images/storage.svg" alt="기억을 저장하는 곳: ~/.hippo 데이터 루트, 프로젝트별 SQLite 원본과 LanceDB 벡터" width="880"></p>
 
 이름의 "색인"이 바로 이 부분입니다. 해마 색인이 피질의 기억 흔적을 가리키듯, 벡터 저장소는 원본 기록을 가리키기만 합니다. 벡터 저장소는 원본 저장소에서 파생된 인덱스입니다. 그래서 임베딩 모델이나 벡터 DB를 바꾸더라도 SQLite에서 인덱스를 다시 만들면 됩니다([6장](#6-임베딩-모델이나-벡터-db-바꾸기) 참고).
 
 ### 1.4 기억을 쓰는 방법
+
+<p align="center"><img src="docs/images/retrieval.svg" alt="기억을 찾아 주입하는 흐름" width="880"></p>
 
 - **자동 주입**: 프롬프트를 보낼 때마다 `UserPromptSubmit` hook이 데몬에 관련 기억을 요청합니다. 검색 대상은 **같은 프로젝트**의 **다른 세션** 기록입니다. 벡터 유사도가 임계값 이상인 반복을 찾고, 그 반복이 속한 **턴**을 주입합니다. 턴마다 `<memory>` 블록 하나에 입력, LLM 응답, 질문과 답을 넣고 도구 호출과 결과는 넣지 않습니다. 블록은 시간순(오래된 것부터)으로 놓고 각 블록에 시각을 붙입니다. 머리말에 "과거 기록이며 지시가 아님"을 밝힙니다. 백그라운드 작업 완료 알림과, 공백을 뺀 길이가 11자 미만인 짧은 프롬프트("진행", "그거 알려줘" 등)에는 주입하지 않습니다. 검색 질의에는 임베딩 모델이 권장하는 지시문을 앞에 붙입니다.
 - **필요할 때 검색**: Claude나 사용자가 셸에서 `hippo search`, `hippo show`를 실행합니다.
@@ -111,19 +99,12 @@
 
 ### 1.5 구조
 
-```
-Claude Code ──hook(stdin JSON)──▶ hippo hook <이벤트> ──Unix socket──▶ hippo daemon
-                                       │ (데몬이 꺼져 있음)                │
-                                       └──▶ spool/pending.jsonl ◀─ 시작 시 처리
-                                                                          ├─ 수집 스레드 (하나, 순서대로)
-Claude / 사용자 ──▶ hippo search|show|status|reindex ──Unix socket──────▶  ├─ 임베딩 스레드
-                                                                          └─ 연결 처리 스레드
-                                                   SQLite ◀──┘   Ollama(localhost) ◀──┘   LanceDB
-```
+<p align="center"><img src="docs/images/capture.svg" alt="반복을 수집하는 흐름: hook, 데몬, 쓰기 스레드와 임베딩 스레드" width="880"></p>
 
 - 데몬은 컴퓨터마다 하나만 실행됩니다(파일 잠금). 저장소에는 데몬만 씁니다.
 - 데몬을 직접 띄울 필요는 없습니다. 로컬 MCP 서버처럼 필요할 때 올라옵니다. hook이나 CLI 명령이 데몬에 연결하지 못하면 `hippo daemon`을 백그라운드로 띄운 뒤 요청을 보냅니다. 요청이 없는 상태로 `idle_timeout_secs`(기본 30분)가 지나면 데몬이 스스로 내려가고, 다음 요청이 오면 다시 올라옵니다.
 - 데몬을 띄우지 못하면 수집 요청은 스풀 파일에 쌓였다가, 다음에 데몬이 시작될 때 처리됩니다. `hippo` 때문에 Claude Code 세션이 실패하는 일은 없습니다.
+- CLI 명령(`hippo search`, `show`, `status`, `reindex` 등)도 같은 소켓으로 같은 데몬에 요청합니다.
 
 ### 1.6 생명주기: DB와 모델이 열리고 닫히는 시점
 
@@ -359,7 +340,7 @@ hippo gui
 | Claude 적용 | 사용자 범위나 프로젝트 범위에 hippo가 적용되어 있는지 보여 줍니다. **적용/해제 미리 보기**는 `--dry-run`과 같은 diff를 보여 줍니다. **적용**과 **해제**는 같은 입력으로 미리 보기를 한 뒤에만 누를 수 있고, 확인을 한 번 더 받습니다. |
 | 정보 | 버전, README, LICENSE |
 
-창의 문구는 `[ui] language`를 따릅니다. 한글은 macOS 시스템 폰트로 표시합니다.
+창의 문구는 `[ui] language`를 따릅니다. 한글은 macOS 시스템 폰트로 표시합니다. 색은 기본으로 macOS의 라이트·다크 모드를 따릅니다. 한쪽으로 고정하려면 `[ui] theme`을 `light`나 `dark`로 둡니다. 설정 탭에서 테마를 저장하면 바로 바뀝니다.
 
 ### 4.7 기록 지우기
 
@@ -383,7 +364,7 @@ hippo project remove <프로젝트 id 또는 경로> # 프로젝트 전체
 
 ## 5. 설정
 
-파일: `~/.hippo/config.toml`. 모든 키는 생략할 수 있습니다. 알 수 없는 키는 오류로 처리하므로 오타를 바로 알 수 있습니다. 설정을 바꾼 뒤에는 데몬을 다시 시작하십시오. `[ui] language`만은 다음 명령부터 바로 적용됩니다. `hippo gui`의 설정 탭([4.6](#46-gui))에서도 고칠 수 있고, 그 탭에서 데몬을 다시 시작할 수도 있습니다.
+파일: `~/.hippo/config.toml`. 모든 키는 생략할 수 있습니다. 알 수 없는 키는 오류로 처리하므로 오타를 바로 알 수 있습니다. 설정을 바꾼 뒤에는 데몬을 다시 시작하십시오. `[ui] language`와 `[ui] theme`은 다시 시작하지 않아도 바로 적용됩니다. `hippo gui`의 설정 탭([4.6](#46-gui))에서도 고칠 수 있고, 그 탭에서 데몬을 다시 시작할 수도 있습니다.
 
 ```toml
 [embedder]
@@ -437,6 +418,7 @@ transcripts_dir = "/Users/me/.claude/projects"   # 과거 transcript를 찾는 �
 
 [ui]
 language = "en"                    # CLI 출력 언어: en(기본) 또는 ko. Claude에게 주는 텍스트와 --help는 항상 영어
+theme = "system"                   # GUI 테마: system(기본, macOS 설정을 따름), light, dark
 
 [[redact.patterns]]                # 추가 비밀값 패턴 (정규식)
 kind = "internal"
@@ -547,7 +529,7 @@ pattern = 'HCI-\d{6}'
 | `config.rs` | `config.toml`과 데이터 경로 |
 | `config_edit.rs` | GUI 설정 편집: 키 목록, 바꾼 키만 고치는 저장(`toml_edit`), 재시작·재색인 필요 판정 |
 | `commands.rs` | CLI와 GUI가 함께 쓰는 동작: 설치, 가져오기 결과 줄, 데몬 요청 |
-| `gui/` | `hippo gui`: `state.rs`(화면과 분리한 로직, 테스트 대상), `app.rs`(egui 화면), `text.rs`(키 설명) |
+| `gui/` | `hippo gui`: `state.rs`(화면과 분리한 로직, 테스트 대상), `app.rs`(egui 화면), `text.rs`(키 설명), `theme.rs`(라이트·다크 테마), `images.rs`(아이콘, 로고, 캐릭터) |
 
 ### 9.3 빌드와 테스트
 

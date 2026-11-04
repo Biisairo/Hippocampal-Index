@@ -209,3 +209,25 @@ fn rejects_cold_budget_below_budget() {
     let ok = Config::parse("[inject]\nbudget_ms = 1000\ncold_budget_ms = 1000\n").unwrap();
     assert_eq!(ok.inject.cold_budget_ms, 1_000);
 }
+
+// ---- FR-UI-3 ----
+
+#[test]
+fn ui_theme_defaults_to_system_and_accepts_light_and_dark() {
+    use hippo::config::Theme;
+    assert_eq!(Config::default().ui.theme, Theme::System);
+    for (text, theme) in [
+        ("light", Theme::Light),
+        ("dark", Theme::Dark),
+        ("system", Theme::System),
+    ] {
+        assert_eq!(
+            Config::parse(&format!("[ui]\ntheme = \"{text}\"\n"))
+                .unwrap()
+                .ui
+                .theme,
+            theme
+        );
+    }
+    assert!(Config::parse("[ui]\ntheme = \"blue\"\n").is_err());
+}

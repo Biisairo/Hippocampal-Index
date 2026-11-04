@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="560" viewBox="0 0 960 560" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <style>
+    .title { font-size: 20px; font-weight: 700; fill: #3B3654; }
+    .head { font-size: 15px; font-weight: 700; fill: #3B3654; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; fill: #3B3654; }
+    .monob { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; font-weight: 700; fill: #3B3654; }
+    .note { font-size: 12.5px; fill: #6E6786; }
+    .tag { font-size: 11.5px; fill: #5B4BA6; }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8E7CC3"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="960" height="560" rx="18" fill="#FDF6EC"/>
+  <text class="title" x="32" y="44">Where the memory is stored</text>
+  <text class="note" x="32" y="66">Everything stays on your machine. SQLite is the source of truth; LanceDB is an index that can be rebuilt from it.</text>
+
+  <!-- data root -->
+  <rect x="32" y="88" width="372" height="440" rx="14" fill="#FFFDF9" stroke="#D9D1F2" stroke-width="2"/>
+  <text class="monob" x="52" y="118">~/.hippo/</text>
+  <text class="note" x="140" y="118">data root</text>
+
+  <text class="monob" x="52" y="156">config.toml</text>
+  <text class="note" x="52" y="174">settings (also editable in the GUI)</text>
+
+  <text class="monob" x="52" y="208">registry.sqlite</text>
+  <text class="note" x="52" y="226">projects · project_roots · session_projects</text>
+  <text class="note" x="52" y="243">which folder and session belong to which project</text>
+
+  <rect x="44" y="258" width="348" height="52" rx="10" fill="#EFE8F7"/>
+  <text class="monob" x="56" y="281">projects/&lt;id&gt;/</text>
+  <text class="note" x="56" y="299">one folder per project (see right)</text>
+
+  <text class="monob" x="52" y="338">spool/pending.jsonl</text>
+  <text class="note" x="52" y="356">hook requests kept while the daemon is down</text>
+
+  <text class="monob" x="52" y="390">logs/</text>
+  <text class="note" x="104" y="390">daemon.err · ollama.log</text>
+
+  <text class="monob" x="52" y="424">bin/hippo</text>
+  <text class="note" x="52" y="442">the binary that hooks and Claude run</text>
+
+  <text class="monob" x="52" y="476">hippo.sock · hippo.lock</text>
+  <text class="note" x="52" y="494">daemon socket and single-instance lock</text>
+
+  <path d="M392 284 C 420 284, 420 150, 448 150" fill="none" stroke="#8E7CC3" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- project -->
+  <rect x="450" y="88" width="478" height="440" rx="14" fill="#FFFDF9" stroke="#D9D1F2" stroke-width="2"/>
+  <text class="monob" x="470" y="118">projects/&lt;id&gt;/</text>
+
+  <rect x="466" y="134" width="446" height="226" rx="10" fill="#FDF6EC" stroke="#E0D6EC"/>
+  <text class="head" x="482" y="160">records.sqlite</text>
+  <text class="tag" x="596" y="160">source of truth · SQLite (WAL)</text>
+  <text class="monob" x="482" y="190">iterations</text>
+  <text class="note" x="614" y="190">one row per agentic-loop iteration</text>
+  <text class="tag" x="614" y="207">+ iterations_fts (FTS5, trigram)</text>
+  <text class="monob" x="482" y="234">results</text>
+  <text class="note" x="614" y="234">tool outputs, deduplicated by SHA-256</text>
+  <text class="tag" x="614" y="251">+ results_fts (FTS5, trigram)</text>
+  <text class="monob" x="482" y="278">iteration_results</text>
+  <text class="note" x="652" y="278">iteration ↔ result links</text>
+  <text class="monob" x="482" y="302">bg_tasks · bg_completions</text>
+  <text class="note" x="704" y="302">background tasks</text>
+  <text class="monob" x="482" y="326">embed_jobs</text>
+  <text class="note" x="614" y="326">queue for the embedding thread</text>
+  <text class="monob" x="482" y="350">sessions</text>
+  <text class="note" x="614" y="350">transcript offset per session</text>
+
+  <path d="M689 362 L689 396" fill="none" stroke="#8E7CC3" stroke-width="2" marker-end="url(#arrow)"/>
+  <text class="tag" x="700" y="384">embedding thread · local Ollama</text>
+
+  <rect x="466" y="398" width="446" height="114" rx="10" fill="#EFE8F7"/>
+  <text class="head" x="482" y="424">vectors/&lt;name&gt;/</text>
+  <text class="tag" x="616" y="424">derived index · LanceDB · rebuildable</text>
+  <text class="monob" x="482" y="452">ACTIVE → g…/vectors.lance</text>
+  <text class="note" x="482" y="470">one vector per chunk of an iteration or a result</text>
+  <text class="monob" x="482" y="496">g…/meta.json</text>
+  <text class="note" x="600" y="496">embedding model and dimension</text>
+</svg>

@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/banner.png" alt="Hippocampal Index" width="720"></p>
+
 # Hippocampal Index (`hippo`)
 
 **Long-term memory for Claude Code sessions.**
@@ -82,27 +84,13 @@ Memory is stored **separately for each project**. Records of other projects do n
 - **Project location**: the git common dir (`.git`) for a git repository, otherwise the directory itself. Sessions opened in a subdirectory and git worktrees belong to the same project as the main checkout.
 - **Moved folders**: for a git repository, if the root commit matches and the old location no longer exists, the project follows it automatically. For a folder without git, use `hippo import --from <old path>` ([4.4](#44-projects-and-importing-past-records)).
 
-```
-~/.hippo/registry.sqlite      registry: projects, locations, root commits, session → project
-~/.hippo/projects/<id>/       one project = the source store and vector store below
-```
-
-```
-Source store (SQLite, the source of truth)
- ├─ iterations          one row per iteration (+ full-text index)
- ├─ results             tool outputs, deduplicated by SHA-256 (+ full-text index)
- ├─ iteration_results   links between iterations and results
- ├─ bg_tasks / bg_completions
- ├─ embed_jobs          queue for the embedding worker
- └─ sessions            per-session transcript offset
-
-Vector store (LanceDB, a derived index that can be rebuilt any time)
- └─ one vector per chunk of an iteration or result
-```
+<p align="center"><img src="docs/images/storage.svg" alt="Where the memory is stored: ~/.hippo data root, per-project SQLite records and LanceDB vectors" width="880"></p>
 
 This is the "index" in the name: the vector store only points to the records, as the hippocampal index points to cortical traces. Because the vector store is derived, you can replace the embedding model or the vector database and rebuild the index from SQLite (see [section 6](#6-changing-the-embedding-model-or-vector-database)).
 
 ### 1.4 How memory is used
+
+<p align="center"><img src="docs/images/retrieval.svg" alt="How memory is found and injected" width="880"></p>
 
 - **Automatic injection**: on each prompt, the `UserPromptSubmit` hook asks the daemon for memories that match the prompt. The search uses only the **current project** and **other sessions**. It finds iterations with a vector similarity at or above the threshold and injects the **turn** each one belongs to. Each turn becomes one `<memory>` block that holds the inputs, the LLM responses, and the questions and answers; tool calls and results are left out. Blocks are in chronological order (oldest first), each with its time. The header tells Claude that the blocks are past data, not instructions. Background task notifications get no injection, and neither do short prompts under 11 characters after trimming (such as "go on" or "show me that"). Search queries get the instruction the embedding model recommends as a prefix.
 - **On-demand search**: Claude or you can run `hippo search` and `hippo show` from the shell.
@@ -111,19 +99,12 @@ Search is **hybrid**: vector similarity plus SQLite FTS5 keyword search, merged 
 
 ### 1.5 Architecture
 
-```
-Claude Code ──hook (stdin JSON)──▶ hippo hook <event> ──Unix socket──▶ hippo daemon
-                                        │ (daemon not running)              │
-                                        └──▶ spool/pending.jsonl ◀─ drained at start
-                                                                            ├─ ingest thread (one, in order)
-Claude / you ──▶ hippo search|show|status|reindex ──Unix socket──────────▶   ├─ embedding thread
-                                                                            └─ connection threads
-                                                     SQLite ◀──┘   Ollama (localhost) ◀──┘   LanceDB
-```
+<p align="center"><img src="docs/images/capture.svg" alt="How every iteration is captured: hooks, daemon, writer and embedding threads" width="880"></p>
 
 - One daemon runs per machine (file lock). Only the daemon writes to the stores.
 - You do not need to start the daemon yourself. Like a local MCP server, it starts on demand: when a hook or a CLI command cannot reach it, it starts `hippo daemon` in the background and then sends the request. After `idle_timeout_secs` (default 30 minutes) with no requests, the daemon stops by itself. The next request starts it again.
 - If the daemon cannot start, capture requests go to a spool file and are processed at the next start. Your Claude Code session never fails because of `hippo`.
+- CLI commands (`hippo search`, `show`, `status`, `reindex`, …) talk to the same daemon through the same socket.
 
 ### 1.6 Lifecycle: when the database and the model are open
 
@@ -359,7 +340,7 @@ Opens a native window (egui, no browser or web view). The command returns when y
 | Claude setup | Shows whether hippo is applied for the user or project scope. **Preview apply/remove** shows the same diff as `--dry-run`. **Apply** and **Remove** work only after a preview with the same inputs, and ask for confirmation. |
 | About | Version, README, and LICENSE |
 
-The window uses `[ui] language`. Korean text uses a macOS system font.
+The window uses `[ui] language`. Korean text uses a macOS system font. The colors follow the macOS light or dark mode by default; set `[ui] theme` to `light` or `dark` to fix one. Saving the theme in the Settings tab applies it at once.
 
 ### 4.7 Deleting records
 
@@ -383,7 +364,7 @@ Each command first prints what it would delete: the project id and location, and
 
 ## 5. Configuration
 
-File: `~/.hippo/config.toml`. Every key is optional. Unknown keys are an error, so typos are caught. Restart the daemon after you change it. Only `[ui] language` takes effect from the next command without a restart. You can also edit the file in the Settings tab of `hippo gui` ([4.6](#46-gui)), which can restart the daemon for you.
+File: `~/.hippo/config.toml`. Every key is optional. Unknown keys are an error, so typos are caught. Restart the daemon after you change it. Only `[ui] language` and `[ui] theme` take effect without a restart. You can also edit the file in the Settings tab of `hippo gui` ([4.6](#46-gui)), which can restart the daemon for you.
 
 ```toml
 [embedder]
@@ -437,6 +418,7 @@ transcripts_dir = "/Users/me/.claude/projects"   # where past transcripts are fo
 
 [ui]
 language = "en"                    # CLI output language: en (default) or ko. Text for Claude and --help are always English
+theme = "system"                   # GUI theme: system (default, follows macOS), light, or dark
 
 [[redact.patterns]]                # extra secret patterns (regex)
 kind = "internal"
@@ -547,7 +529,7 @@ Security measures:
 | `config.rs` | `config.toml` and data paths |
 | `config_edit.rs` | Settings for the GUI: key list, saving only changed keys (`toml_edit`), restart and reindex checks |
 | `commands.rs` | Work shared by the CLI and the GUI: install, import result lines, daemon requests |
-| `gui/` | `hippo gui`: `state.rs` (logic without the screen, tested), `app.rs` (egui screen), `text.rs` (key descriptions) |
+| `gui/` | `hippo gui`: `state.rs` (logic without the screen, tested), `app.rs` (egui screen), `text.rs` (key descriptions), `theme.rs` (light and dark themes), `images.rs` (icon, logo, character) |
 
 ### 9.3 Build and test
 

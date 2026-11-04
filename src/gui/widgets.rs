@@ -76,7 +76,8 @@ pub fn text_field(ui: &mut Ui, width: f32, text: &mut String, hint: &str) -> egu
 pub fn primary(ui: &mut Ui, enabled: bool, text: String) -> egui::Response {
     let label = RichText::new(text).strong();
     let widget = if enabled {
-        Button::new(label.color(Color32::WHITE)).fill(ui.visuals().selection.bg_fill)
+        Button::new(label.color(ui.visuals().selection.stroke.color))
+            .fill(ui.visuals().selection.bg_fill)
     } else {
         Button::new(label)
     };

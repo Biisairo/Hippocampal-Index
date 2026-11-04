@@ -554,3 +554,81 @@ fn error_toast_stays_until_closed_even_when_new_messages_arrive() {
 fn texts(toasts: &Toasts) -> Vec<&str> {
     toasts.items().iter().map(|t| t.text.as_str()).collect()
 }
+
+// ---- FR-GUI-11, FR-GUI-20 ----
+
+use hippo::gui::images::{CHARACTER, ICON, ICON_SMALL, LOGO, LOGO_DARK, decode_png, readme_text};
+
+#[test]
+fn embedded_images_decode_with_expected_sizes() {
+    for (bytes, size) in [
+        (ICON, [512, 512]),
+        (ICON_SMALL, [64, 64]),
+        (LOGO, [720, 240]),
+        (LOGO_DARK, [720, 240]),
+        (CHARACTER, [201, 256]),
+    ] {
+        assert_eq!(decode_png(bytes).map(|i| i.size), Some(size));
+    }
+    assert!(decode_png(b"not a png").is_none(), "해석 실패는 None");
+}
+
+#[test]
+fn readme_text_drops_only_image_blocks_and_image_lines() {
+    let md = "# Title\n<p align=\"center\">\n  <img src=\"a.png\">\n</p>\n\ntext <img> inline stays\n![diagram](docs/images/x.svg)\n<picture>\n<source srcset=\"d.png\">\n<img src=\"l.png\">\n</picture>\n<p align=\"center\"><img src=\"b.png\"></p>\nend\n";
+    assert_eq!(readme_text(md), "# Title\n\ntext <img> inline stays\nend\n");
+    assert_eq!(
+        readme_text("plain\n<pre>code</pre>\n"),
+        "plain\n<pre>code</pre>\n"
+    );
+}
+
+// ---- FR-UI-3, FR-GUI-21 ----
+
+use hippo::config::Theme;
+use hippo::gui::theme::{contrast, palette, preference, visuals};
+
+#[test]
+fn theme_setting_maps_to_egui_preference() {
+    use eframe::egui::ThemePreference;
+    assert_eq!(preference(Theme::System), ThemePreference::System);
+    assert_eq!(preference(Theme::Light), ThemePreference::Light);
+    assert_eq!(preference(Theme::Dark), ThemePreference::Dark);
+}
+
+#[test]
+fn brand_themes_use_logo_colors_with_enough_contrast() {
+    use eframe::egui::Color32;
+    for (dark, bg, text) in [
+        (
+            false,
+            Color32::from_rgb(0xFD, 0xF6, 0xEC),
+            Color32::from_rgb(0x3B, 0x36, 0x54),
+        ),
+        (
+            true,
+            Color32::from_rgb(0x23, 0x20, 0x2F),
+            Color32::from_rgb(0xF3, 0xEE, 0xE6),
+        ),
+    ] {
+        let v = visuals(dark);
+        assert_eq!(v.dark_mode, dark);
+        assert_eq!((v.panel_fill, v.text_color()), (bg, text));
+        assert!(
+            contrast(v.selection.bg_fill, v.selection.stroke.color) >= 4.5,
+            "강조색 위 글자"
+        );
+        let p = palette(dark);
+        for c in [p.ok, p.warn, p.changed, p.error] {
+            assert!(contrast(c, bg) >= 3.0, "상태 색 {c:?} (dark={dark})");
+        }
+    }
+}
+
+#[test]
+fn contrast_follows_wcag() {
+    use eframe::egui::Color32;
+    let c = contrast(Color32::BLACK, Color32::WHITE);
+    assert!((c - 21.0).abs() < 0.01, "{c}");
+    assert!((contrast(Color32::WHITE, Color32::WHITE) - 1.0).abs() < 0.001);
+}

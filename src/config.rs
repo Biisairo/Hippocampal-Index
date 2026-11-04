@@ -113,6 +113,31 @@ pub struct ProjectSection {
 pub struct UiSection {
     /// 사람이 읽는 출력의 언어. (FR-UI-1)
     pub language: Lang,
+    /// GUI 테마. (FR-UI-3)
+    pub theme: Theme,
+}
+
+/// GUI 테마. `System`은 운영 체제의 라이트·다크 모드를 따른다. (FR-UI-3)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl Theme {
+    pub const ALL: [Theme; 3] = [Theme::System, Theme::Light, Theme::Dark];
+
+    /// 설정 파일에 쓰는 값.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Theme::System => "system",
+            Theme::Light => "light",
+            Theme::Dark => "dark",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

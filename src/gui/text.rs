@@ -112,6 +112,10 @@ pub fn describe(section: &str, key: &str, lang: Lang) -> &'static str {
             "Output language: en or ko. Text for Claude stays English",
             "출력 언어: en 또는 ko. Claude에게 주는 텍스트는 항상 영어",
         ),
+        ("ui", "theme") => (
+            "GUI theme: system (follow macOS), light or dark",
+            "GUI 테마: system(macOS 설정을 따름), light, dark",
+        ),
         ("redact", "patterns") => (
             "Extra secret patterns (regular expressions)",
             "추가 비밀값 패턴 (정규식)",

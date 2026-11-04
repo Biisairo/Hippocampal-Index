@@ -15,16 +15,18 @@ use crate::commands::{
     SESSION_ID_SHORT, project_scope, query, query_until_reply, run_install, scope_arg,
 };
 use crate::config::PatternEntry;
-use crate::config::{Config, Paths};
+use crate::config::{Config, Paths, Theme};
 use crate::config_edit::{
     Field, FieldValue, SaveOutcome, changed, fields, needs_reindex, needs_restart, save,
 };
+use crate::gui::images;
 use crate::gui::state::{
     DeleteTarget, ImportForm, ImportProgress, InstallAction, InstallForm, PreviewKey, RecordsView,
     Reload, Toast, Toasts, default_project, embed_state, page_count, resolve_import_args,
     run_import, skip_label, verdict_label,
 };
 use crate::gui::text::describe;
+use crate::gui::theme;
 use crate::gui::widgets::{
     FIELD_HEIGHT, apply_style, banner, button, card, cell, form, mono_cell, output, primary, stat,
     text_field,
@@ -53,9 +55,6 @@ const LIST_BUTTON_WIDTH: f32 = 40.0;
 const NUMBER_WIDTH: f32 = 120.0;
 const PATTERN_KIND_WIDTH: f32 = 110.0;
 const MODAL_WIDTH: f32 = 420.0;
-const OK_COLOR: egui::Color32 = egui::Color32::from_rgb(90, 190, 120);
-const WARN_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 170, 60);
-const CHANGED_COLOR: egui::Color32 = egui::Color32::from_rgb(100, 170, 240);
 const DEFAULT_LIMIT: usize = 10;
 const RECORDS_SEARCH_LIMIT: usize = 20;
 const QUERY_HEIGHT: f32 = 220.0;
@@ -65,14 +64,21 @@ const README_EN: &str = include_str!("../../README.md");
 const README_KO: &str = include_str!("../../README.ko.md");
 const LICENSE: &str = include_str!("../../LICENSE");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const HEADER_ICON_SIZE: egui::Vec2 = egui::vec2(24.0, 24.0);
+const LOGO_SIZE: egui::Vec2 = egui::vec2(144.0, 48.0);
+const CHARACTER_SIZE: egui::Vec2 = egui::vec2(94.0, 120.0);
 
 /// 창을 열고 닫힐 때까지 돌아온다. (IF-CLI-10)
 pub fn run(paths: Paths, cwd: String) -> Result<(), String> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("hippo")
+        .with_inner_size(WINDOW_SIZE)
+        .with_min_inner_size(MIN_WINDOW_SIZE);
+    if let Some(icon) = images::app_icon() {
+        viewport = viewport.with_icon(Arc::new(icon));
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("hippo")
-            .with_inner_size(WINDOW_SIZE)
-            .with_min_inner_size(MIN_WINDOW_SIZE),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
@@ -80,10 +86,33 @@ pub fn run(paths: Paths, cwd: String) -> Result<(), String> {
         options,
         Box::new(move |cc| {
             apply_style(&cc.egui_ctx);
-            Ok(Box::new(App::new(paths, cwd)))
+            Ok(Box::new(App::new(paths, cwd, &cc.egui_ctx)))
         }),
     )
     .map_err(|e| e.to_string())
+}
+
+/// 화면에 쓰는 이미지. 해석하지 못한 이미지는 `None`이고 그 자리를 비운다. (FR-GUI-20)
+struct Art {
+    icon: Option<egui::TextureHandle>,
+    logo: Option<egui::TextureHandle>,
+    logo_dark: Option<egui::TextureHandle>,
+    character: Option<egui::TextureHandle>,
+}
+
+impl Art {
+    fn load(ctx: &egui::Context) -> Self {
+        let load = |name: &str, bytes: &[u8]| {
+            images::decode_png(bytes)
+                .map(|image| ctx.load_texture(name, image, egui::TextureOptions::LINEAR))
+        };
+        Self {
+            icon: load("icon", images::ICON_SMALL),
+            logo: load("logo", images::LOGO),
+            logo_dark: load("logo-dark", images::LOGO_DARK),
+            character: load("character", images::CHARACTER),
+        }
+    }
 }
 
 /// 작업 스레드 하나의 결과 칸.
@@ -393,11 +422,20 @@ pub struct App {
     projects: Projects,
     install: Install,
     about_license: bool,
+    art: Art,
+    readme_en: String,
+    readme_ko: String,
 }
 
 impl App {
-    fn new(paths: Paths, cwd: String) -> Self {
-        let lang = Config::load(&paths.config()).map_or(Lang::En, |c| c.ui.language);
+    fn new(paths: Paths, cwd: String, ctx: &egui::Context) -> Self {
+        let ui_config = Config::load(&paths.config())
+            .map(|c| c.ui)
+            .unwrap_or_default();
+        let lang = ui_config.language;
+        ctx.set_visuals_of(egui::Theme::Light, theme::visuals(false));
+        ctx.set_visuals_of(egui::Theme::Dark, theme::visuals(true));
+        ctx.set_theme(theme::preference(ui_config.theme));
         Self {
             lang,
             tab: Tab::Status,
@@ -442,6 +480,9 @@ impl App {
                 task: Task::default(),
             },
             about_license: false,
+            art: Art::load(ctx),
+            readme_en: images::readme_text(README_EN),
+            readme_ko: images::readme_text(README_KO),
             paths,
             cwd,
         }
@@ -478,8 +519,10 @@ impl App {
                 return;
             }
             Some(Err(e)) => {
-                banner(ui, ui.visuals().error_fg_color, |ui| {
-                    ui.label(tr!(lang, "Not connected: {e}", "연결 안 됨: {e}"));
+                empty_state(ui, self.art.character.as_ref(), |ui| {
+                    banner(ui, ui.visuals().error_fg_color, |ui| {
+                        ui.label(tr!(lang, "Not connected: {e}", "연결 안 됨: {e}"));
+                    });
                 });
                 return;
             }
@@ -489,7 +532,7 @@ impl App {
             stat(
                 ui,
                 &tr!(lang, "Daemon", "데몬"),
-                RichText::new(tr!(lang, "running", "실행 중")).color(OK_COLOR),
+                RichText::new(tr!(lang, "running", "실행 중")).color(ok_color(ui)),
             );
             stat(
                 ui,
@@ -515,7 +558,7 @@ impl App {
         ));
         ui.add_space(4.0);
         card(ui, &tr!(lang, "Projects", "프로젝트"), |ui| {
-            project_table(ui, st, lang);
+            project_table(ui, st, lang, self.art.character.as_ref());
         });
     }
 
@@ -547,6 +590,14 @@ impl App {
                     s.loaded = snapshot;
                     s.restart |= needs_restart(&changes);
                     s.reindex |= needs_reindex(&changes);
+                    if let Some(FieldValue::Text(value)) = changes
+                        .iter()
+                        .find(|f| (f.section, f.key) == ("ui", "theme"))
+                        .map(|f| &f.value)
+                        && let Some(theme) = Theme::ALL.into_iter().find(|t| t.as_str() == value)
+                    {
+                        ctx.set_theme(theme::preference(theme));
+                    }
                     if let Some(lang_field) = changes
                         .iter()
                         .find(|f| (f.section, f.key) == ("ui", "language"))
@@ -621,7 +672,7 @@ impl App {
                         "저장하지 않은 변경 {}개",
                         changes.len()
                     ))
-                    .color(CHANGED_COLOR),
+                    .color(changed_color(ui)),
                 );
             }
             if let Some(m) = &s.message {
@@ -630,7 +681,7 @@ impl App {
             }
         });
         if s.restart || s.reindex {
-            banner(ui, WARN_COLOR, |ui| {
+            banner(ui, warn_color(ui), |ui| {
                 if s.restart {
                     ui.label(tr!(
                         lang,
@@ -798,7 +849,7 @@ impl App {
                     }
                     if !current && !self.import.candidates.is_empty() {
                         ui.colored_label(
-                            WARN_COLOR,
+                            warn_color(ui),
                             tr!(
                                 lang,
                                 "Inputs changed. Preview again.",
@@ -1152,7 +1203,9 @@ impl App {
             }
         });
         if projects.is_empty() {
-            ui.weak(tr!(lang, "No project yet.", "아직 프로젝트가 없습니다."));
+            empty_state(ui, self.art.character.as_ref(), |ui| {
+                ui.weak(tr!(lang, "No project yet.", "아직 프로젝트가 없습니다."));
+            });
             return;
         }
         ui.add_space(4.0);
@@ -1577,7 +1630,9 @@ impl App {
                 ui.end_row();
                 ui.label(tr!(lang, "Current", "현재"));
                 match i.installed {
-                    Some(true) => ui.colored_label(OK_COLOR, tr!(lang, "● applied", "● 적용됨")),
+                    Some(true) => {
+                        ui.colored_label(ok_color(ui), tr!(lang, "● applied", "● 적용됨"))
+                    }
                     Some(false) => ui.weak(tr!(lang, "○ not applied", "○ 적용 안 됨")),
                     None => ui.weak(tr!(lang, "unknown", "알 수 없음")),
                 };
@@ -1704,6 +1759,14 @@ impl App {
     fn about_tab(&mut self, ui: &mut egui::Ui) {
         let lang = self.lang;
         ui.horizontal(|ui| {
+            let logo = if ui.visuals().dark_mode {
+                &self.art.logo_dark
+            } else {
+                &self.art.logo
+            };
+            if let Some(logo) = logo {
+                ui.add(egui::Image::new(logo).fit_to_exact_size(LOGO_SIZE));
+            }
             ui.label(
                 RichText::new(format!("hippo {VERSION}"))
                     .strong()
@@ -1716,8 +1779,8 @@ impl App {
         });
         let text = match (self.about_license, lang) {
             (true, _) => LICENSE,
-            (false, Lang::En) => README_EN,
-            (false, Lang::Ko) => README_KO,
+            (false, Lang::En) => self.readme_en.as_str(),
+            (false, Lang::Ko) => self.readme_ko.as_str(),
         };
         output(ui, "about-text", text, "");
     }
@@ -1735,6 +1798,9 @@ impl eframe::App for App {
             )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    if let Some(icon) = &self.art.icon {
+                        ui.add(egui::Image::new(icon).fit_to_exact_size(HEADER_ICON_SIZE));
+                    }
                     ui.label(RichText::new("hippo").strong().size(17.0));
                     ui.add_space(8.0);
                     for tab in Tab::ALL {
@@ -1747,7 +1813,7 @@ impl eframe::App for App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         match &self.status {
                             Some(Ok(_)) => {
-                                ui.colored_label(OK_COLOR, tr!(lang, "● daemon", "● 데몬"))
+                                ui.colored_label(ok_color(ui), tr!(lang, "● daemon", "● 데몬"))
                             }
                             Some(Err(_)) => ui.colored_label(
                                 ui.visuals().error_fg_color,
@@ -1824,7 +1890,7 @@ fn hit_rows<'a>(
     lang: Lang,
 ) -> Option<&'a HitView> {
     for note in notes {
-        ui.colored_label(WARN_COLOR, note);
+        ui.colored_label(warn_color(ui), note);
     }
     if hits.is_empty() {
         ui.weak(tr!(lang, "No results", "결과 없음"));
@@ -1994,9 +2060,16 @@ fn kind_name(kind: SearchKind) -> &'static str {
     }
 }
 
-fn project_table(ui: &mut egui::Ui, st: &StatusInfo, lang: Lang) {
+fn project_table(
+    ui: &mut egui::Ui,
+    st: &StatusInfo,
+    lang: Lang,
+    character: Option<&egui::TextureHandle>,
+) {
     if st.projects.is_empty() {
-        ui.weak(tr!(lang, "No project yet.", "아직 프로젝트가 없습니다."));
+        empty_state(ui, character, |ui| {
+            ui.weak(tr!(lang, "No project yet.", "아직 프로젝트가 없습니다."));
+        });
         return;
     }
     let heads = [
@@ -2105,8 +2178,8 @@ fn candidate_table(ui: &mut egui::Ui, form: &mut ImportForm, lang: Lang) {
                     });
                     row.col(|ui| {
                         let color = match c.status {
-                            ImportStatus::New => OK_COLOR,
-                            ImportStatus::LiveOnly => WARN_COLOR,
+                            ImportStatus::New => ok_color(ui),
+                            ImportStatus::LiveOnly => warn_color(ui),
                             ImportStatus::Imported | ImportStatus::OtherProject => {
                                 ui.visuals().weak_text_color()
                             }
@@ -2133,7 +2206,7 @@ fn setting_row(
         ui.set_width(SETTING_KEY_WIDTH);
         let key = RichText::new(field.key).strong();
         ui.label(if modified {
-            key.color(CHANGED_COLOR)
+            key.color(changed_color(ui))
         } else {
             key
         });
@@ -2172,6 +2245,7 @@ fn setting_row(
 
 fn field_editor(ui: &mut egui::Ui, field: &mut Field, lang: Lang) {
     let is_language = (field.section, field.key) == ("ui", "language");
+    let is_theme = (field.section, field.key) == ("ui", "theme");
     let is_multiline = (field.section, field.key) == ("embedder", "query_prefix");
     match &mut field.value {
         FieldValue::Bool(b) => {
@@ -2196,6 +2270,16 @@ fn field_editor(ui: &mut egui::Ui, field: &mut Field, lang: Lang) {
                 .show_ui(ui, |ui| {
                     for code in ["en", "ko"] {
                         ui.selectable_value(s, code.to_string(), code);
+                    }
+                });
+        }
+        FieldValue::Text(s) if is_theme => {
+            egui::ComboBox::from_id_salt("theme")
+                .selected_text(s.clone())
+                .width(NUMBER_WIDTH)
+                .show_ui(ui, |ui| {
+                    for theme in Theme::ALL {
+                        ui.selectable_value(s, theme.as_str().to_string(), theme.as_str());
                     }
                 });
         }
@@ -2313,4 +2397,33 @@ fn install_text(
         Ok(()) => Ok(out),
         Err(e) => Err(format!("{out}{e}")),
     }
+}
+
+/// 빈 상태. 캐릭터 이미지 아래에 안내를 둔다. (FR-GUI-20)
+fn empty_state(
+    ui: &mut egui::Ui,
+    character: Option<&egui::TextureHandle>,
+    add: impl FnOnce(&mut egui::Ui),
+) {
+    ui.add_space(24.0);
+    ui.vertical_centered(|ui| {
+        if let Some(character) = character {
+            ui.add(egui::Image::new(character).fit_to_exact_size(CHARACTER_SIZE));
+            ui.add_space(8.0);
+        }
+        add(ui);
+    });
+}
+
+/// 현재 테마의 상태 색. (FR-GUI-21)
+fn ok_color(ui: &egui::Ui) -> egui::Color32 {
+    theme::palette(ui.visuals().dark_mode).ok
+}
+
+fn warn_color(ui: &egui::Ui) -> egui::Color32 {
+    theme::palette(ui.visuals().dark_mode).warn
+}
+
+fn changed_color(ui: &egui::Ui) -> egui::Color32 {
+    theme::palette(ui.visuals().dark_mode).changed
 }
