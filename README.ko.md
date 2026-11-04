@@ -14,6 +14,27 @@
 
 ---
 
+## 빠른 시작
+
+macOS, Rust, `protoc`, Ollama가 필요합니다([2. 요구 사항](#2-요구-사항)).
+
+```bash
+git clone https://github.com/Biisairo/Hippocampal-Index.git hippo && cd hippo
+brew install protobuf ollama
+ollama serve &                      # 모델을 처음 받을 때만 필요합니다
+ollama pull qwen3-embedding:0.6b
+scripts/bundle-app.sh               # target/hippo.app을 만듭니다. 처음 빌드는 몇 분 걸립니다
+open target/hippo.app               # 원하면 /Applications로 옮겨도 됩니다
+```
+
+1. 창의 **Claude 적용** 탭에서 데이터 루트(기본 `~/.hippo`)와 Claude 폴더(기본 `~/.claude`)를 확인합니다.
+2. **적용** 카드의 **미리 보기**로 바뀔 내용을 확인한 뒤 **적용**을 누릅니다.
+3. Claude Code 세션을 새로 시작합니다. 이제부터 대화가 기록되고, 관련된 과거 기억이 자동으로 주입됩니다.
+
+앱 없이 터미널에서 설치하려면 `cargo build --release && ./target/release/hippo install`을 실행합니다. 지우는 방법은 [3.6](#36-제거)을 보십시오.
+
+---
+
 ## 목차
 
 1. [개념](#1-개념)
@@ -25,8 +46,9 @@
 7. [데이터 위치와 보안](#7-데이터-위치와-보안)
 8. [문제 해결](#8-문제-해결)
 9. [개발: 수정과 빌드](#9-개발-수정과-빌드)
-10. [알려진 한계](#10-알려진-한계)
-11. [라이선스](#11-라이선스)
+10. [기여하기](#10-기여하기)
+11. [알려진 한계](#11-알려진-한계)
+12. [라이선스](#12-라이선스)
 
 ---
 
@@ -546,10 +568,11 @@ pattern = 'HCI-\d{6}'
 | `ingest.rs` | transcript → 마스킹 → 저장 파이프라인 |
 | `search.rs` | 하이브리드 검색, 자동 주입, `search`/`show` 출력 |
 | `daemon.rs`, `client.rs`, `protocol.rs`, `spool.rs` | 데몬, hook 클라이언트, 소켓 프로토콜, 스풀 |
-| `install.rs`, `setup.rs` | 설정 파일 병합, hook JSON, launchd plist |
+| `install.rs`, `setup.rs` | 설정 파일 병합, 실행 파일 복사, hook JSON, launchd plist |
+| `layout.rs` | 데이터 루트 판정, PATH 링크, Claude 폴더 기록, 설치 상태, 완전 삭제 |
 | `config.rs` | `config.toml`과 데이터 경로 |
 | `config_edit.rs` | GUI 설정 편집: 키 목록, 바꾼 키만 고치는 저장(`toml_edit`), 재시작·재색인 필요 판정 |
-| `commands.rs` | CLI와 GUI가 함께 쓰는 동작: 설치, 가져오기 결과 줄, 데몬 요청 |
+| `commands.rs` | CLI와 GUI가 함께 쓰는 동작: 설치·제거·완전 삭제·멈추기, 가져오기 결과 줄, 데몬 요청 |
 | `gui/` | `hippo gui`: `state.rs`(화면과 분리한 로직, 테스트 대상), `app.rs`(egui 화면), `text.rs`(키 설명), `theme.rs`(라이트·다크 테마), `images.rs`(아이콘, 로고, 캐릭터) |
 
 ### 9.3 빌드와 테스트
@@ -576,7 +599,38 @@ cargo fmt
 
 ---
 
-## 10. 알려진 한계
+## 10. 기여하기
+
+버그 제보, 기능 제안, 코드 기여를 모두 환영합니다. 이슈와 PR은 한국어나 영어로 쓰면 됩니다.
+
+### 10.1 이슈
+
+- 버그: 재현 순서, 기대한 동작과 실제 동작, `hippo status` 출력, `~/.hippo/logs/`의 관련 오류 줄, macOS·Claude Code·Ollama 버전을 적어 주십시오.
+- 로그나 출력에 대화 내용, 개인 경로, 비밀값이 있으면 지운 뒤 올려 주십시오.
+- 기능 제안은 어떤 상황에서 왜 필요한지를 먼저 적어 주십시오.
+
+### 10.2 PR
+
+1. 저장소를 fork하고 브랜치를 만듭니다.
+2. 동작을 바꾸는 변경이면 [9.1](#91-스펙-먼저)의 순서를 따릅니다: `docs/SRS.md` 수정 → 실패하는 테스트 → 구현.
+3. 올리기 전에 다음이 모두 통과해야 합니다.
+   ```bash
+   cargo test
+   cargo clippy --all-targets   # 경고 0
+   cargo fmt --check
+   ```
+4. 사용자에게 보이는 동작이 바뀌면 README 영어판(`README.md`)과 한국어판(`README.ko.md`)을 함께 고칩니다.
+5. 커밋 메시지는 `종류: 요약` 형식으로 씁니다. 종류는 `feat`, `fix`, `docs`, `test`, `refactor`, `chore`입니다. 요구사항을 바꿨으면 SRS 버전을 함께 적습니다(예: `fix: … (SRS 0.21)`).
+
+### 10.3 지켜 주실 것
+
+- 실제 대화, transcript, 개인 경로, 비밀값을 저장소에 넣지 않습니다. fixture를 새로 만들 때는 [9.3](#93-빌드와-테스트)의 방법을 쓰고 경로를 익명화합니다.
+- 테스트는 결정론적이어야 합니다. 실제 Ollama가 필요한 테스트는 `#[ignore]`로 둡니다.
+- 테스트와 개발 중에는 실제 `~/.claude`와 `~/.hippo`를 바꾸지 않습니다. 실행 파일을 띄우는 테스트는 임시 폴더의 `<루트>/bin/hippo`로 실행합니다(`tests/cli_test.rs`의 `installed_bin`).
+
+---
+
+## 11. 알려진 한계
 
 - 자동 주입의 품질은 `inject.threshold`에 달려 있습니다. "방금 주입됐어?"처럼 과거에 같은 말을 한 적이 있는 메타 질문에는 관련 없는 기억이 들어올 수 있습니다(SRS 부록 C).
 - "버그"처럼 2자인 한국어 단어는 키워드 검색으로 찾을 수 없습니다(FTS5 trigram은 3자 이상 필요). 이런 단어는 벡터 검색이 담당합니다.
@@ -593,6 +647,6 @@ cargo fmt
 
 ---
 
-## 11. 라이선스
+## 12. 라이선스
 
 MIT입니다. [LICENSE](LICENSE)를 보십시오.

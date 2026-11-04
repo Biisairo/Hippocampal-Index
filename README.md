@@ -14,6 +14,27 @@ All data stays on your machine. Embeddings come from a local Ollama model, and v
 
 ---
 
+## Quick start
+
+You need macOS, Rust, `protoc`, and Ollama ([2. Requirements](#2-requirements)).
+
+```bash
+git clone https://github.com/Biisairo/Hippocampal-Index.git hippo && cd hippo
+brew install protobuf ollama
+ollama serve &                      # needed only to pull the model the first time
+ollama pull qwen3-embedding:0.6b
+scripts/bundle-app.sh               # makes target/hippo.app; the first build takes a few minutes
+open target/hippo.app               # you can move it to /Applications if you like
+```
+
+1. In the window's **Claude setup** tab, check the data root (default `~/.hippo`) and the Claude folder (default `~/.claude`).
+2. In the **Apply** card, press **Preview** to see the changes, then press **Apply**.
+3. Start a new Claude Code session. From now on, your sessions are recorded and related past memories are injected automatically.
+
+To install from a terminal without the app, run `cargo build --release && ./target/release/hippo install`. To remove hippo, see [3.6](#36-uninstall).
+
+---
+
 ## Contents
 
 1. [Concept](#1-concept)
@@ -25,8 +46,9 @@ All data stays on your machine. Embeddings come from a local Ollama model, and v
 7. [Data layout and security](#7-data-layout-and-security)
 8. [Troubleshooting](#8-troubleshooting)
 9. [Development: modify and build](#9-development-modify-and-build)
-10. [Known limitations](#10-known-limitations)
-11. [License](#11-license)
+10. [Contributing](#10-contributing)
+11. [Known limitations](#11-known-limitations)
+12. [License](#12-license)
 
 ---
 
@@ -546,10 +568,11 @@ Security measures:
 | `ingest.rs` | Transcript → redact → store pipeline |
 | `search.rs` | Hybrid search, injection, `search`/`show` output |
 | `daemon.rs`, `client.rs`, `protocol.rs`, `spool.rs` | Daemon, hook client, socket protocol, spool |
-| `install.rs`, `setup.rs` | Settings merge, hook JSON, launchd plist |
+| `install.rs`, `setup.rs` | Settings merge, binary copy, hook JSON, launchd plist |
+| `layout.rs` | Data root detection, PATH link, Claude folder record, install state, purge |
 | `config.rs` | `config.toml` and data paths |
 | `config_edit.rs` | Settings for the GUI: key list, saving only changed keys (`toml_edit`), restart and reindex checks |
-| `commands.rs` | Work shared by the CLI and the GUI: install, import result lines, daemon requests |
+| `commands.rs` | Work shared by the CLI and the GUI: install, uninstall, purge, stop, import result lines, daemon requests |
 | `gui/` | `hippo gui`: `state.rs` (logic without the screen, tested), `app.rs` (egui screen), `text.rs` (key descriptions), `theme.rs` (light and dark themes), `images.rs` (icon, logo, character) |
 
 ### 9.3 Build and test
@@ -576,7 +599,38 @@ Ingest, search, and the daemon do not change.
 
 ---
 
-## 10. Known limitations
+## 10. Contributing
+
+Bug reports, feature ideas, and code are all welcome. Write issues and PRs in English or Korean.
+
+### 10.1 Issues
+
+- Bugs: give the steps to reproduce, what you expected and what happened, the output of `hippo status`, the related error lines from `~/.hippo/logs/`, and your macOS, Claude Code, and Ollama versions.
+- If logs or output contain conversation text, personal paths, or secrets, remove them before you post.
+- For a feature idea, first describe the situation and why you need it.
+
+### 10.2 Pull requests
+
+1. Fork the repository and create a branch.
+2. If the change alters behavior, follow the order in [9.1](#91-specification-first): change `docs/SRS.md`, then write a failing test, then implement.
+3. Before you open the PR, all of these must pass:
+   ```bash
+   cargo test
+   cargo clippy --all-targets   # no warnings
+   cargo fmt --check
+   ```
+4. If user-visible behavior changes, update both the English (`README.md`) and the Korean (`README.ko.md`) README.
+5. Write commit messages as `type: summary`. Types are `feat`, `fix`, `docs`, `test`, `refactor`, and `chore`. If you changed requirements, add the SRS version (for example `fix: … (SRS 0.21)`).
+
+### 10.3 Ground rules
+
+- Do not commit real conversations, transcripts, personal paths, or secrets. To make a new fixture, use the method in [9.3](#93-build-and-test) and anonymize the paths.
+- Tests must be deterministic. Mark tests that need a real Ollama with `#[ignore]`.
+- During tests and development, do not change your real `~/.claude` or `~/.hippo`. Tests that start the binary run it as `<root>/bin/hippo` in a temporary folder (see `installed_bin` in `tests/cli_test.rs`).
+
+---
+
+## 11. Known limitations
 
 - Automatic injection quality depends on `inject.threshold`. Meta questions you have asked before, such as "was memory injected just now?", can still pull in unrelated memories (SRS appendix C).
 - Two-character Korean words (for example, "버그") are not found by keyword search (the FTS5 trigram tokenizer needs 3 or more characters). Vector search covers them.
@@ -593,6 +647,6 @@ Ingest, search, and the daemon do not change.
 
 ---
 
-## 11. License
+## 12. License
 
 MIT. See [LICENSE](LICENSE).
