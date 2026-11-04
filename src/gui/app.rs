@@ -22,6 +22,7 @@ use crate::config_edit::{
     needs_reindex, needs_restart, save,
 };
 use crate::gui::images;
+use crate::gui::picker::{pick_folder, start_folder};
 use crate::gui::state::{
     DeleteTarget, ImportForm, ImportProgress, InstallAction, InstallForm, PollGate, PreviewKey,
     RecordsView, Reload, Toast, Toasts, default_project, embed_state, page_count, purge_may_start,
@@ -62,6 +63,7 @@ const NUMBER_WIDTH: f32 = 120.0;
 const PATTERN_KIND_WIDTH: f32 = 110.0;
 const MODAL_WIDTH: f32 = 420.0;
 const DEFAULT_LIMIT: usize = 10;
+const BROWSE_WIDTH: f32 = 96.0;
 const RECORDS_SEARCH_LIMIT: usize = 20;
 const QUERY_HEIGHT: f32 = 220.0;
 const TS_CHARS: usize = 19;
@@ -415,6 +417,69 @@ impl Records {
     }
 }
 
+/// 찾아보기로 채울 경로 입력란. (FR-GUI-24)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathField {
+    ImportFrom,
+    ImportTo,
+    SearchScope,
+    ShowScope,
+    ReindexScope,
+    DataRoot,
+    ClaudeDir,
+    TranscriptsDir,
+}
+
+type PickResult = (PathField, Option<PathBuf>);
+
+/// 찾아보기 버튼. 선택 창은 작업 스레드에서 띄운다. 한 번에 하나만 연다. (FR-GUI-24)
+struct Browse<'a> {
+    picker: &'a mut Task<PickResult>,
+    ctx: &'a egui::Context,
+    cwd: &'a str,
+    home: &'a Path,
+    lang: Lang,
+}
+
+impl Browse<'_> {
+    fn button(&mut self, ui: &mut egui::Ui, field: PathField, current: &str) {
+        let label = tr!(self.lang, "Browse…", "찾아보기…");
+        if ui
+            .add_enabled(
+                !self.picker.running,
+                button(label).min_size(egui::vec2(BROWSE_WIDTH, FIELD_HEIGHT)),
+            )
+            .clicked()
+        {
+            let start = start_folder(current, Path::new(self.cwd), self.home);
+            let prompt = tr!(self.lang, "Choose a folder", "폴더를 고르십시오");
+            self.picker
+                .start(self.ctx, move || (field, pick_folder(&prompt, &start)));
+        }
+    }
+}
+
+/// 경로 입력란과 찾아보기 버튼. (FR-GUI-24)
+fn path_input(
+    ui: &mut egui::Ui,
+    width: f32,
+    text: &mut String,
+    hint: &str,
+    field: PathField,
+    browse: &mut Browse,
+) {
+    ui.horizontal(|ui| {
+        let spacing = ui.spacing().item_spacing.x;
+        text_field(
+            ui,
+            (width - BROWSE_WIDTH - spacing).max(BROWSE_WIDTH),
+            text,
+            hint,
+        );
+        browse.button(ui, field, text);
+    });
+}
+
 pub struct App {
     paths: Paths,
     cwd: String,
@@ -431,6 +496,8 @@ pub struct App {
     switches: (bool, bool),
     switch_task: Task<Result<(bool, bool), String>>,
     switch_error: Option<String>,
+    /// 찾아보기 선택 창. (FR-GUI-24)
+    picker: Task<PickResult>,
     lang: Lang,
     tab: Tab,
     status: Option<Result<StatusInfo, String>>,
@@ -522,6 +589,7 @@ impl App {
             switches: load_switches(&paths),
             switch_task: Task::default(),
             switch_error: None,
+            picker: Task::default(),
             about_license: false,
             art: Art::load(ctx),
             readme_en: images::readme_text(README_EN),
@@ -728,6 +796,13 @@ impl App {
         let lang = self.lang;
         let ctx = ui.ctx().clone();
         let s = &mut self.settings;
+        let mut browse = Browse {
+            picker: &mut self.picker,
+            ctx: &ctx,
+            cwd: &self.cwd,
+            home: &self.home,
+            lang,
+        };
         if let Some(result) = s.load.poll() {
             match result {
                 Ok(list) => {
@@ -920,7 +995,7 @@ impl App {
                                         .iter()
                                         .find(|d| d.section == field.section && d.key == field.key);
                                     let modified = !loaded.contains(field);
-                                    setting_row(ui, field, default, modified, lang);
+                                    setting_row(ui, field, default, modified, lang, &mut browse);
                                     ui.end_row();
                                 }
                             });
@@ -949,14 +1024,31 @@ impl App {
             &tr!(lang, "Source and target", "원본과 대상"),
             |ui| {
                 let hint = tr!(lang, "path or project id", "경로 또는 프로젝트 id");
+                let mut browse = Browse {
+                    picker: &mut self.picker,
+                    ctx: &ctx,
+                    cwd: &self.cwd,
+                    home: &self.home,
+                    lang,
+                };
+                let import = &mut self.import;
                 form(ui, "import-args", |ui, w| {
                     ui.label(tr!(lang, "From", "원본"));
                     ui.add_enabled_ui(!running, |ui| {
-                        text_field(ui, w, &mut self.import.from, &hint)
+                        path_input(
+                            ui,
+                            w,
+                            &mut import.from,
+                            &hint,
+                            PathField::ImportFrom,
+                            &mut browse,
+                        )
                     });
                     ui.end_row();
                     ui.label(tr!(lang, "To", "대상"));
-                    ui.add_enabled_ui(!running, |ui| text_field(ui, w, &mut self.import.to, ""));
+                    ui.add_enabled_ui(!running, |ui| {
+                        path_input(ui, w, &mut import.to, "", PathField::ImportTo, &mut browse)
+                    });
                     ui.end_row();
                 });
                 ui.add_space(4.0);
@@ -1111,6 +1203,13 @@ impl App {
         let lang = self.lang;
         let ctx = ui.ctx().clone();
         let s = &mut self.search;
+        let mut browse = Browse {
+            picker: &mut self.picker,
+            ctx: &ctx,
+            cwd: &self.cwd,
+            home: &self.home,
+            lang,
+        };
         if let Some(reply) = s.task.poll() {
             match reply {
                 Ok(Response::Hits { hits, notes }) => {
@@ -1135,7 +1234,14 @@ impl App {
                     }
                     ui.end_row();
                     ui.label(tr!(lang, "Scope", "범위"));
-                    text_field(ui, w, &mut s.scope, "project | all | <path>");
+                    path_input(
+                        ui,
+                        w,
+                        &mut s.scope,
+                        "project | all | <path>",
+                        PathField::SearchScope,
+                        &mut browse,
+                    );
                     ui.end_row();
                     ui.label(tr!(lang, "Kind / limit", "종류 / 개수"));
                     ui.horizontal(|ui| {
@@ -1172,7 +1278,14 @@ impl App {
                     text_field(ui, w, &mut s.prompt_id, "");
                     ui.end_row();
                     ui.label(tr!(lang, "Scope", "범위"));
-                    text_field(ui, w, &mut s.show_scope, &hint);
+                    path_input(
+                        ui,
+                        w,
+                        &mut s.show_scope,
+                        &hint,
+                        PathField::ShowScope,
+                        &mut browse,
+                    );
                     ui.end_row();
                     ui.label(tr!(lang, "Results", "결과"));
                     ui.checkbox(
@@ -1683,6 +1796,13 @@ impl App {
         let lang = self.lang;
         let ctx = ui.ctx().clone();
         let p = &mut self.projects;
+        let mut browse = Browse {
+            picker: &mut self.picker,
+            ctx: &ctx,
+            cwd: &self.cwd,
+            home: &self.home,
+            lang,
+        };
         if let Some(reply) = p.list.poll() {
             p.output = text_of(reply);
         }
@@ -1701,7 +1821,14 @@ impl App {
         card(ui, &tr!(lang, "Reindex", "재색인"), |ui| {
             form(ui, "reindex-args", |ui, w| {
                 ui.label(tr!(lang, "Scope", "범위"));
-                text_field(ui, w, &mut p.reindex_scope, "all | project | <path>");
+                path_input(
+                    ui,
+                    w,
+                    &mut p.reindex_scope,
+                    "all | project | <path>",
+                    PathField::ReindexScope,
+                    &mut browse,
+                );
                 ui.end_row();
             });
             ui.horizontal(|ui| {
@@ -1743,6 +1870,33 @@ impl App {
             }
         });
         output(ui, "project-list", &p.output, "");
+    }
+
+    /// 찾아보기로 고른 폴더를 그 입력란에 넣는다. 취소했으면 그대로 둔다. (FR-GUI-24)
+    fn apply_pick(&mut self) {
+        let Some((field, Some(path))) = self.picker.poll() else {
+            return;
+        };
+        let text = path.display().to_string();
+        match field {
+            PathField::ImportFrom => self.import.from = text,
+            PathField::ImportTo => self.import.to = text,
+            PathField::SearchScope => self.search.scope = text,
+            PathField::ShowScope => self.search.show_scope = text,
+            PathField::ReindexScope => self.projects.reindex_scope = text,
+            PathField::DataRoot => self.install.form.root = text,
+            PathField::ClaudeDir => self.install.form.claude_dir = text,
+            PathField::TranscriptsDir => {
+                if let Some(f) = self
+                    .settings
+                    .edited
+                    .iter_mut()
+                    .find(|f| (f.section, f.key) == ("import", "transcripts_dir"))
+                {
+                    f.value = FieldValue::Text(text);
+                }
+            }
+        }
     }
 
     /// 입력란의 데이터 루트가 바뀌면 요청 대상과 설치 상태를 그 루트로 바꾼다. (FR-GUI-22, FR-GUI-23)
@@ -1791,6 +1945,13 @@ impl App {
         let state = self.state;
         let exe = self.exe.clone();
         let i = &mut self.install;
+        let mut browse = Browse {
+            picker: &mut self.picker,
+            ctx: &ctx,
+            cwd: &self.cwd,
+            home: &self.home,
+            lang,
+        };
         if let Some(current) = i.check.poll() {
             i.current = Some(current);
         }
@@ -1829,10 +1990,24 @@ impl App {
         card(ui, &tr!(lang, "Where to apply", "적용 위치"), |ui| {
             form(ui, "install-args", |ui, w| {
                 ui.label(tr!(lang, "Data root", "데이터 루트"));
-                text_field(ui, w, &mut i.form.root, "~/.hippo");
+                path_input(
+                    ui,
+                    w,
+                    &mut i.form.root,
+                    "~/.hippo",
+                    PathField::DataRoot,
+                    &mut browse,
+                );
                 ui.end_row();
                 ui.label(tr!(lang, "Claude folder", "Claude 폴더"));
-                text_field(ui, w, &mut i.form.claude_dir, "~/.claude");
+                path_input(
+                    ui,
+                    w,
+                    &mut i.form.claude_dir,
+                    "~/.claude",
+                    PathField::ClaudeDir,
+                    &mut browse,
+                );
                 ui.end_row();
                 ui.label(tr!(lang, "Binary", "실행 파일"));
                 match state {
@@ -2074,6 +2249,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.sync_root(&ctx);
+        self.apply_pick();
         self.poll_status(&ctx);
         let lang = self.lang;
         let ready = self.state == Some(InstallState::Installed);
@@ -2563,6 +2739,7 @@ fn setting_row(
     default: Option<&Field>,
     modified: bool,
     lang: Lang,
+    browse: &mut Browse,
 ) {
     ui.vertical(|ui| {
         ui.set_width(SETTING_KEY_WIDTH);
@@ -2581,7 +2758,7 @@ fn setting_row(
             .wrap(),
         );
     });
-    field_editor(ui, field, lang);
+    field_editor(ui, field, lang, browse);
     match default {
         Some(d) if d.value == field.value => {
             ui.weak(tr!(lang, "default", "기본값"));
@@ -2605,7 +2782,8 @@ fn setting_row(
     }
 }
 
-fn field_editor(ui: &mut egui::Ui, field: &mut Field, lang: Lang) {
+fn field_editor(ui: &mut egui::Ui, field: &mut Field, lang: Lang, browse: &mut Browse) {
+    let is_path = (field.section, field.key) == ("import", "transcripts_dir");
     let is_language = (field.section, field.key) == ("ui", "language");
     let is_theme = (field.section, field.key) == ("ui", "theme");
     let is_multiline = (field.section, field.key) == ("embedder", "query_prefix");
@@ -2644,6 +2822,16 @@ fn field_editor(ui: &mut egui::Ui, field: &mut Field, lang: Lang) {
                         ui.selectable_value(s, theme.as_str().to_string(), theme.as_str());
                     }
                 });
+        }
+        FieldValue::Text(s) if is_path => {
+            path_input(
+                ui,
+                TEXT_FIELD_WIDTH,
+                s,
+                "",
+                PathField::TranscriptsDir,
+                browse,
+            );
         }
         FieldValue::Text(s) if is_multiline => {
             ui.add_sized(

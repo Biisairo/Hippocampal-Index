@@ -395,6 +395,8 @@ The window's data root is the binary's data root. For a binary that is not insta
 | Claude setup | Choose the data root and the Claude folder. Shows whether the binary is installed, whether the hooks are applied, and the PATH link. **Preview** shows the same result as `--dry-run`. **Apply** and **Remove** work only after a preview with the same inputs, and ask for confirmation. **Delete everything** does the same as `purge`. |
 | About | Version, README, and LICENSE |
 
+Path fields have a **Browse…** button that opens the macOS folder picker. Hidden folders (such as `~/.claude`) are shown.
+
 The window uses `[ui] language`. Korean text uses a macOS system font. The colors follow the macOS light or dark mode by default; set `[ui] theme` to `light` or `dark` to fix one. Saving the theme in the Settings tab applies it at once.
 
 ### 4.7 Deleting records

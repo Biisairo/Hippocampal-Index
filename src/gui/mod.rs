@@ -2,6 +2,7 @@
 
 mod app;
 pub mod images;
+pub mod picker;
 pub mod state;
 mod text;
 pub mod theme;
