@@ -1,6 +1,6 @@
 //! GUI 화면. 데몬 요청과 파일 작업은 작업 스레드에서 하고, 화면은 2초마다 갱신한다. (FR-GUI-1~12)
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -12,12 +12,14 @@ use egui_extras::{Column, TableBuilder};
 use crate::client::request;
 use crate::commands::render_delete_report;
 use crate::commands::{
-    SESSION_ID_SHORT, project_scope, query, query_until_reply, run_install, scope_arg,
+    InstallTarget, SESSION_ID_SHORT, purge_data, query, query_until_reply, run_install,
+    run_uninstall, scope_arg, stop_services,
 };
 use crate::config::PatternEntry;
 use crate::config::{Config, Paths, Theme};
 use crate::config_edit::{
-    Field, FieldValue, SaveOutcome, changed, fields, needs_reindex, needs_restart, save,
+    CAPTURE_ENABLED, Field, FieldValue, INJECT_ENABLED, SaveOutcome, changed, fields,
+    needs_reindex, needs_restart, save,
 };
 use crate::gui::images;
 use crate::gui::state::{
@@ -33,12 +35,16 @@ use crate::gui::widgets::{
 };
 use crate::i18n::{Lang, local_time};
 use crate::import::{Candidate, ImportStatus, size_label, started_label};
-use crate::install::{Scope, is_installed, target_file};
+use crate::install::{installed_exe, is_installed, settings_file};
+use crate::layout::{
+    InstallState, LinkState, default_claude_dir, install_state, link_state, path_link,
+};
 use crate::protocol::{
     DeleteReport, Request, Response, Scope as QueryScope, StatusInfo, embed_progress,
     missing_location,
 };
 use crate::search::{HitView, InjectionPlan, IterationView, SearchKind};
+use crate::setup::home_dir;
 use crate::store::{Page, RecordKind, SessionSummary, TurnSummary};
 use crate::tr;
 
@@ -282,13 +288,17 @@ struct Projects {
 type PreviewOutcome = (String, String, Result<(String, Vec<Candidate>), String>);
 type InstallOutcome = (Option<PreviewKey>, Result<String, String>);
 
+/// Claude 적용 탭이 보여 주는 현재 상태: hook 적용 여부와 PATH 링크. (FR-GUI-10)
+type InstallCheck = (bool, LinkState);
+
 struct Install {
     form: InstallForm,
     output: String,
-    installed: Option<bool>,
-    checked: Option<(bool, String)>,
+    current: Option<InstallCheck>,
+    checked: Option<(String, String)>,
     confirm: Option<InstallAction>,
-    check: Task<Option<bool>>,
+    confirm_purge: bool,
+    check: Task<InstallCheck>,
     task: Task<InstallOutcome>,
 }
 
@@ -404,6 +414,19 @@ impl Records {
 pub struct App {
     paths: Paths,
     cwd: String,
+    exe: PathBuf,
+    home: PathBuf,
+    /// 데이터 루트의 설치 상태. 계산 중이면 `None`. (FR-GUI-23)
+    state: Option<InstallState>,
+    state_task: Task<(PathBuf, InstallState)>,
+    /// 수동 중지 뒤 폴링을 멈춘 상태. 폴링이 데몬을 다시 띄우지 않게 한다. (FR-GUI-3)
+    paused: bool,
+    stop_task: Task<Result<String, String>>,
+    stop_output: String,
+    /// (주입 동작, 저장 동작). (FR-GUI-3, FR-CAP-8, FR-RET-12)
+    switches: (bool, bool),
+    switch_task: Task<Result<(bool, bool), String>>,
+    switch_error: Option<String>,
     lang: Lang,
     tab: Tab,
     status: Option<Result<StatusInfo, String>>,
@@ -433,6 +456,9 @@ impl App {
             .map(|c| c.ui)
             .unwrap_or_default();
         let lang = ui_config.language;
+        let exe = std::env::current_exe().unwrap_or_default();
+        let home = home_dir().unwrap_or_default();
+        let claude_dir = default_claude_dir(&paths.root, &home);
         ctx.set_visuals_of(egui::Theme::Light, theme::visuals(false));
         ctx.set_visuals_of(egui::Theme::Dark, theme::visuals(true));
         ctx.set_theme(theme::preference(ui_config.theme));
@@ -471,14 +497,25 @@ impl App {
                 ..Projects::default()
             },
             install: Install {
-                form: InstallForm::new(&cwd),
+                form: InstallForm::new(&paths.root, &claude_dir),
                 output: String::new(),
-                installed: None,
+                current: None,
                 checked: None,
                 confirm: None,
+                confirm_purge: false,
                 check: Task::default(),
                 task: Task::default(),
             },
+            exe,
+            home,
+            state: None,
+            state_task: Task::default(),
+            paused: false,
+            stop_task: Task::default(),
+            stop_output: String::new(),
+            switches: load_switches(&paths),
+            switch_task: Task::default(),
+            switch_error: None,
             about_license: false,
             art: Art::load(ctx),
             readme_en: images::readme_text(README_EN),
@@ -497,7 +534,9 @@ impl App {
                 .map_or(0, |d| d.as_secs() as i64);
             self.status_at = local_time(now);
         }
-        if Instant::now() >= self.next_poll && !self.status_task.running {
+        let ready = self.state == Some(InstallState::Installed);
+        let polling = ready && !self.paused && !self.stop_task.running;
+        if polling && Instant::now() >= self.next_poll && !self.status_task.running {
             self.next_poll = Instant::now() + POLL;
             let paths = self.paths.clone();
             self.status_task.start(ctx, move || {
@@ -511,8 +550,119 @@ impl App {
         ctx.request_repaint_after(POLL);
     }
 
+    /// 멈추기와 다시 시작. 멈춘 동안에는 폴링하지 않는다. (FR-GUI-3, FR-DMN-12)
+    fn stop_controls(&mut self, ui: &mut egui::Ui) {
+        let lang = self.lang;
+        let ctx = ui.ctx().clone();
+        if let Some(result) = self.stop_task.poll() {
+            self.paused = true;
+            self.status = None;
+            self.stop_output = result.unwrap_or_else(|e| tr!(lang, "error: {e}\n", "오류: {e}\n"));
+        }
+        ui.horizontal(|ui| {
+            if self.paused {
+                ui.colored_label(warn_color(ui), tr!(lang, "● stopped", "● 멈춤"));
+                if primary(ui, true, tr!(lang, "Start again", "다시 시작")).clicked() {
+                    self.paused = false;
+                    self.stop_output.clear();
+                    self.next_poll = Instant::now();
+                }
+            } else {
+                let label = tr!(lang, "Stop daemon and Ollama", "데몬과 Ollama 멈추기");
+                if ui
+                    .add_enabled(!self.stop_task.running, button(label))
+                    .clicked()
+                {
+                    let root = self.paths.root.clone();
+                    self.stop_task.start(&ctx, move || {
+                        let mut out = String::new();
+                        stop_services(&root, lang, &mut out).map(|()| out)
+                    });
+                }
+                if self.stop_task.running {
+                    ui.spinner();
+                }
+            }
+        });
+        if !self.stop_output.is_empty() {
+            ui.weak(self.stop_output.trim_end());
+        }
+        ui.add_space(4.0);
+        self.pause_controls(ui);
+    }
+
+    /// 주입과 저장의 일시정지/재생. 그 키만 `config.toml`에 저장한다. (FR-GUI-3)
+    fn pause_controls(&mut self, ui: &mut egui::Ui) {
+        let lang = self.lang;
+        let ctx = ui.ctx().clone();
+        if let Some(result) = self.switch_task.poll() {
+            match result {
+                Ok(switches) => {
+                    self.switches = switches;
+                    self.switch_error = None;
+                }
+                Err(e) => self.switch_error = Some(e),
+            }
+        }
+        let rows = [
+            (
+                INJECT_ENABLED,
+                tr!(lang, "Injection", "주입"),
+                self.switches.0,
+            ),
+            (
+                CAPTURE_ENABLED,
+                tr!(lang, "Saving", "저장"),
+                self.switches.1,
+            ),
+        ];
+        for ((section, key), name, on) in rows {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(name).strong());
+                if on {
+                    ui.colored_label(ok_color(ui), tr!(lang, "● running", "● 동작 중"));
+                } else {
+                    ui.colored_label(warn_color(ui), tr!(lang, "● paused", "● 일시정지"));
+                }
+                let label = if on {
+                    tr!(lang, "Pause", "일시정지")
+                } else {
+                    tr!(lang, "Resume", "재생")
+                };
+                if ui
+                    .add_enabled(!self.switch_task.running, button(label))
+                    .clicked()
+                {
+                    let paths = self.paths.clone();
+                    let field = Field {
+                        section,
+                        key,
+                        value: FieldValue::Bool(!on),
+                    };
+                    self.switch_task.start(&ctx, move || {
+                        save(&paths.config(), &[field]).map_err(|e| e.to_string())?;
+                        Ok(load_switches(&paths))
+                    });
+                }
+            });
+        }
+        if let Some(e) = &self.switch_error {
+            ui.colored_label(ui.visuals().error_fg_color, e);
+        }
+        ui.add_space(4.0);
+    }
+
     fn status_tab(&mut self, ui: &mut egui::Ui) {
         let lang = self.lang;
+        self.stop_controls(ui);
+        if self.paused {
+            ui.weak(tr!(
+                lang,
+                "Status polling is paused. Press Start again to resume; it starts the daemon.",
+                "상태 폴링을 멈췄습니다. 다시 시작을 누르면 폴링을 다시 하며, 데몬도 다시 뜹니다."
+            ));
+            return;
+        }
         let st = match &self.status {
             None => {
                 ui.weak(tr!(lang, "Waiting for the daemon…", "데몬을 기다리는 중…"));
@@ -1583,12 +1733,54 @@ impl App {
         output(ui, "project-list", &p.output, "");
     }
 
+    /// 입력란의 데이터 루트가 바뀌면 요청 대상과 설치 상태를 그 루트로 바꾼다. (FR-GUI-22, FR-GUI-23)
+    fn sync_root(&mut self, ctx: &egui::Context) {
+        let typed = self.install.form.root.trim();
+        if !typed.is_empty() && Path::new(typed) != self.paths.root {
+            let old_default = default_claude_dir(&self.paths.root, &self.home);
+            let root = PathBuf::from(typed);
+            if Path::new(self.install.form.claude_dir.trim()) == old_default {
+                self.install.form.claude_dir =
+                    default_claude_dir(&root, &self.home).display().to_string();
+            }
+            self.paths = Paths::new(root);
+            self.switches = load_switches(&self.paths);
+            self.state = None;
+            self.status = None;
+            self.records = Records::default();
+        }
+        if let Some((root, state)) = self.state_task.poll()
+            && root == self.paths.root
+        {
+            self.state = Some(state);
+        }
+        if self.state.is_none() && !self.state_task.running {
+            let (exe, root) = (self.exe.clone(), self.paths.root.clone());
+            self.state_task.start(ctx, move || {
+                let state = install_state(&exe, &root);
+                (root, state)
+            });
+        }
+    }
+
+    fn install_target(&self) -> InstallTarget {
+        let form = &self.install.form;
+        InstallTarget {
+            root: PathBuf::from(form.root.trim()),
+            claude_dir: PathBuf::from(form.claude_dir.trim()),
+            home: self.home.clone(),
+        }
+    }
+
     fn install_tab(&mut self, ui: &mut egui::Ui) {
         let lang = self.lang;
         let ctx = ui.ctx().clone();
+        let target = self.install_target();
+        let state = self.state;
+        let exe = self.exe.clone();
         let i = &mut self.install;
-        if let Some(installed) = i.check.poll() {
-            i.installed = installed;
+        if let Some(current) = i.check.poll() {
+            i.current = Some(current);
         }
         if let Some((key, result)) = i.task.poll() {
             match (key, result) {
@@ -1600,52 +1792,75 @@ impl App {
                     i.form.clear_preview();
                     i.output = text;
                     i.checked = None;
+                    self.state = None;
                 }
-                (_, Err(e)) => i.output = tr!(lang, "error: {e}\n", "오류: {e}\n"),
+                (_, Err(e)) => {
+                    i.output = tr!(lang, "error: {e}\n", "오류: {e}\n");
+                    i.checked = None;
+                    self.state = None;
+                }
             }
         }
-        card(ui, &tr!(lang, "Where to apply", "적용 범위"), |ui| {
+        card(ui, &tr!(lang, "Where to apply", "적용 위치"), |ui| {
             form(ui, "install-args", |ui, w| {
-                ui.label(tr!(lang, "Scope", "범위"));
-                ui.horizontal(|ui| {
-                    ui.radio_value(
-                        &mut i.form.user_scope,
-                        false,
-                        tr!(lang, "Project", "프로젝트"),
-                    );
-                    ui.radio_value(&mut i.form.user_scope, true, tr!(lang, "User", "사용자"));
-                });
+                ui.label(tr!(lang, "Data root", "데이터 루트"));
+                text_field(ui, w, &mut i.form.root, "~/.hippo");
                 ui.end_row();
-                ui.label(tr!(lang, "Project path", "프로젝트 경로"));
-                ui.add_enabled_ui(!i.form.user_scope, |ui| {
-                    text_field(ui, w, &mut i.form.project, "")
-                });
+                ui.label(tr!(lang, "Claude folder", "Claude 폴더"));
+                text_field(ui, w, &mut i.form.claude_dir, "~/.claude");
                 ui.end_row();
-                ui.label(tr!(lang, "Settings file", "설정 파일"));
-                ui.weak(if i.form.user_scope {
-                    "~/.claude/settings.json, ~/.claude/CLAUDE.md"
-                } else {
-                    "<project>/.claude/settings.local.json, <project>/CLAUDE.local.md"
-                });
+                ui.label(tr!(lang, "Binary", "실행 파일"));
+                match state {
+                    Some(InstallState::Installed) => {
+                        ui.colored_label(ok_color(ui), tr!(lang, "● installed", "● 설치됨"))
+                    }
+                    Some(InstallState::NeedUpdate) => ui.colored_label(
+                        warn_color(ui),
+                        tr!(lang, "● update needed", "● 업데이트 필요"),
+                    ),
+                    Some(InstallState::NeedInstall) => {
+                        ui.weak(tr!(lang, "○ not installed", "○ 설치 필요"))
+                    }
+                    None => ui.weak(tr!(lang, "checking…", "확인 중…")),
+                };
                 ui.end_row();
-                ui.label(tr!(lang, "Current", "현재"));
-                match i.installed {
-                    Some(true) => {
+                ui.label(tr!(lang, "Claude hooks", "Claude hook"));
+                match i.current {
+                    Some((true, _)) => {
                         ui.colored_label(ok_color(ui), tr!(lang, "● applied", "● 적용됨"))
                     }
-                    Some(false) => ui.weak(tr!(lang, "○ not applied", "○ 적용 안 됨")),
+                    Some((false, _)) => ui.weak(tr!(lang, "○ not applied", "○ 적용 안 됨")),
+                    None => ui.weak(tr!(lang, "unknown", "알 수 없음")),
+                };
+                ui.end_row();
+                ui.label(tr!(lang, "PATH link", "PATH 링크"));
+                let link = path_link(&target.home).display().to_string();
+                match i.current {
+                    Some((_, LinkState::Ours)) => {
+                        ui.colored_label(ok_color(ui), format!("● {link}"))
+                    }
+                    Some((_, LinkState::Foreign)) => ui.colored_label(
+                        warn_color(ui),
+                        tr!(
+                            lang,
+                            "● {link} points elsewhere",
+                            "● {link}이(가) 다른 곳을 가리킴"
+                        ),
+                    ),
+                    Some((_, LinkState::Missing)) => ui.weak(tr!(lang, "○ none", "○ 없음")),
                     None => ui.weak(tr!(lang, "unknown", "알 수 없음")),
                 };
                 ui.end_row();
             });
         });
-        let inputs = (i.form.user_scope, i.form.project.clone());
+        let inputs = (i.form.root.clone(), i.form.claude_dir.clone());
         if i.checked.as_ref() != Some(&inputs) && !i.check.running {
             i.checked = Some(inputs);
-            let scope = install_scope(&i.form, &self.cwd);
+            let target = target.clone();
             i.check.start(&ctx, move || {
-                let path = target_file(&scope.ok()?).ok()?;
-                Some(is_installed(&path))
+                let hooks = is_installed(&settings_file(&target.claude_dir));
+                let link = link_state(&path_link(&target.home), &installed_exe(&target.root));
+                (hooks, link)
             });
         }
         ui.add_space(4.0);
@@ -1656,8 +1871,8 @@ impl App {
                     tr!(lang, "Apply", "적용"),
                     tr!(
                         lang,
-                        "Add the hippo hooks and the guide block",
-                        "hippo hook과 안내 블록을 넣습니다"
+                        "Copy the binary, add the hippo hooks and the guide block, and link it on PATH",
+                        "실행 파일을 복사하고 hippo hook과 안내 블록, PATH 링크를 넣습니다"
                     ),
                 ),
                 (
@@ -1665,8 +1880,8 @@ impl App {
                     tr!(lang, "Remove", "해제"),
                     tr!(
                         lang,
-                        "Remove only the hippo hooks and the guide block",
-                        "hippo hook과 안내 블록만 지웁니다"
+                        "Remove only the hippo hooks, the guide block, and the PATH link",
+                        "hippo hook과 안내 블록, PATH 링크만 지웁니다"
                     ),
                 ),
             ];
@@ -1679,10 +1894,9 @@ impl App {
                             .clicked()
                         {
                             let key = i.form.key(action);
-                            let scope = install_scope(&i.form, &self.cwd);
-                            let paths = self.paths.clone();
+                            let (target, exe) = (target.clone(), exe.clone());
                             i.task.start(&ctx, move || {
-                                (Some(key), install_text(&paths, scope, action, true, lang))
+                                (Some(key), install_text(&target, &exe, action, true, lang))
                             });
                         }
                         if primary(ui, !i.task.running && i.form.can_run(action), label.clone())
@@ -1697,6 +1911,22 @@ impl App {
                 });
             }
         });
+        card(ui, &tr!(lang, "Delete everything", "완전 삭제"), |ui| {
+            ui.weak(tr!(
+                lang,
+                "Remove, then delete the data root with all records",
+                "해제한 뒤 데이터 루트와 모든 기록을 지웁니다"
+            ));
+            if ui
+                .add_enabled(
+                    !i.task.running,
+                    button(tr!(lang, "Delete everything", "완전 삭제")),
+                )
+                .clicked()
+            {
+                i.confirm_purge = true;
+            }
+        });
         if let Some(action) = i.confirm {
             let modal = egui::Modal::new(egui::Id::unique("install-confirm")).show(&ctx, |ui| {
                 ui.set_max_width(MODAL_WIDTH);
@@ -1709,22 +1939,21 @@ impl App {
                 ui.label(match action {
                     InstallAction::Install => tr!(
                         lang,
-                        "Write the hippo hooks and guide block shown in the preview?",
-                        "미리 보기의 hippo hook과 안내 블록을 쓸까요?"
+                        "Apply the changes shown in the preview?",
+                        "미리 보기의 변경을 적용할까요?"
                     ),
                     InstallAction::Uninstall => tr!(
                         lang,
-                        "Remove the hippo hooks and guide block shown in the preview?",
-                        "미리 보기의 hippo hook과 안내 블록을 지울까요?"
+                        "Remove the hippo hooks, guide block, and PATH link shown in the preview?",
+                        "미리 보기의 hippo hook과 안내 블록, PATH 링크를 지울까요?"
                     ),
                 });
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if primary(ui, true, tr!(lang, "Confirm", "확인")).clicked() {
-                        let scope = install_scope(&i.form, &self.cwd);
-                        let paths = self.paths.clone();
+                        let (target, exe) = (target.clone(), exe.clone());
                         i.task.start(&ctx, move || {
-                            (None, install_text(&paths, scope, action, false, lang))
+                            (None, install_text(&target, &exe, action, false, lang))
                         });
                         i.confirm = None;
                     }
@@ -1735,6 +1964,37 @@ impl App {
             });
             if modal.should_close() {
                 i.confirm = None;
+            }
+        }
+        if i.confirm_purge {
+            let modal = egui::Modal::new(egui::Id::unique("purge-confirm")).show(&ctx, |ui| {
+                ui.set_max_width(MODAL_WIDTH);
+                ui.label(
+                    RichText::new(tr!(lang, "Delete everything", "완전 삭제"))
+                        .strong()
+                        .size(16.0),
+                );
+                ui.add_space(4.0);
+                let root = target.root.display().to_string();
+                ui.label(tr!(
+                    lang,
+                    "Remove the hooks, then delete {root} and all its records. This cannot be undone.",
+                    "hook을 해제한 뒤 {root}와(과) 모든 기록을 지웁니다. 되돌릴 수 없습니다."
+                ));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if primary(ui, true, tr!(lang, "Delete", "지우기")).clicked() {
+                        let target = target.clone();
+                        i.task.start(&ctx, move || (None, purge_text(&target, lang)));
+                        i.confirm_purge = false;
+                    }
+                    if ui.add(button(tr!(lang, "Cancel", "취소"))).clicked() {
+                        i.confirm_purge = false;
+                    }
+                });
+            });
+            if modal.should_close() {
+                i.confirm_purge = false;
             }
         }
         ui.add_space(4.0);
@@ -1789,8 +2049,13 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.sync_root(&ctx);
         self.poll_status(&ctx);
         let lang = self.lang;
+        let ready = self.state == Some(InstallState::Installed);
+        if self.state.is_some() && !ready && !matches!(self.tab, Tab::Install | Tab::About) {
+            self.tab = Tab::Install;
+        }
         egui::Panel::top("tabs")
             .frame(
                 egui::Frame::side_top_panel(ui.style())
@@ -1804,11 +2069,14 @@ impl eframe::App for App {
                     ui.label(RichText::new("hippo").strong().size(17.0));
                     ui.add_space(8.0);
                     for tab in Tab::ALL {
-                        ui.selectable_value(
-                            &mut self.tab,
-                            tab,
-                            RichText::new(tab.label(lang)).size(15.0),
-                        );
+                        let enabled = ready || matches!(tab, Tab::Install | Tab::About);
+                        ui.add_enabled_ui(enabled, |ui| {
+                            ui.selectable_value(
+                                &mut self.tab,
+                                tab,
+                                RichText::new(tab.label(lang)).size(15.0),
+                            );
+                        });
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         match &self.status {
@@ -1827,16 +2095,43 @@ impl eframe::App for App {
             });
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::same(14)))
-            .show(ui, |ui| match self.tab {
-                Tab::Status => self.status_tab(ui),
-                Tab::Records => self.records_tab(ui),
-                Tab::Settings => self.settings_tab(ui),
-                Tab::Import => self.import_tab(ui),
-                Tab::Search => self.search_tab(ui),
-                Tab::Projects => self.projects_tab(ui),
-                Tab::Install => self.install_tab(ui),
-                Tab::About => self.about_tab(ui),
+            .show(ui, |ui| {
+                let notice = match self.state {
+                    Some(InstallState::NeedInstall) => Some(tr!(
+                        lang,
+                        "hippo is not installed in this data root. Apply it in the Claude setup tab.",
+                        "이 데이터 루트에 hippo가 설치되어 있지 않습니다. Claude 적용 탭에서 적용하십시오."
+                    )),
+                    Some(InstallState::NeedUpdate) => Some(tr!(
+                        lang,
+                        "The installed binary differs from this app. Apply again in the Claude setup tab to update it.",
+                        "설치된 실행 파일이 이 앱과 다릅니다. 업데이트하려면 Claude 적용 탭에서 다시 적용하십시오."
+                    )),
+                    _ => None,
+                };
+                if let Some(notice) = notice {
+                    banner(ui, warn_color(ui), |ui| {
+                        ui.label(notice);
+                    });
+                    ui.add_space(6.0);
+                }
+                self.show_tab(ui);
             });
+    }
+}
+
+impl App {
+    fn show_tab(&mut self, ui: &mut egui::Ui) {
+        match self.tab {
+            Tab::Status => self.status_tab(ui),
+            Tab::Records => self.records_tab(ui),
+            Tab::Settings => self.settings_tab(ui),
+            Tab::Import => self.import_tab(ui),
+            Tab::Search => self.search_tab(ui),
+            Tab::Projects => self.projects_tab(ui),
+            Tab::Install => self.install_tab(ui),
+            Tab::About => self.about_tab(ui),
+        }
     }
 }
 
@@ -2366,34 +2661,37 @@ fn field_editor(ui: &mut egui::Ui, field: &mut Field, lang: Lang) {
     }
 }
 
-fn install_scope(form: &InstallForm, cwd: &str) -> Result<Scope, String> {
-    if form.user_scope {
-        return Ok(Scope::User);
-    }
-    let project = PathBuf::from(cwd).join(form.project.trim());
-    project_scope(Some(project), &PathBuf::from(cwd))
+/// 설정 파일의 (주입 동작, 저장 동작). 읽지 못하면 기본값(둘 다 동작)이다. (FR-GUI-3)
+fn load_switches(paths: &Paths) -> (bool, bool) {
+    let config = Config::load(&paths.config()).unwrap_or_default();
+    (config.inject.enabled, config.capture.enabled)
 }
 
 /// `hippo install`/`uninstall`과 같은 동작. 복사할 실행 파일은 실행 중인 hippo이다. (FR-GUI-10)
 fn install_text(
-    paths: &Paths,
-    scope: Result<Scope, String>,
+    target: &InstallTarget,
+    exe: &Path,
     action: InstallAction,
     dry_run: bool,
     lang: Lang,
 ) -> Result<String, String> {
-    let scope = scope?;
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut out = String::new();
-    match run_install(
-        paths,
-        &scope,
-        action == InstallAction::Install,
-        dry_run,
-        &exe,
-        lang,
-        &mut out,
-    ) {
+    let result = match action {
+        InstallAction::Install => run_install(target, dry_run, exe, lang, &mut out),
+        InstallAction::Uninstall => run_uninstall(target, dry_run, lang, &mut out),
+    };
+    match result {
+        Ok(()) => Ok(out),
+        Err(e) => Err(format!("{out}{e}")),
+    }
+}
+
+/// `hippo purge`와 같은 동작. 확인은 대화창에서 받았다. (FR-GUI-10, FR-INS-13)
+fn purge_text(target: &InstallTarget, lang: Lang) -> Result<String, String> {
+    let mut out = String::new();
+    let result = run_uninstall(target, false, lang, &mut out)
+        .and_then(|()| purge_data(&target.root, &target.home, lang, &mut out));
+    match result {
         Ok(()) => Ok(out),
         Err(e) => Err(format!("{out}{e}")),
     }

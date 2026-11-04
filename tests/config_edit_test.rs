@@ -36,6 +36,9 @@ total_chars = 99
 budget_ms = 1
 cold_budget_ms = 2
 min_prompt_chars = 3
+enabled = false
+[capture]
+enabled = false
 [index]
 vector_index_threshold = 5
 job_batch = 6
@@ -85,10 +88,10 @@ fn fields_read_every_key_and_save_round_trips() {
     let all = Config::parse(ALL_KEYS).unwrap();
     let defaults = fields(&Config::default());
     let set = fields(&all);
-    assert_eq!(set.len(), 33);
+    assert_eq!(set.len(), 35);
     assert_eq!(
         changed(&defaults, &set).len(),
-        33,
+        35,
         "모든 키가 설정값을 읽음"
     );
     let d = dir();

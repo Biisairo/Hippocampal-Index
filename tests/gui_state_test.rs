@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -239,18 +239,19 @@ fn session_error_is_counted_and_import_continues() {
 
 #[test]
 fn apply_and_remove_need_a_preview_with_the_same_inputs() {
-    let mut form = InstallForm::new("/w");
+    let mut form = InstallForm::new(Path::new("/d"), Path::new("/c"));
+    assert_eq!((form.root.as_str(), form.claude_dir.as_str()), ("/d", "/c"));
     assert!(!form.can_run(InstallAction::Install));
     form.mark_previewed(form.key(InstallAction::Install));
     assert!(form.can_run(InstallAction::Install));
     assert!(!form.can_run(InstallAction::Uninstall), "다른 동작");
-    form.project = "/other".into();
-    assert!(!form.can_run(InstallAction::Install), "다른 프로젝트");
-    form.project = "/w".into();
+    form.root = "/other".into();
+    assert!(!form.can_run(InstallAction::Install), "다른 데이터 루트");
+    form.root = "/d".into();
     assert!(form.can_run(InstallAction::Install));
-    form.user_scope = true;
-    assert!(!form.can_run(InstallAction::Install), "다른 범위");
-    form.user_scope = false;
+    form.claude_dir = "/c2".into();
+    assert!(!form.can_run(InstallAction::Install), "다른 Claude 폴더");
+    form.claude_dir = "/c".into();
     form.clear_preview();
     assert!(
         !form.can_run(InstallAction::Install),

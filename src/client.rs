@@ -8,9 +8,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::config::Paths;
+use crate::config::{Config, Paths};
 use crate::fsutil::{ensure_private_dir, open_private_append};
 use crate::ingest::{HookEvent, IngestRequest};
+use crate::install::installed_exe;
 use crate::protocol::{Request, Response};
 use crate::spool;
 
@@ -44,14 +45,12 @@ const DAEMON_STDERR: &str = "daemon.err";
 /// 데몬을 띄우는 방법. 실제로는 `spawn_daemon_process`, 자동 시작을 끄면 `launch_disabled`.
 pub type Launcher<'a> = &'a dyn Fn(&Paths) -> std::io::Result<()>;
 
-/// 같은 실행 파일로 `daemon`을 분리된 프로세스로 띄운다. stderr는 `logs/daemon.err`에 덧붙인다.
+/// 데이터 루트의 설치 경로로 `daemon`을 분리된 프로세스로 띄운다. stderr는 `logs/daemon.err`에 덧붙인다. (FR-DMN-7)
 pub fn spawn_daemon_process(paths: &Paths) -> std::io::Result<()> {
     ensure_private_dir(&paths.logs())?;
     let stderr = open_private_append(&paths.logs().join(DAEMON_STDERR))?;
-    let mut command = Command::new(std::env::current_exe()?);
+    let mut command = Command::new(installed_exe(&paths.root));
     command
-        .arg("--root")
-        .arg(&paths.root)
         .arg("daemon")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -157,6 +156,15 @@ pub fn parse_hook(event_arg: &str, input: &str) -> HookAction {
 /// UserPromptSubmit hook의 stdout JSON.
 pub fn inject_output(context: &str) -> String {
     json!({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}}).to_string()
+}
+
+/// 일시정지된 hook이면 true. 데몬에 요청하지도, 스풀에 쓰지도 않는다. (FR-CAP-8, FR-RET-12)
+pub fn hook_paused(config: &Config, event_arg: &str) -> bool {
+    match event_arg {
+        "user-prompt-submit" => !config.inject.enabled,
+        "post-tool-batch" | "stop" | "stop-failure" | "session-end" => !config.capture.enabled,
+        _ => false,
+    }
 }
 
 /// hook을 실행하고 stdout에 쓸 내용을 돌려준다. 어떤 경우에도 실패를 밖으로 내지 않는다. (QA-5)

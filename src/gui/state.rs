@@ -1,5 +1,6 @@
 //! 화면과 분리한 GUI 상태 로직. (FR-GUI-7, FR-GUI-8, FR-GUI-10, FR-GUI-13~17)
 
+use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -209,31 +210,32 @@ pub enum InstallAction {
 /// 미리 보기를 한 입력. 같은 입력이어야 적용·해제를 할 수 있다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviewKey {
-    user_scope: bool,
-    project: String,
+    root: String,
+    claude_dir: String,
     action: InstallAction,
 }
 
-/// Claude 적용 탭의 입력. (FR-GUI-10)
+/// Claude 적용 탭의 입력. (FR-GUI-10, FR-GUI-22)
 #[derive(Debug, Clone, Default)]
 pub struct InstallForm {
-    pub user_scope: bool,
-    pub project: String,
+    pub root: String,
+    pub claude_dir: String,
     previewed: Option<PreviewKey>,
 }
 
 impl InstallForm {
-    pub fn new(cwd: &str) -> Self {
+    pub fn new(root: &Path, claude_dir: &Path) -> Self {
         Self {
-            project: cwd.to_string(),
-            ..Self::default()
+            root: root.display().to_string(),
+            claude_dir: claude_dir.display().to_string(),
+            previewed: None,
         }
     }
 
     pub fn key(&self, action: InstallAction) -> PreviewKey {
         PreviewKey {
-            user_scope: self.user_scope,
-            project: self.project.clone(),
+            root: self.root.clone(),
+            claude_dir: self.claude_dir.clone(),
             action,
         }
     }

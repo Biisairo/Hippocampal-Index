@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -12,11 +12,22 @@ fn hippo(root: &Path, args: &[&str], stdin: &str) -> Output {
     hippo_in(root, Path::new("/"), args, stdin)
 }
 
+/// 데이터 루트는 실행 파일 위치로 정하므로, `<root>/bin/hippo`에 빌드한 실행 파일의 하드 링크를 둔다.
+/// 하드 링크를 만들 수 없으면 복사한다. (FR-ROOT-2)
+fn installed_bin(root: &Path) -> PathBuf {
+    let bin = root.join("bin/hippo");
+    if !bin.exists() {
+        fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        if fs::hard_link(BIN, &bin).is_err() {
+            fs::copy(BIN, &bin).unwrap();
+        }
+    }
+    bin
+}
+
 fn hippo_in(root: &Path, cwd: &Path, args: &[&str], stdin: &str) -> Output {
-    let mut child = Command::new(BIN)
+    let mut child = Command::new(installed_bin(root))
         .current_dir(cwd)
-        .arg("--root")
-        .arg(root)
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -56,9 +67,7 @@ fn spawn_daemon(root: &Path) -> Daemon {
         ),
     )
     .unwrap();
-    let child = Command::new(BIN)
-        .arg("--root")
-        .arg(root)
+    let child = Command::new(installed_bin(root))
         .arg("daemon")
         .stderr(Stdio::piped())
         .spawn()
@@ -107,7 +116,7 @@ fn launchd_plist_prints_xml() {
     assert!(text.contains("<string>daemon</string>"));
     assert!(
         text.contains(&dir.path().display().to_string()),
-        "--root 경로를 반영"
+        "데이터 루트 경로를 반영"
     );
 }
 
@@ -195,9 +204,7 @@ fn daemon_refuses_invalid_config() {
         "[embedder]\nurl = \"https://api.example.com\"\n",
     )
     .unwrap();
-    let out = Command::new(BIN)
-        .arg("--root")
-        .arg(dir.path())
+    let out = Command::new(installed_bin(dir.path()))
         .arg("daemon")
         .output()
         .unwrap();
@@ -205,183 +212,137 @@ fn daemon_refuses_invalid_config() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("localhost"));
 }
 
-// ---- IF-CLI-6 ----
+// ---- IF-CLI-6, IF-CLI-13, IF-CLI-14, FR-INS-14 ----
 
-#[test]
-fn install_and_uninstall_project_scope() {
-    let dir = tempfile::tempdir_in("/tmp").unwrap();
-    let project = dir.path().join("proj");
-    fs::create_dir_all(&project).unwrap();
-    let p = project.to_string_lossy().to_string();
-    let target = project.join(".claude/settings.local.json");
+/// 관리 실행 파일이 아닌 실행 파일(빌드 폴더)로 실행한다. HOME과 PATH는 격리한다.
+fn unmanaged(home: &Path, args: &[&str]) -> Output {
+    Command::new(BIN)
+        .env("HOME", home)
+        .env("PATH", "/usr/bin:/bin")
+        .args(args)
+        .output()
+        .unwrap()
+}
 
-    let dry = hippo(
-        dir.path(),
-        &[
-            "install",
-            "--scope",
-            "project",
-            "--project",
-            &p,
-            "--dry-run",
-        ],
-        "",
-    );
-    assert!(dry.status.success());
-    assert!(!target.exists());
-    assert!(String::from_utf8_lossy(&dry.stdout).contains("hook stop"));
-
-    assert!(
-        hippo(
-            dir.path(),
-            &["install", "--scope", "project", "--project", &p],
-            ""
-        )
-        .status
-        .success()
-    );
-    let v: Value = serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
-    assert!(
-        v["hooks"]["Stop"][0]["hooks"][0]["command"]
-            .as_str()
-            .unwrap()
-            .ends_with("hippo hook stop")
-    );
-
-    let again = hippo(
-        dir.path(),
-        &["install", "--scope", "project", "--project", &p],
-        "",
-    );
-    assert!(String::from_utf8_lossy(&again.stdout).contains("No change"));
-
-    assert!(
-        hippo(
-            dir.path(),
-            &["uninstall", "--scope", "project", "--project", &p],
-            ""
-        )
-        .status
-        .success()
-    );
-    assert!(!target.exists(), "hippo만 있던 설정 파일은 지움 (FR-INS-4)");
-    assert!(
-        !target.parent().unwrap().exists(),
-        "빈 .claude 디렉터리도 지움"
-    );
+fn run(exe: &Path, home: &Path, args: &[&str]) -> Output {
+    Command::new(exe)
+        .env("HOME", home)
+        .env("PATH", "/usr/bin:/bin")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
 }
 
 #[test]
-fn install_user_scope_uses_home() {
+fn unmanaged_binary_only_installs_and_root_option_is_gone() {
     let dir = tempfile::tempdir_in("/tmp").unwrap();
+    for args in [
+        &["status"][..],
+        &["search", "q"],
+        &["uninstall"],
+        &["purge", "--yes"],
+    ] {
+        let out = unmanaged(dir.path(), args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("hippo install"),
+            "{args:?}: {out:?}"
+        );
+    }
+    let hook = unmanaged(dir.path(), &["hook", "user-prompt-submit"]);
+    assert!(hook.status.success() && hook.stdout.is_empty(), "{hook:?}");
+    let root = unmanaged(dir.path(), &["--root", "/tmp/x", "status"]);
+    assert_eq!(root.status.code(), Some(2), "--root는 없음");
+    let help = unmanaged(dir.path(), &[]);
+    assert!(help.status.success());
+    assert!(
+        String::from_utf8_lossy(&help.stdout).contains("Usage"),
+        "인자가 없으면 도움말: {help:?}"
+    );
+    assert!(!dir.path().join(".hippo").exists(), "아무것도 만들지 않음");
+}
+
+#[test]
+fn install_uninstall_and_purge_through_the_cli() {
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let home = fs::canonicalize(dir.path()).unwrap();
+    let claude = home.join(".claude");
+    let root = home.join("data");
+    let link = home.join(".local/bin/hippo");
+
+    let dry = unmanaged(&home, &["install", "--data-dir", "data", "--dry-run"]);
+    assert!(dry.status.success(), "{dry:?}");
+    assert!(!root.exists() && !claude.exists());
+
     let out = Command::new(BIN)
-        .env("HOME", dir.path())
-        .args([
-            "--root",
-            &dir.path().join("root").to_string_lossy(),
-            "install",
-            "--scope",
-            "user",
-        ])
+        .current_dir(&home)
+        .env("HOME", &home)
+        .env("PATH", "/usr/bin:/bin")
+        .args(["install", "--data-dir", "data"])
         .output()
         .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(dir.path().join(".claude/settings.json").exists());
-    let exe = dir.path().join("root/bin/hippo");
+    assert!(out.status.success(), "{out:?}");
+    let printed = String::from_utf8_lossy(&out.stdout);
+    assert!(printed.contains("is not on PATH"), "PATH 경고: {printed}");
+    let exe = root.join("bin/hippo");
     assert!(exe.exists(), "실행 파일을 데이터 루트로 복사 (FR-INS-8)");
-    let settings = fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
+    let settings = fs::read_to_string(claude.join("settings.json")).unwrap();
     assert!(
-        settings.contains("\"~/root/bin/hippo hook stop\""),
+        settings.contains("\"~/data/bin/hippo hook stop\""),
         "hook은 설치 경로: {settings}"
     );
-    let memory = dir.path().join(".claude/CLAUDE.md");
     assert!(
-        fs::read_to_string(&memory)
+        fs::read_to_string(claude.join("CLAUDE.md"))
             .unwrap()
-            .contains("`~/root/bin/hippo search"),
+            .contains("`~/data/bin/hippo search"),
         "안내 블록도 설치 경로"
     );
-    assert!(
-        fs::read_to_string(&memory)
-            .unwrap()
-            .contains("<!-- hippo:begin -->"),
-        "안내 블록도 함께 설치 (FR-INS-7)"
-    );
-    let printed = String::from_utf8_lossy(&out.stdout);
-    assert!(printed.contains("Applied:"), "기본 출력은 영어: {printed}");
+    assert_eq!(fs::read_link(&link).unwrap(), exe);
 
-    let project = dir.path().join("proj");
-    fs::create_dir_all(&project).unwrap();
+    let via_link = run(&link, &home, &["hooks-config"]);
     assert!(
-        std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&project)
-            .status()
-            .unwrap()
-            .success()
+        via_link.status.success(),
+        "링크로 실행해도 루트를 찾음: {via_link:?}"
     );
-    let run = |args: &[&str]| {
-        Command::new(BIN)
-            .env("HOME", dir.path())
-            .arg("--root")
-            .arg(dir.path().join("root"))
-            .args(args)
-            .arg("--project")
-            .arg(&project)
-            .output()
-            .unwrap()
-    };
-    let installed = run(&["install", "--scope", "project"]);
-    let printed = String::from_utf8_lossy(&installed.stdout);
+    let again = run(&exe, &home, &["install", "--dry-run"]);
+    let again_text = String::from_utf8_lossy(&again.stdout);
     assert!(
-        printed.contains("Warning:"),
-        "무시되지 않는 CLAUDE.local.md 경고: {printed}"
+        again_text.contains("Binary up to date") && again_text.contains("No change"),
+        "기본값은 자기 루트와 기록한 Claude 폴더: {again_text}"
     );
-    assert!(project.join("CLAUDE.local.md").exists());
-    assert!(run(&["uninstall", "--scope", "project"]).status.success());
-    assert!(
-        !project.join("CLAUDE.local.md").exists(),
-        "블록만 있던 파일은 지움"
-    );
-    assert!(exe.exists(), "user 범위 설치가 남아 있으면 실행 파일 유지");
-    let out = Command::new(BIN)
-        .env("HOME", dir.path())
-        .arg("--root")
-        .arg(dir.path().join("root"))
-        .args(["uninstall", "--scope", "user"])
-        .output()
-        .unwrap();
-    assert!(out.status.success());
-    assert!(
-        !dir.path().join("root/bin").exists(),
-        "마지막 제거에서 실행 파일 삭제 (FR-INS-9)"
-    );
+
+    let removed = run(&exe, &home, &["uninstall"]);
+    assert!(removed.status.success(), "{removed:?}");
+    assert!(!claude.join("settings.json").exists());
+    assert!(fs::symlink_metadata(&link).is_err());
+    assert!(exe.exists(), "제거해도 실행 파일은 남음");
+
+    let refused = run(&exe, &home, &["purge"]);
+    assert_eq!(refused.status.code(), Some(1), "터미널이 아니고 --yes 없음");
+    assert!(root.exists());
+    let purged = run(&exe, &home, &["purge", "--yes"]);
+    assert!(purged.status.success(), "{purged:?}");
+    assert!(!root.exists(), "데이터 루트 삭제");
 }
 
 #[test]
 fn install_refuses_invalid_settings() {
     let dir = tempfile::tempdir_in("/tmp").unwrap();
-    let project = dir.path().join("proj/.claude");
-    fs::create_dir_all(&project).unwrap();
-    fs::write(project.join("settings.local.json"), "{ broken").unwrap();
-    let out = hippo(
+    let claude = dir.path().join(".claude");
+    fs::create_dir_all(&claude).unwrap();
+    fs::write(claude.join("settings.json"), "{ broken").unwrap();
+    let out = unmanaged(
         dir.path(),
         &[
             "install",
-            "--scope",
-            "project",
-            "--project",
-            &dir.path().join("proj").to_string_lossy(),
+            "--data-dir",
+            &dir.path().join("data").to_string_lossy(),
         ],
-        "",
     );
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
-        fs::read_to_string(project.join("settings.local.json")).unwrap(),
+        fs::read_to_string(claude.join("settings.json")).unwrap(),
         "{ broken"
     );
 }
@@ -678,4 +639,52 @@ fn forget_and_project_remove_confirm_and_report() {
         "",
     ));
     assert!(missing.contains("Nothing to delete"), "{missing}");
+}
+
+// ---- FR-DMN-12, IF-CLI-15 ----
+
+#[test]
+fn stop_shuts_down_running_daemon_and_reports_when_nothing_runs() {
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let root = dir.path().join("root");
+    let mut daemon = spawn_daemon(&root);
+    let out = stdout(&hippo(&root, &["stop"], ""));
+    assert!(out.contains("Stopped the daemon"), "{out}");
+    assert!(!root.join("hippo.sock").exists(), "소켓 파일이 없어짐");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while daemon.0.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "데몬 프로세스 종료");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let again = stdout(&hippo(&root, &["stop"], ""));
+    assert!(again.contains("Nothing to stop"), "{again}");
+}
+
+// ---- FR-CAP-8 ----
+
+#[test]
+fn paused_capture_neither_contacts_daemon_nor_spools() {
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    fs::write(
+        dir.path().join("config.toml"),
+        "[daemon]\nautostart = false\n[capture]\nenabled = false\n",
+    )
+    .unwrap();
+    let input = r#"{"session_id":"s","transcript_path":"/t/s.jsonl","cwd":"/w"}"#;
+    let out = hippo(dir.path(), &["hook", "stop"], input);
+    assert!(out.status.success() && out.stdout.is_empty());
+    assert!(
+        !dir.path().join("spool/pending.jsonl").exists(),
+        "스풀에 쓰지 않음"
+    );
+    fs::write(
+        dir.path().join("config.toml"),
+        "[daemon]\nautostart = false\n",
+    )
+    .unwrap();
+    assert!(hippo(dir.path(), &["hook", "stop"], input).status.success());
+    assert!(
+        dir.path().join("spool/pending.jsonl").exists(),
+        "재생하면 다시 동작"
+    );
 }

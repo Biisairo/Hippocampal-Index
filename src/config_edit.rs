@@ -13,6 +13,10 @@ use crate::fsutil::ensure_private_dir;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const LANGUAGE: (&str, &str) = ("ui", "language");
 const THEME: (&str, &str) = ("ui", "theme");
+/// hook이 매번 읽는 키. 바꿔도 데몬을 다시 시작할 필요가 없다. (FR-GUI-6)
+const NO_RESTART: &[(&str, &str)] = &[LANGUAGE, THEME, INJECT_ENABLED, CAPTURE_ENABLED];
+pub const INJECT_ENABLED: (&str, &str) = ("inject", "enabled");
+pub const CAPTURE_ENABLED: (&str, &str) = ("capture", "enabled");
 const REINDEX_EMBEDDER_KEYS: &[&str] = &["backend", "model", "dimension", "max_input_tokens"];
 const REINDEX_SECTIONS: &[&str] = &["vector", "chunking", "embed_text"];
 
@@ -107,6 +111,8 @@ pub fn fields(c: &Config) -> Vec<Field> {
         ("inject", "budget_ms", int(c.inject.budget_ms)),
         ("inject", "cold_budget_ms", int(c.inject.cold_budget_ms)),
         ("inject", "min_prompt_chars", int(c.inject.min_prompt_chars)),
+        ("inject", "enabled", FieldValue::Bool(c.inject.enabled)),
+        ("capture", "enabled", FieldValue::Bool(c.capture.enabled)),
         (
             "index",
             "vector_index_threshold",
@@ -161,11 +167,11 @@ pub fn changed(loaded: &[Field], edited: &[Field]) -> Vec<Field> {
         .collect()
 }
 
-/// `[ui] language`와 `[ui] theme` 말고 다른 키가 바뀌었으면 데몬 재시작이 필요하다. (FR-GUI-6)
+/// 언어, 테마, 일시정지 키 말고 다른 키가 바뀌었으면 데몬 재시작이 필요하다. (FR-GUI-6)
 pub fn needs_restart(changes: &[Field]) -> bool {
     changes
         .iter()
-        .any(|f| (f.section, f.key) != LANGUAGE && (f.section, f.key) != THEME)
+        .any(|f| !NO_RESTART.contains(&(f.section, f.key)))
 }
 
 /// 재색인 필요 키가 바뀌었는지. (SRS 1.3)

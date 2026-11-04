@@ -16,6 +16,7 @@ pub mod indexer;
 pub mod ingest;
 pub mod install;
 pub mod lance;
+pub mod layout;
 pub mod ollama;
 pub mod project;
 pub mod protocol;

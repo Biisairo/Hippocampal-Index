@@ -1,4 +1,4 @@
-# 인계: 결함 정리(SRS 0.20) 이후 — 앱(.app) 배포
+# 인계: 앱(.app) 배포(SRS 0.21) 이후 — push와 재설치·재임베딩
 
 이 문서는 다음 세션의 착수 문서입니다. 이번 세션의 지시는 아래 "착수 블록"이 전부입니다.
 
@@ -8,101 +8,59 @@
 
 1. `git status`를 실행합니다.
    - 작업 트리는 깨끗해야 합니다.
-   - `main`은 `origin/main`보다 15개 커밋 앞서 있습니다(push 전). 기능 쪽 마지막 커밋은 `d3bb389`(SRS 0.20)이고, 그 뒤에 이 문서를 고친 커밋이 하나 있습니다.
+   - `main`은 `origin/main`보다 앞서 있습니다(push 전). 마지막 커밋은 앱 배포 구현(SRS 0.21)입니다.
 2. 다음 문서를 읽습니다.
    - 이 문서 전체
-   - `docs/handoff-delete-records.md`의 4장(값을 치르고 배운 것), 5장(고친 것과 남은 것), 6장(규약)
-   - `docs/handoff-laya.md` 4장(재설치 순서, GUI 화면 확인 방법)
-3. 다음 순서로 진행합니다.
-   1. **앱(.app) 배포**(2장). 사용자가 앱으로 배포하기로 정했습니다. SRS 인터뷰부터 시작합니다. 질문은 하나씩, 권장안과 함께 냅니다.
-   2. **push와 재임베딩**: 둘 다 사용자에게 먼저 묻습니다. 재임베딩은 다시 설치한 뒤 프로젝트 10개를 `hippo import --from <경로> --to <경로>`로 가져오는 일이고, 대상 경로는 사용자에게 받습니다.
-4. 결정이 필요하면 `AskUserQuestion`으로 하나씩 묻습니다. 커밋과 push는 사용자 확인 후에만 합니다. 커밋할 때는 `git add -A`를 쓰지 말고 파일을 지정합니다(4장).
-5. **`docs/handoff-laya.md`는 건드리지 않습니다.** 사용자가 직접 정리하기로 했습니다(1장).
+   - `docs/handoff-delete-records.md`의 4장(값을 치르고 배운 것), 6장(규약)
+3. 다음을 사용자에게 **하나씩 먼저 묻고** 진행합니다.
+   1. **push**: `origin/main`으로 push할지.
+   2. **재설치**: 지금 이 장비에는 hippo가 설치되어 있지 않습니다(`~/.hippo` 없음, `~/.claude`에 hippo hook 없음). 앱(`scripts/bundle-app.sh` → `target/hippo.app`)의 GUI로 설치할지, `target/release/hippo install`로 설치할지 묻습니다. 설치는 `~/.claude`를 바꾸므로 반드시 사용자 확인 뒤에 합니다.
+   3. **재임베딩**: 설치한 뒤 프로젝트 10개를 `~/.hippo/bin/hippo import --from <경로> --to <경로>`로 가져옵니다. 대상 경로는 사용자에게 받습니다.
+4. 결정이 필요하면 `AskUserQuestion`으로 하나씩 묻습니다. 커밋과 push는 사용자 확인 후에만 합니다. 커밋할 때는 `git add -A`를 쓰지 말고 파일을 지정합니다.
+5. **`docs/handoff-laya.md`는 건드리지 않습니다.** 사용자가 직접 정리하기로 했습니다.
 
 ---
 
-## 1. 결함 정리 — 끝남 (`d3bb389`, SRS 0.20)
+## 1. 이번 세션에서 한 일 (SRS 0.21)
 
-| 항목 | 결과 |
-|------|------|
-| CRLF 메모리 파일 | 고쳤습니다. FR-INS-7을 먼저 고쳤습니다. 기존 줄의 줄 끝(LF, CRLF)은 줄마다 그대로 두고, 새 줄은 첫 줄의 줄 끝을 씁니다(첫 줄에 줄 끝이 없으면 LF). CRLF 파일과 줄 끝이 섞인 파일도 install → uninstall 뒤 바이트 단위로 같습니다. `src/install.rs`의 `split_lines`(`split_inclusive`), `line_ending`. 테스트 `install_then_remove_keeps_crlf_and_mixed_line_endings_byte_identical` |
-| 기록 탭 80자 잘림 표시 | 고쳤습니다. 저장된 프롬프트는 원문 그대로이고, 데몬이 `session_list`·`turn_list` 응답을 만들 때만 80자로 자릅니다. 이제 80자를 넘으면 끝에 `…`를 붙입니다(FR-GUI-13, `src/store.rs` `summary_line`). 사용자 의견: `…`가 있어야 상세를 열어 봅니다. 정확히 80자인 경우는 테스트하지 않았습니다. 가져오기 미리 보기(`src/import.rs` `prompt_preview`)는 범위 밖이라 그대로입니다. |
-| SRS IF-SK-2의 `cwd` 문구 | 문서만 고쳤습니다. `cwd`가 없는 요청은 `ingest`, `status`, `project_list`, `import_prepare`, `import_session`, `shutdown`입니다(이전 인계는 둘만 적었습니다). |
-| `CLAUDE.local.md`가 git에서 무시되지 않음 | 사용자 결정: 지금처럼 경고만 합니다. `.gitignore`와 `.git/info/exclude`는 건드리지 않습니다. |
-| 임베딩 큐의 프로젝트 순서 | 사용자 결정: 바꾸지 않습니다. |
-| SRS 상태 칸 | 사용자 결정: "검토 대기"로 둡니다. 앱 배포 요구사항을 넣은 뒤 다시 봅니다. |
-| `docs/handoff-laya.md` 정리 | 사용자가 4·6·7장만 옮기고 지우기를 골랐습니다. 그런데 그 작업을 하던 에이전트 응답이 안전 분류기에 막혔고, 사용자가 **직접 하기로** 했습니다. 다음 세션은 이 파일을 옮기거나 지우지 않습니다. 사용자가 요청하면 다른 문서에서 이 파일을 가리키는 곳만 찾아 줍니다. |
+### 설치 구조가 바뀌었습니다
+| 항목 | 이전 | 지금 |
+|------|------|------|
+| 데이터 루트 | `--root`, 없으면 `~/.hippo` | 실행 파일의 실제 경로 `<루트>/bin/hippo`로만 정함. `--root` 없음(FR-ROOT-1) |
+| 설치하지 않은 실행 파일 | 모든 명령 가능 | `install`, `gui`, 도움말만 가능. hook은 종료 코드 0으로 바로 끝남(FR-INS-14) |
+| install | `--scope user\|project [--project]` | `[--data-dir] [--claude-dir] [--dry-run]`. `<Claude 폴더>/settings.json`과 `CLAUDE.md`. 프로젝트 범위(`CLAUDE.local.md`)는 없앰 |
+| PATH | 없음 | `~/.local/bin/hippo` 링크. 다른 것이 있으면 아무것도 바꾸지 않고 오류(FR-INS-11) |
+| uninstall | 마지막 설치면 `bin/hippo` 삭제(`bin/installs`) | hook, 안내 블록, 링크만 지움. 실행 파일과 기록은 남김(FR-INS-9) |
+| 데이터 삭제 | `rm -rf ~/.hippo` | `hippo purge`: uninstall → 확인 → 데몬·Ollama 멈춤 → 루트 삭제(FR-INS-13) |
+| 데몬 자동 시작 | 자기 실행 파일 | 항상 `<루트>/bin/hippo`(FR-DMN-7) |
+| 실행 파일 교체 | 수동으로 데몬 재시작 | install이 내용을 바꾸면 그 루트의 데몬에 `shutdown`(FR-INS-8) |
 
-검증: 테스트 429개 통과, 실패 0, 무시 2. clippy 경고 0, fmt 통과.
+- Claude 폴더는 `<루트>/bin/claude-dir`에 기록하고, `--claude-dir`이 없을 때 기본값으로 씁니다(FR-INS-12).
+- hippo가 띄운 Ollama의 pid는 `<루트>/ollama.pid`에 기록합니다. 멈출 때는 프로세스 이름이 `ollama`인지 확인합니다(FR-EMB-4).
 
-## 2. 앱(.app) 배포 — 지금까지 정한 것과 정할 것
-
-### 정한 것
-- 배포는 macOS `.app`으로 합니다.
-- 앱을 열면 `~/.hippo`를 만들고, 앱 안의 실행 파일을 `~/.hippo/bin/hippo`로 복사합니다. CLI와 hook은 이 경로를 씁니다.
-- 실행 파일은 지금처럼 하나입니다. 앱은 같은 실행 파일을 감쌀 뿐이라 CLI 기능은 그대로입니다.
-
-### 정할 것 (인터뷰 대상)
-- **업데이트**: 앱을 새 버전으로 바꾸면 `~/.hippo/bin/hippo`를 교체하고, 떠 있는 이전 데몬을 내려야 합니다. 이전 데몬과 새 클라이언트가 섞이면 모르는 필드를 무시해 잘못 동작할 수 있습니다(`docs/handoff-laya.md` 4장).
-- **uninstall과의 관계**: 지금 `uninstall`은 남은 설치가 없으면 `bin/hippo`를 지웁니다(FR-INS-9). 앱을 열 때마다 복사하는 규칙과 맞춰야 합니다.
-- **인자 없이 실행**: Finder에서 열면 인자가 없습니다. 지금은 도움말만 출력합니다. 인자가 없으면 GUI를 띄우게 해야 합니다.
-- **PATH**: 터미널에서 `hippo`를 바로 치게 할지(링크를 만들지) 정합니다. Claude는 안내 블록의 `~/.hippo/bin/hippo` 경로를 쓰므로 없어도 됩니다.
-- **빌드**: `Info.plist`, `.icns`(`iconutil`, 원본은 `assets/icon.png` 또는 `assets/app/icon.png`), 번들을 만드는 스크립트. 새 의존성은 필요 없을 것으로 봅니다.
-- **서명**: 직접 빌드해서 쓰면 필요 없습니다. 다른 사람에게 배포하려면 코드 서명과 공증이 필요합니다. 격리 속성이 붙은 앱은 안의 실행 파일을 셸에서 실행할 때도 Gatekeeper 검사를 받습니다.
-
-## 3. 지난 세션(SRS 0.19)에서 한 일
-
-### 커밋 (push 전)
-| 커밋 | 내용 |
-|------|------|
-| `248486d` | 데몬 재시작 테스트의 간헐 `AlreadyRunning`: 다른 스레드의 자식 프로세스가 닫힌 잠금 fd를 exec 전까지 쥐는 것이 원인. 테스트만 고침 |
-| `8669bcd` | SRS 0.17: 실제 삭제는 시간 제한 없이 결과를 기다림 |
-| `373f575` | SRS 0.18: 삭제 끼어들기, 가져오기 대기, uninstall 바이트 복원, 기록 탭 개선(기본 프로젝트, 토스트, 삭제 대기 표시, 질의 결과 초기화) |
-| `4397f1e` | GUI 닫기(`×`)·추가 버튼 표시, 스풀 테스트 경합 |
-| 이 문서와 함께 | SRS 0.19: GUI 라이트·다크 테마(`[ui] theme`), 아이콘·로고·캐릭터, README 배너와 SVG 그림 3개 |
-
-### SRS 0.19에서 더한 것
-- FR-UI-3: `[ui] theme` = `system`(기본) | `light` | `dark`
-- FR-GUI-21: 로고 색으로 만든 두 테마. 강조색 위 글자의 명도 대비 4.5:1 이상, 상태 색과 배경의 명도 대비 3:1 이상
-- FR-GUI-20: 창·Dock 아이콘, 상단 작은 아이콘, 정보 탭 로고(라이트는 원본, 다크는 다크용), 빈 상태의 캐릭터
-- FR-GUI-11: 정보 탭의 README에서 이미지 블록과 이미지 줄을 뺌
-- FR-GUI-6: 테마도 언어처럼 데몬을 다시 시작하지 않고 바로 적용
-
-### 에셋 구성
-| 경로 | 쓰는 곳 |
-|------|---------|
-| `assets/icon.png`, `banner.png`, `character.png`, `logo.png` | 사용자가 준 원본. README 배너는 `banner.png` |
-| `assets/logo-dark.png` | 다크 배경용 로고. 원본의 글자 영역(x ≥ 740)만 크림색으로 바꿈 |
-| `assets/app/` | 바이너리에 넣는 작은 사본(`include_bytes!`, `src/gui/images.rs`). 아이콘 512px·64px(macOS 격자의 둥근 사각형), 로고 720px 두 가지, 배경을 투명하게 만든 캐릭터 |
-| `docs/images/storage.svg`, `capture.svg`, `retrieval.svg` | README 그림. 영어판은 `README.md`, 한국어판(`*.ko.svg`)은 `README.ko.md`가 씀. 한국어판에는 한글 글꼴(`Apple SD Gothic Neo`, `Noto Sans KR`, `Malgun Gothic`)을 글꼴 목록에 더함 |
+### 새로 넣은 것
+- **앱**: `scripts/bundle-app.sh`가 `target/hippo.app`을 만듭니다(Info.plist, `.icns`, ad-hoc 서명). 앱을 열면 GUI만 뜨고 아무것도 설치하지 않습니다(FR-APP-1~5, IF-CLI-14).
+- **GUI 데이터 루트**: 자기 루트 → PATH 링크의 루트 → `~/.hippo` 순서로 고릅니다. Claude 적용 탭에서 데이터 루트와 Claude 폴더를 바꿀 수 있습니다. 설치 상태(`설치 필요`, `업데이트 필요`, `설치됨`)가 `설치됨`이 아니면 Claude 적용 탭과 정보 탭만 쓸 수 있습니다(FR-GUI-22, 23). **완전 삭제** 버튼이 있습니다.
+- **수동 중지**: `hippo stop`과 상태 탭의 **데몬과 Ollama 멈추기**. 멈춘 뒤 GUI는 폴링도 멈추고 **다시 시작**을 기다립니다(FR-DMN-12, IF-CLI-15, FR-GUI-3).
+- **일시정지**: `[inject] enabled`, `[capture] enabled`(기본 true)와 상태 탭의 **일시정지/재생** 버튼. hook이 설정을 읽어 바로 끝냅니다. 데몬 재시작이 필요 없습니다. 저장을 재생하면 열린 세션은 밀린 기록도 저장합니다(사용자 결정: "그냥 일시정지")(FR-CAP-8, FR-RET-12).
 
 ### 검증
-- 테스트 428개 통과, 무시 2개, clippy 경고 0, fmt 통과
-- 화면으로 확인한 것: 라이트·다크 테마의 상태·기록·설정·정보 탭, 설정 탭에서 테마를 저장하면 바로 바뀜, 상단 아이콘, 정보 탭 로고, 빈 상태의 캐릭터
-- **화면으로 확인하지 않은 것**:
-  - Dock 아이콘: 화면을 찍으면 다른 앱도 담기므로 찍지 않았습니다.
-  - `system` 테마: macOS 외관 설정을 바꿔야 해서 확인하지 않았습니다.
-  - 오류 토스트: 단위 테스트로만 확인했습니다.
+- 테스트 445개 통과, 실패 0, 무시 2. clippy 경고 0, fmt 통과.
+- 번들: `plutil -lint` OK, `codesign --verify` 통과.
+- 화면으로 확인한 것:
+  - Finder 방식(`open`)으로 앱을 열면 "설치 안 됨" 안내와 함께 Claude 적용·정보 탭만 켜지고, `~/.hippo`와 `~/.local/bin/hippo`가 생기지 않음.
+  - 격리 HOME에 앱 실행 파일로 설치한 뒤: PATH 링크로 데이터 루트를 찾음, 데몬이 설치 경로로 뜸, 저장 일시정지가 그 키만 씀, 멈추기 뒤 데몬이 다시 뜨지 않음. 그 뒤 `purge`로 정리함.
+- **화면으로 확인하지 않은 것**: GUI의 적용·해제·완전 삭제 버튼(실제 `~/.claude`를 바꾸므로 라이브러리 테스트와 CLI 테스트로만 확인), `업데이트 필요` 상태.
 
-## 4. 값을 치르고 배운 것
+## 2. 남은 것
+- 같은 데이터 루트로 여러 Claude 폴더에 설치하면, 기록은 마지막 폴더 하나만 남습니다. `purge`는 그 폴더만 해제합니다(SRS 결정, README 10장).
+- TDD 순서: 이번 구현은 테스트를 먼저 썼지만, 일부는 구현과 같은 묶음으로 넣어 실패를 따로 확인하지 않았습니다.
+- SRS 상태 칸은 "검토 대기"입니다.
 
-### 결함 정리 세션 (SRS 0.20)
-- **인계 문서의 사실도 코드로 다시 확인합니다.** IF-SK-2에서 `cwd`가 없는 요청은 인계 문서에 둘만 있었지만, 실제로는 여섯이었습니다(`src/protocol.rs`의 `Request`, `src/ingest.rs`의 `IngestRequest`).
-- `str::lines`는 `\r\n`의 `\r`도 지웁니다. 줄 끝을 지키려면 `split_inclusive('\n')`로 나누고, 표식 비교는 `trim_end`로 합니다.
-- 사용자는 선택지 대신 질문으로 답할 때가 있습니다(예: "실제로 잘리는 게 아니라 GUI에서만 잘려 보이는 거지?"). 코드로 확인해서 답한 뒤 진행합니다.
-- 에이전트 응답이 안전 분류기에 막히면, 막힌 작업은 표현을 바꿔서도 다시 하지 않습니다. 사용자에게 알리고 다른 방법을 제안합니다.
-
-### SRS 0.19 세션
-
-- **커밋에는 `git add -A`를 쓰지 않습니다.** 작업 중에 사용자가 넣은 `assets/`가 확인 없이 커밋에 들어갔습니다. 아직 push 전이라 amend로 뺐습니다.
-- **SVG 미리 보기**: `sips -s format png`는 CSS 글꼴과 화살표를 그리지 않습니다. 실제 모습은 `qlmanage -t`(WebKit)로 봅니다. 다만 `qlmanage`는 정사각형으로 잘라서, 미리 보기용 사본의 캔버스 높이를 너비와 같게 바꾼 뒤 그립니다.
-- **PIL**은 사용자 site-packages에 있어서 `python3 -I`로는 불러오지 못합니다. 사용자가 준 파일과 직접 만든 스크립트에만 `-I` 없이 씁니다.
-- **egui 화면 조작**:
-  - `System Events`의 `click at`은 egui 팝업 바깥 클릭으로 전달되지 않습니다. 실제 마우스 이벤트(CGEvent)를 씁니다.
-  - 스크롤도 CGEvent 휠 이벤트로 합니다.
-  - 콤보 상자 항목은 접근성 트리에 나오지 않으므로, 열어서 찍은 뒤 좌표로 누릅니다.
-- **egui 0.37 표시 함정**:
-  - `ui.columns` 안의 `Label`은 양쪽 정렬로 그려져 글자 간격이 벌어집니다. `Layout::top_down(Align::Min)`으로 감쌉니다.
-  - 기본 글꼴에는 `✕`가 없습니다. `×`를 씁니다.
-  - 빈 세로 영역의 버튼은 글자가 줄 바꿈되므로 `TextWrapMode::Extend`를 씁니다.
-- **실시간 주입은 임베딩 잠금을 쓰지 않습니다**(`inject_gate`). 삭제는 `deletes_waiting`으로 임베딩 스레드에 끼어듭니다. 대기가 27~35초에서 0.3~3.7초로 줄었습니다.
+## 3. 값을 치르고 배운 것
+- **macOS에는 `timeout` 명령이 없습니다.** `timeout 600 cargo build | grep …`은 명령을 찾지 못해 아무것도 출력하지 않습니다. 빌드가 통과한 것으로 착각하기 쉽습니다. 도구의 timeout 인자를 씁니다.
+- 긴 Markdown 표 줄은 Edit보다 `python3 -X utf8` 스크립트로 줄 단위로 바꾸는 편이 안전합니다. 스크립트 첫 줄에 `# -*- coding: utf-8 -*-`를 둡니다(없을 때 한 번 `Non-UTF-8 code` 오류가 났습니다). 바꾸기 전에 대상 문자열이 정확히 한 번 나오는지 `assert`로 확인합니다.
+- release 빌드는 약 10분 걸립니다. `scripts/bundle-app.sh`는 백그라운드로 돌립니다.
+- egui 화면 조작: 상태 탭 버튼은 `button n of UI element 2 of group 1 of window "hippo"`로 누를 수 있습니다. 창 번호는 CGWindowList에서 소유자 이름 `hippo`, layer 0인 창을 찾습니다.
+- 에이전트 응답이 안전 분류기에 막히면, 막힌 작업은 표현을 바꿔서도 다시 하지 않습니다. 이번 세션에서도 두 번 막혔습니다. 사용자에게 알리고 다른 방법을 제안합니다.
+- 사용자는 작업 도중에 요구를 더합니다(이번에는 수동 중지, 일시정지). 새 요구는 SRS에 먼저 넣고, 결정이 필요한 것만 하나씩 묻습니다.

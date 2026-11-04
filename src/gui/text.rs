@@ -60,6 +60,14 @@ pub fn describe(section: &str, key: &str, lang: Lang) -> &'static str {
             "자동 주입의 최소 벡터 유사도",
         ),
         ("inject", "top_k") => ("Number of turns to inject", "주입할 턴 수"),
+        ("inject", "enabled") => (
+            "Inject memories (false: paused). Applies from the next prompt",
+            "기억 주입 (false면 일시정지). 다음 프롬프트부터 적용",
+        ),
+        ("capture", "enabled") => (
+            "Save records (false: paused). Open sessions catch up after resuming",
+            "기록 저장 (false면 일시정지). 재생하면 열린 세션은 밀린 기록도 저장",
+        ),
         ("inject", "total_chars") => (
             "Total injection limit. Turns over it are skipped whole",
             "주입 전체 길이 한도. 넘는 턴은 통째로 뺌",

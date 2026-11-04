@@ -143,18 +143,28 @@ git clone git@github.com:Biisairo/Hippocampal-Index.git hippo && cd hippo
 cargo build --release
 ```
 
-### 3.2 Where the binary lives
+### 3.2 The app and where the binary lives
 
-`hippo install` **copies itself to `~/.hippo/bin/hippo`** in the data root and uses that path in the hook commands and the Claude guide. The daemon also starts from this copy. So you can install straight from the build directory, and the hooks keep working after `cargo clean` or after you move the repository.
+Install hippo from the macOS app (`hippo.app`) or from a binary you built. To make the app:
 
 ```bash
-./target/release/hippo install --scope user --dry-run
+scripts/bundle-app.sh            # makes target/hippo.app (ad-hoc signed)
 ```
 
+Opening the app opens the GUI window. Opening the app installs nothing. Install from the **Claude setup** tab of the GUI or with `hippo install`.
+
+Install **copies the binary to `bin/hippo` in the data root** (default `~/.hippo/bin/hippo`) and uses that path in the hook commands and the Claude guide. The daemon also starts from this copy. So the hooks keep working after you delete or move the app or the build directory.
+
+```bash
+./target/release/hippo install --dry-run
+```
+
+- **The data root comes from where the binary is.** When you run `<root>/bin/hippo`, `<root>` is the data root. There is no `--root` option. To use another data root, install into it with `install --data-dir <path>`.
+- A binary that is not installed (the one inside the app, or `target/release/hippo`) can run only `install` and `gui`.
+- Install makes `~/.local/bin/hippo`, a link to the installed binary. If `~/.local/bin` is on your PATH, you can run `hippo` directly in a terminal. If it is not, install prints a warning and does not change your shell settings. If `~/.local/bin/hippo` already exists and points somewhere else, install changes nothing and fails.
 - The hook commands and the Claude guide write the path with `~`, as in `~/.hippo/bin/hippo`, so shared settings files do not reveal your account name. (The launchd plist does not go through a shell, so it uses the absolute path.)
-- After you rebuild, run `install` again to copy the new binary. If the content is the same, nothing is copied.
+- To update, run install again from the new app (or the rebuilt binary). If the content is the same, nothing is copied. If the binary changed, install stops the old daemon, and the next request starts the daemon from the new binary. The GUI shows "update needed" when the installed binary differs from the app.
 - The copy uses APFS file cloning, so it takes almost no extra disk space.
-- `~/.hippo/bin/installs` records which settings files you installed into. When `uninstall` removes the last one, the copy is removed too.
 
 In the examples below, commands before installing use `./target/release/hippo`, and commands after installing use `~/.hippo/bin/hippo`.
 
@@ -197,16 +207,14 @@ Check the daemon:
 
 ### 3.5 Register the hooks
 
-`hippo install` merges the hooks into a Claude Code settings file. It changes only `hippo` hook entries and keeps your other hooks and settings. **Preview first:**
+`hippo install` merges the hooks into `settings.json` in the Claude folder (default `~/.claude`). It changes only `hippo` hook entries and keeps your other hooks and settings. **Preview first:**
 
 ```bash
-# One project only: <project>/.claude/settings.local.json (personal file, not committed)
-./target/release/hippo install --scope project --project ~/work/my-app --dry-run
-./target/release/hippo install --scope project --project ~/work/my-app
+./target/release/hippo install --dry-run
+./target/release/hippo install
 
-# All sessions: ~/.claude/settings.json
-./target/release/hippo install --scope user --dry-run
-./target/release/hippo install --scope user
+# To use another data root or Claude folder
+./target/release/hippo install --data-dir ~/hippo-data --claude-dir ~/work/my-app/.claude
 ```
 
 What `install` does:
@@ -217,20 +225,23 @@ What `install` does:
 - If you run it again, nothing changes ("No change").
 - It refuses to write through a symbolic link, and it does not touch a settings file that is not valid JSON.
 - The file is rewritten as 2-space-indented JSON. Key order and values are kept, but the original formatting may change. The backup keeps the original.
-- It adds an English guide block to a memory file, so Claude knows it can run `hippo search` and `hippo show`. The commands use the absolute path of the hippo executable you installed with, so `hippo` does not need to be on your PATH. `--scope user` uses `~/.claude/CLAUDE.md`, and `--scope project` uses `<project>/CLAUDE.local.md` (the personal file the official docs recommend). The block sits between `<!-- hippo:begin -->` and `<!-- hippo:end -->`. Claude Code strips these markers before they reach the context, so they cost no tokens. Text outside the block is kept. If `CLAUDE.local.md` is not ignored by git, it prints a warning but does not change `.gitignore`.
+- It adds an English guide block to a memory file, so Claude knows it can run `hippo search` and `hippo show`. The commands use the install path, so `hippo` does not need to be on your PATH. The memory file is `<Claude folder>/CLAUDE.md`. The block sits between `<!-- hippo:begin -->` and `<!-- hippo:end -->`. Claude Code strips these markers before they reach the context, so they cost no tokens. Text outside the block is kept.
+- It records the Claude folder it used in `<data root>/bin/claude-dir`. Later `install`, `uninstall`, `purge`, and the GUI use this value when `--claude-dir` is not given.
 
-You can also print the hook block and add it by hand: `hippo hooks-config`. `uninstall` removes only the hook entries and the guide block. A settings file or memory file that held only hippo content is deleted without a backup, and a `.claude/` directory left empty by that is removed. A file that keeps other content is backed up before it is changed.
+You can also print the hook block and add it by hand: `hippo hooks-config`. `uninstall` removes only the hook entries, the guide block, and the `~/.local/bin/hippo` link. The binary and the records stay. A settings file or memory file that held only hippo content is deleted without a backup, and a `.claude/` directory left empty by that is removed. A file that keeps other content is backed up before it is changed.
 
 Start a new Claude Code session after you install the hooks.
 
 ### 3.6 Uninstall
 
 ```bash
-~/.hippo/bin/hippo uninstall --scope user          # or --scope project --project <path>
-launchctl bootout gui/$(id -u)/com.hippo.daemon
+launchctl bootout gui/$(id -u)/com.hippo.daemon     # if you registered it with launchd
 rm ~/Library/LaunchAgents/com.hippo.daemon.plist
-rm -rf ~/.hippo                          # deletes all stored memory
+~/.hippo/bin/hippo uninstall     # removes only the hooks, the guide block, and the PATH link; records stay
+~/.hippo/bin/hippo purge         # uninstalls, then deletes the whole data root with all stored memory
 ```
+
+`purge` shows the path it will delete and asks first (`--yes` skips the question). It stops the daemon and the Ollama server hippo started, then deletes. If the daemon is reindexing, it deletes nothing. To remove the app, move it to the Trash.
 
 ---
 
@@ -268,7 +279,10 @@ Without `--scope`, `show` looks in the current project first, then in the other 
 
 ```bash
 hippo status
+hippo stop       # stops the daemon and the Ollama server hippo started; the next hook or command starts the daemon again
 ```
+
+To pause only injection or saving, set `[inject] enabled` or `[capture] enabled` to `false`. The **Pause**/**Resume** buttons in the GUI Status tab change the same keys. Hooks read the config every time, so no daemon restart is needed. After saving resumes, sessions that stayed open save what they missed at their next capture.
 
 ```
 spool_pending: 0                  # requests captured while the daemon was down
@@ -327,17 +341,19 @@ Automatic injection gives Claude only the best few matches. For more, Claude can
 hippo gui
 ```
 
-Opens a native window (egui, no browser or web view). The command returns when you close the window. The folder you run it from is the current folder for every request, and the default for path fields.
+Opens a native window (egui, no browser or web view). The command returns when you close the window. Opening the app (`hippo.app`) opens the same window. The folder you run it from is the current folder for every request, and the default for path fields (`/` for the app opened from Finder).
+
+The window's data root is the binary's data root. For a binary that is not installed, it is the root that the `~/.local/bin/hippo` link points to, or `~/.hippo` if there is no link. If that root has no installed binary, or the installed binary differs from the app, the window shows a notice at the top and only the Claude setup and About tabs work.
 
 | Tab | What it does |
 |-----|--------------|
-| Status | Asks the daemon for its status every 2 seconds: spool, reindex state, and a table per project with pending embeddings, rate, and time left. While the window is open, the daemon stays up. |
+| Status | **Stop** (the same as `hippo stop`; polling also stops until you press **Start again**), and **Pause**/**Resume** for injection and saving. Asks the daemon for its status every 2 seconds: spool, reindex state, and a table per project with pending embeddings, rate, and time left. While the window is open, the daemon stays up. |
 | Records | Browse the records of one project: sessions (newest first), then the turns of a session (oldest first), then the turn detail. Lists come 50 at a time. A filter box above each list keeps only the sessions or turns whose iterations contain the text (3 or more characters: full-text search; fewer: plain substring). Each turn shows `done` or `pending n` for embedding. The detail shows the same content as `show --with-results`, split by iteration, with tool outputs folded. The query box above the lists runs a hybrid search in this project (click a result to open its turn) or an **injection preview**: it applies the same settings and rules as automatic injection, without excluding a session or applying the time budget, and shows each candidate's RRF rank, similarity, and verdict (`selected`, `below threshold`, `FTS only`, `same turn`, `over length limit`, `over count`), the text that would be injected, and the time it took. If nothing would be injected, it shows why. Each level has a **Delete** button that shows the preview of [4.7](#47-deleting-records) and asks for confirmation. |
 | Settings | Every `config.toml` key with its description and whether it is the default. Saving changes only the keys you changed and keeps your comments. A key set back to its default is removed from the file. The result is checked first, and an invalid file is not written. If the daemon must restart, a **Restart daemon** button appears. If the change needs a reindex, the window tells you. |
 | Import | **Preview** shows what would happen and a table of candidate sessions (the same as `--dry-run`). `new` and `live-only` sessions are selected first. **Import selected** sends only the checked sessions. **Stop** stops after the current session. Embedding progress comes from the status poll. |
 | Search | `search` and `show`. Each iteration result has **Open in records**, which opens its project and turn in the Records tab. |
 | Projects | `project list` and `reindex` |
-| Claude setup | Shows whether hippo is applied for the user or project scope. **Preview apply/remove** shows the same diff as `--dry-run`. **Apply** and **Remove** work only after a preview with the same inputs, and ask for confirmation. |
+| Claude setup | Choose the data root and the Claude folder. Shows whether the binary is installed, whether the hooks are applied, and the PATH link. **Preview** shows the same result as `--dry-run`. **Apply** and **Remove** work only after a preview with the same inputs, and ask for confirmation. **Delete everything** does the same as `purge`. |
 | About | Version, README, and LICENSE |
 
 The window uses `[ui] language`. Korean text uses a macOS system font. The colors follow the macOS light or dark mode by default; set `[ui] theme` to `light` or `dark` to fix one. Saving the theme in the Settings tab applies it at once.
@@ -399,6 +415,10 @@ total_chars = 12000                # total injection limit; a turn that does not
 budget_ms = 800                    # time budget for the UserPromptSubmit hook
 cold_budget_ms = 2500              # budget when the hook has to start the daemon (cold start); at least budget_ms
 min_prompt_chars = 11              # prompts shorter than this after trimming get no injection
+enabled = true                     # false pauses injection from the next prompt (no daemon restart)
+
+[capture]
+enabled = true                     # false pauses saving; after resuming, open sessions save what they missed
 
 [index]
 vector_index_threshold = 100000    # build an ANN index when the vector count reaches this
@@ -457,7 +477,8 @@ To add a completely new backend, see [9.4](#94-adding-a-new-backend).
 ~/.hippo/            (0700)
 ├─ config.toml
 ├─ bin/hippo                  (0700) installed binary; hooks and the guide use this path
-├─ bin/installs               (0600) settings files the hooks were installed into
+├─ bin/claude-dir             (0600) the Claude folder used at install
+├─ ollama.pid                 (0600) pid of the Ollama server hippo started
 ├─ registry.sqlite            (0600) registry: projects, locations, root commits, session → project
 ├─ projects/<id>/             (0700) one project
 │  ├─ records.sqlite          (0600) source of truth
@@ -560,7 +581,7 @@ Ingest, search, and the daemon do not change.
 - Automatic injection quality depends on `inject.threshold`. Meta questions you have asked before, such as "was memory injected just now?", can still pull in unrelated memories (SRS appendix C).
 - Two-character Korean words (for example, "버그") are not found by keyword search (the FTS5 trigram tokenizer needs 3 or more characters). Vector search covers them.
 - Not yet checked in interactive sessions: whether a hook fires after a background notice (OPEN-1), the Esc interrupt (OPEN-2), compaction (OPEN-3), and whether the last line is written before `Stop` fires (OPEN-6).
-- Hooks always use the default data root (`~/.hippo`). `--root` is not written into hook commands.
+- Install records only one Claude folder. If you installed one data root into several Claude folders, run `uninstall --claude-dir <path>` for the others yourself before `purge`.
 - When the daemon stops with a signal, the socket file stays. It is removed at the next start.
 - There is no retention policy yet. Memory grows until you delete it with `forget` or `project remove` ([4.7](#47-deleting-records)).
 - Results (tool outputs) are deduplicated only within a project. The same output in two projects is stored twice.

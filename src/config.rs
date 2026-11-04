@@ -19,8 +19,6 @@ pub enum ConfigError {
     ChunkOverlap { overlap: usize, limit: usize },
     #[error("inject cold_budget_ms ({cold}) must not be smaller than budget_ms ({budget})")]
     ColdBudget { cold: u64, budget: u64 },
-    #[error("HOME is not set")]
-    NoHome,
 }
 
 /// Qwen3-Embedding이 권장하는 검색 질의 지시문. (FR-RET-11)
@@ -79,6 +77,21 @@ pub struct InjectSection {
     pub cold_budget_ms: u64,
     /// 공백을 뺀 길이가 이보다 짧은 프롬프트는 주입하지 않는다. (FR-RET-1)
     pub min_prompt_chars: usize,
+    /// false면 주입을 일시정지한다. (FR-RET-12)
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CaptureSection {
+    /// false면 저장을 일시정지한다. (FR-CAP-8)
+    pub enabled: bool,
+}
+
+impl Default for CaptureSection {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -168,6 +181,7 @@ pub struct Config {
     pub chunking: ChunkingConfig,
     pub embed_text: EmbedTextConfig,
     pub inject: InjectSection,
+    pub capture: CaptureSection,
     pub index: IndexConfig,
     pub redact: RedactConfig,
     pub daemon: DaemonSection,
@@ -231,12 +245,6 @@ impl Paths {
         Self { root }
     }
 
-    /// `$HOME/.hippo`
-    pub fn default_root() -> Result<PathBuf, ConfigError> {
-        let home = std::env::var_os("HOME").ok_or(ConfigError::NoHome)?;
-        Ok(PathBuf::from(home).join(DATA_DIR))
-    }
-
     pub fn registry(&self) -> PathBuf {
         self.root.join("registry.sqlite")
     }
@@ -269,7 +277,6 @@ impl Paths {
     }
 }
 
-const DATA_DIR: &str = ".hippo";
 const LOCAL_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1"];
 
 /// URL을 파서로 해석해 host가 로컬 루프백인지 확인한다. userinfo, 쿼리, 프래그먼트가 있으면 거부한다. (C-4)
@@ -345,6 +352,7 @@ impl Default for InjectSection {
             budget_ms: 800,
             cold_budget_ms: 2_500,
             min_prompt_chars: 11,
+            enabled: true,
         }
     }
 }

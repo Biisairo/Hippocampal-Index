@@ -143,7 +143,10 @@ fn paths_layout() {
     assert_eq!(p.config(), PathBuf::from("/r/config.toml"));
     assert_eq!(p.socket(), PathBuf::from("/r/hippo.sock"));
     assert_eq!(p.lock(), PathBuf::from("/r/hippo.lock"));
-    assert!(Paths::default_root().unwrap().ends_with(".hippo"));
+    assert_eq!(
+        hippo::layout::default_data_root(std::path::Path::new("/h")),
+        PathBuf::from("/h/.hippo")
+    );
 }
 
 #[test]

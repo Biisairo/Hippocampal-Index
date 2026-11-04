@@ -12,14 +12,23 @@ use crate::config::{Config, Paths};
 use crate::i18n::Lang;
 use crate::ingest::ImportOutcome;
 use crate::install::{
-    Action, Outcome, Scope, apply, apply_memory, forget_install, guide_block, install_binary,
-    installed_exe, memory_file, record_install, target_file, warn_untracked,
+    Action, Outcome, apply, apply_memory, guide_block, install_binary, installed_exe, memory_file,
+    settings_file,
+};
+use crate::layout::{
+    LinkState, create_link, forget_claude_dir, link_state, path_has_dir, path_link,
+    record_claude_dir, remove_link, remove_root, stop_ollama,
 };
 use crate::protocol::{DeleteReport, ImportSessionReport, Request, Response, Scope as QueryScope};
 use crate::search::escape_control;
 use crate::setup::hooks_config;
 use crate::tr;
 
+/// 실행 파일을 바꾼 뒤 이전 데몬에 보내는 종료 요청의 응답 대기 시간. (FR-INS-8)
+const SHUTDOWN_REPLY: Duration = Duration::from_secs(5);
+/// 수동 중지가 데몬 종료를 기다리는 시간. (FR-DMN-12)
+const STOP_DAEMON_WAIT: Duration = Duration::from_secs(10);
+const STOP_POLL: Duration = Duration::from_millis(50);
 /// UserPromptSubmit hook timeout(초)은 시간 예산보다 이만큼 여유를 둔다.
 const INJECT_TIMEOUT_MARGIN_SECS: u64 = 2;
 pub const SESSION_ID_SHORT: usize = 8;
@@ -79,100 +88,251 @@ pub fn hook_settings(paths: &Paths, exe: &Path) -> Result<serde_json::Value, Str
     Ok(hooks_config(exe, timeout))
 }
 
-/// `--project`(없으면 `cwd`)를 실제 경로로 바꿔 설치 범위를 만든다. (FR-INS-1)
-pub fn project_scope(project: Option<PathBuf>, cwd: &Path) -> Result<Scope, String> {
-    let dir = project.unwrap_or_else(|| cwd.to_path_buf());
-    std::fs::canonicalize(&dir)
-        .or_else(|_| std::path::absolute(&dir))
-        .map(Scope::Project)
-        .map_err(|e| e.to_string())
+/// 설치·제거 대상. 경로는 절대 경로로 바꿔 쓴다. (IF-CLI-6, FR-GUI-10)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallTarget {
+    pub root: PathBuf,
+    pub claude_dir: PathBuf,
+    pub home: PathBuf,
 }
 
-/// hook 설정과 메모리 파일의 안내 블록을 함께 바꾼다. 출력은 `out`에 쌓는다. (IF-CLI-6, FR-INS-7, FR-GUI-10)
+impl InstallTarget {
+    fn absolute(&self) -> Result<(PathBuf, PathBuf), String> {
+        let abs = |p: &Path| std::path::absolute(p).map_err(|e| e.to_string());
+        Ok((abs(&self.root)?, abs(&self.claude_dir)?))
+    }
+}
+
+/// 실행 파일 복사, hook, 안내 블록, PATH 링크, Claude 폴더 기록. 출력은 `out`에 쌓는다. (FR-INS-*)
 pub fn run_install(
-    paths: &Paths,
-    scope: &Scope,
-    install: bool,
+    target: &InstallTarget,
     dry_run: bool,
     exe: &Path,
     lang: Lang,
     out: &mut String,
 ) -> Result<(), String> {
-    let root = std::path::absolute(&paths.root).map_err(|e| e.to_string())?;
-    let settings_path = target_file(scope).map_err(|e| e.to_string())?;
-    let (action, block) = if install {
-        let binary = install_binary(exe, &root, dry_run).map_err(|e| e.to_string())?;
-        let path = binary.path.display();
-        let line = match (binary.copied, dry_run) {
-            (true, false) => tr!(
-                lang,
-                "Installed binary: {path}",
-                "실행 파일을 설치했습니다: {path}"
-            ),
-            (true, true) => tr!(
-                lang,
-                "(dry-run) Would install binary: {path}",
-                "(dry-run) 실행 파일을 설치할 위치: {path}"
-            ),
-            (false, _) => tr!(
-                lang,
-                "Binary up to date: {path}",
-                "실행 파일이 최신입니다: {path}"
-            ),
-        };
-        let _ = writeln!(out, "{line}");
-        let hooks = hook_settings(paths, &binary.path)?;
-        (Action::Install(hooks), Some(guide_block(&binary.path)))
-    } else {
-        (Action::Uninstall, None)
-    };
-    let settings = apply(&settings_path, &action, dry_run).map_err(|e| e.to_string())?;
-    let memory = memory_file(scope)
-        .and_then(|path| apply_memory(&path, block.as_deref(), dry_run))
-        .map_err(|e| e.to_string())?;
-    out.push_str(&outcome_text(&settings, dry_run, lang));
-    out.push_str(&outcome_text(&memory, dry_run, lang));
-    let removed_binary = if install {
-        if !dry_run {
-            record_install(&root, &settings_path).map_err(|e| e.to_string())?;
-        }
-        false
-    } else {
-        forget_install(&root, &settings_path, dry_run).map_err(|e| e.to_string())?
-    };
-    if removed_binary {
-        let path = installed_exe(&root);
-        let path = path.display();
-        let line = if dry_run {
-            tr!(
-                lang,
-                "(dry-run) Would remove binary: {path}",
-                "(dry-run) 지울 실행 파일: {path}"
-            )
-        } else {
-            tr!(
-                lang,
-                "Removed binary: {path}",
-                "실행 파일을 지웠습니다: {path}"
-            )
-        };
-        let _ = writeln!(out, "{line}");
+    let (root, claude_dir) = target.absolute()?;
+    let installed = installed_exe(&root);
+    let link = path_link(&target.home);
+    if link_state(&link, &installed) == LinkState::Foreign {
+        let link = link.display();
+        return Err(tr!(
+            lang,
+            "{link} already exists and does not point to this install; nothing was changed",
+            "{link}이(가) 이미 있고 이 설치를 가리키지 않습니다. 아무것도 바꾸지 않았습니다"
+        ));
     }
-    if let Scope::Project(dir) = scope
-        && install
-        && warn_untracked(dir)
+    let binary = install_binary(exe, &root, dry_run).map_err(|e| e.to_string())?;
+    let path = binary.path.display();
+    let line = match (binary.copied, dry_run) {
+        (true, false) => tr!(
+            lang,
+            "Installed binary: {path}",
+            "실행 파일을 설치했습니다: {path}"
+        ),
+        (true, true) => tr!(
+            lang,
+            "(dry-run) Would install binary: {path}",
+            "(dry-run) 실행 파일을 설치할 위치: {path}"
+        ),
+        (false, _) => tr!(
+            lang,
+            "Binary up to date: {path}",
+            "실행 파일이 최신입니다: {path}"
+        ),
+    };
+    let _ = writeln!(out, "{line}");
+    if binary.copied
+        && !dry_run
+        && let Err(e) = shutdown_daemon(&root)
     {
-        let path = memory.path.display();
         let _ = writeln!(
             out,
             "{}",
             tr!(
                 lang,
-                "Warning: {path} is not ignored by git and may be committed. Add it to .gitignore if it should stay private.",
-                "경고: {path}이(가) git에서 무시되지 않아 커밋될 수 있습니다. 개인 파일로 두려면 .gitignore에 추가하십시오."
+                "Warning: the running daemon did not stop ({e}). Restart it later so it uses the new binary.",
+                "경고: 실행 중인 데몬이 멈추지 않았습니다({e}). 새 실행 파일을 쓰도록 나중에 다시 시작하십시오."
             )
         );
     }
+    let hooks = hook_settings(&Paths::new(root.clone()), &binary.path)?;
+    let settings = apply(
+        &settings_file(&claude_dir),
+        &Action::Install(hooks),
+        dry_run,
+    )
+    .map_err(|e| e.to_string())?;
+    let memory = apply_memory(
+        &memory_file(&claude_dir),
+        Some(&guide_block(&binary.path)),
+        dry_run,
+    )
+    .map_err(|e| e.to_string())?;
+    out.push_str(&outcome_text(&settings, dry_run, lang));
+    out.push_str(&outcome_text(&memory, dry_run, lang));
+    let shown = link.display();
+    let line = if dry_run {
+        match link_state(&link, &installed) {
+            LinkState::Ours => tr!(
+                lang,
+                "Link up to date: {shown}",
+                "링크가 최신입니다: {shown}"
+            ),
+            _ => tr!(
+                lang,
+                "(dry-run) Would link: {shown} -> {path}",
+                "(dry-run) 만들 링크: {shown} -> {path}"
+            ),
+        }
+    } else if create_link(&link, &installed).map_err(|e| e.to_string())? {
+        tr!(
+            lang,
+            "Linked: {shown} -> {path}",
+            "링크를 만들었습니다: {shown} -> {path}"
+        )
+    } else {
+        tr!(
+            lang,
+            "Link up to date: {shown}",
+            "링크가 최신입니다: {shown}"
+        )
+    };
+    let _ = writeln!(out, "{line}");
+    if !dry_run {
+        record_claude_dir(&root, &claude_dir).map_err(|e| e.to_string())?;
+    }
+    let link_dir = link.parent().unwrap_or(&link);
+    let on_path = std::env::var_os("PATH").is_some_and(|p| path_has_dir(&p, link_dir));
+    if !on_path {
+        let dir = link_dir.display();
+        let _ = writeln!(
+            out,
+            "{}",
+            tr!(
+                lang,
+                "Warning: {dir} is not on PATH. Add it to PATH to run `hippo` directly in a terminal.",
+                "경고: {dir}이(가) PATH에 없습니다. 터미널에서 `hippo`를 바로 쓰려면 PATH에 더하십시오."
+            )
+        );
+    }
+    Ok(())
+}
+
+/// hook, 안내 블록, PATH 링크만 지운다. 실행 파일과 데이터는 남긴다. (FR-INS-9)
+pub fn run_uninstall(
+    target: &InstallTarget,
+    dry_run: bool,
+    lang: Lang,
+    out: &mut String,
+) -> Result<(), String> {
+    let (root, claude_dir) = target.absolute()?;
+    let settings = apply(&settings_file(&claude_dir), &Action::Uninstall, dry_run)
+        .map_err(|e| e.to_string())?;
+    let memory =
+        apply_memory(&memory_file(&claude_dir), None, dry_run).map_err(|e| e.to_string())?;
+    out.push_str(&outcome_text(&settings, dry_run, lang));
+    out.push_str(&outcome_text(&memory, dry_run, lang));
+    let installed = installed_exe(&root);
+    let link = path_link(&target.home);
+    let shown = link.display();
+    let line = match (link_state(&link, &installed), dry_run) {
+        (LinkState::Missing, _) => tr!(lang, "No change: {shown}", "변경 없음: {shown}"),
+        (LinkState::Foreign, _) => tr!(
+            lang,
+            "Left {shown}: it does not point to this install",
+            "{shown}은(는) 이 설치를 가리키지 않아 그대로 둡니다"
+        ),
+        (LinkState::Ours, true) => tr!(
+            lang,
+            "(dry-run) Would remove link: {shown}",
+            "(dry-run) 지울 링크: {shown}"
+        ),
+        (LinkState::Ours, false) => {
+            remove_link(&link, &installed).map_err(|e| e.to_string())?;
+            tr!(lang, "Removed link: {shown}", "링크를 지웠습니다: {shown}")
+        }
+    };
+    let _ = writeln!(out, "{line}");
+    if !dry_run {
+        forget_claude_dir(&root, &claude_dir).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// 데이터 루트의 데몬에 종료를 요청한다. 종료를 받아들였으면 true, 데몬이 없으면 false. (FR-INS-8, 13)
+fn shutdown_daemon(root: &Path) -> Result<bool, String> {
+    let socket = Paths::new(root.to_path_buf()).socket();
+    if !socket.exists() {
+        return Ok(false);
+    }
+    match request(&socket, &Request::Shutdown, SHUTDOWN_REPLY) {
+        Ok(Response::Done) => Ok(true),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(other) => Err(format!("unexpected response: {other:?}")),
+        Err(_) => Ok(false),
+    }
+}
+
+/// 데몬과 hippo가 띄운 Ollama를 멈춘다. 데몬은 소켓 파일이 없어질 때까지 기다린다. (FR-DMN-12)
+pub fn stop_services(root: &Path, lang: Lang, out: &mut String) -> Result<(), String> {
+    let socket = Paths::new(root.to_path_buf()).socket();
+    let daemon = shutdown_daemon(root)?;
+    if daemon {
+        let deadline = std::time::Instant::now() + STOP_DAEMON_WAIT;
+        while socket.exists() {
+            if std::time::Instant::now() >= deadline {
+                return Err(tr!(
+                    lang,
+                    "the daemon did not stop in time",
+                    "데몬이 제때 멈추지 않았습니다"
+                ));
+            }
+            std::thread::sleep(STOP_POLL);
+        }
+        let _ = writeln!(
+            out,
+            "{}",
+            tr!(lang, "Stopped the daemon.", "데몬을 멈췄습니다.")
+        );
+    }
+    let ollama = stop_ollama(root);
+    if ollama {
+        let _ = writeln!(
+            out,
+            "{}",
+            tr!(
+                lang,
+                "Stopped the Ollama server hippo started.",
+                "hippo가 띄운 Ollama 서버를 멈췄습니다."
+            )
+        );
+    }
+    if !daemon && !ollama {
+        let _ = writeln!(
+            out,
+            "{}",
+            tr!(lang, "Nothing to stop.", "멈출 것이 없습니다.")
+        );
+    }
+    Ok(())
+}
+
+/// 데몬과 hippo가 띄운 Ollama를 멈춘 뒤 데이터 루트를 통째로 지운다. 제거와 확인은 호출한 쪽이 먼저 한다. (FR-INS-13)
+pub fn purge_data(root: &Path, home: &Path, lang: Lang, out: &mut String) -> Result<(), String> {
+    let root = std::path::absolute(root).map_err(|e| e.to_string())?;
+    stop_services(&root, lang, out)?;
+    remove_root(&root, home)?;
+    let shown = root.display();
+    let _ = writeln!(
+        out,
+        "{}",
+        tr!(
+            lang,
+            "Deleted data root: {shown}",
+            "데이터 루트를 지웠습니다: {shown}"
+        )
+    );
     Ok(())
 }
 

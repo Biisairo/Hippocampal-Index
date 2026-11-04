@@ -1,24 +1,28 @@
 use std::io::{IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use hippo::backends::{build_embedder, vector_source};
-use hippo::client::{STARTUP_WAIT, ensure_daemon, request, request_until_reply, run_hook};
+use hippo::client::{
+    STARTUP_WAIT, ensure_daemon, hook_paused, request, request_until_reply, run_hook,
+};
 use hippo::commands::{
-    self, Confirm, ImportTally, SCOPE_ALL, SCOPE_PROJECT, absolute, confirm_delete, hook_settings,
-    launcher, project_scope, render_delete_report, scope_arg, session_line,
+    self, Confirm, ImportTally, InstallTarget, SCOPE_ALL, SCOPE_PROJECT, absolute, confirm_delete,
+    hook_settings, launcher, purge_data, render_delete_report, scope_arg, session_line,
 };
 use hippo::config::{Config, Paths};
 use hippo::daemon;
 use hippo::i18n::Lang;
 use hippo::import::render_preview;
-use hippo::install::Scope;
+use hippo::layout::{
+    default_claude_dir, default_data_root, default_gui_root, is_app_exe, root_of_exe,
+};
 use hippo::protocol::{Request, Response, embed_progress};
 use hippo::registry::is_project_id;
 use hippo::search::{SearchKind, escape_control};
-use hippo::setup::launchd_plist;
+use hippo::setup::{home_dir, launchd_plist};
 use hippo::store::ForgetTarget;
 use hippo::tr;
 
@@ -32,11 +36,8 @@ const WAIT_POLL: Duration = Duration::from_secs(2);
     about = "Hippocampal Index: long-term memory for Claude Code sessions"
 )]
 struct Cli {
-    /// Data root (default: ~/.hippo)
-    #[arg(long, global = true)]
-    root: Option<PathBuf>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -116,10 +117,21 @@ enum Command {
     HooksConfig,
     /// Print a launchd plist
     LaunchdPlist,
-    /// Add hippo hooks and the memory guide to Claude Code
+    /// Install the binary, add hippo hooks and the memory guide to Claude Code, and link it on PATH
     Install(InstallArgs),
-    /// Remove hippo hooks and the memory guide from Claude Code
-    Uninstall(InstallArgs),
+    /// Remove the hippo hooks, the memory guide, and the PATH link. The binary and data stay
+    Uninstall(UninstallArgs),
+    /// Stop the daemon and the Ollama server hippo started. The next request starts the daemon again
+    Stop,
+    /// Uninstall, then delete this data root with all records
+    Purge {
+        /// Claude Code settings directory (default: the one recorded at install, else ~/.claude)
+        #[arg(long)]
+        claude_dir: Option<PathBuf>,
+        /// Delete without asking
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -141,20 +153,25 @@ enum ProjectCommand {
 
 #[derive(clap::Args)]
 struct InstallArgs {
-    #[arg(long, value_enum)]
-    scope: ScopeArg,
-    /// Project path (default: current directory)
+    /// Data root to install into (default: this binary's data root, else ~/.hippo)
     #[arg(long)]
-    project: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
+    /// Claude Code settings directory (default: the one recorded at install, else ~/.claude)
+    #[arg(long)]
+    claude_dir: Option<PathBuf>,
     /// Print the changes without writing
     #[arg(long)]
     dry_run: bool,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum ScopeArg {
-    User,
-    Project,
+#[derive(clap::Args)]
+struct UninstallArgs {
+    /// Claude Code settings directory (default: the one recorded at install, else ~/.claude)
+    #[arg(long)]
+    claude_dir: Option<PathBuf>,
+    /// Print the changes without writing
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -166,16 +183,42 @@ enum KindArg {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let root = match cli.root.map_or_else(Paths::default_root, Ok) {
-        Ok(root) => root,
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
         Err(e) => return fail(&e.to_string()),
     };
+    let command = match cli.command {
+        Some(command) => command,
+        None if is_app_exe(&exe) => Command::Gui,
+        None => {
+            let _ = Cli::command().print_help();
+            return ExitCode::SUCCESS;
+        }
+    };
+    let home = home_dir();
+    match command {
+        Command::Install(args) => return run_install(&exe, home.as_deref(), &args),
+        Command::Gui => return run_gui(&exe, home.as_deref()),
+        _ => {}
+    }
+    // 데이터 루트는 실행 파일 위치로만 정한다. (FR-ROOT-1, FR-INS-14)
+    let Some(root) = root_of_exe(&exe) else {
+        if matches!(command, Command::Hook { .. }) {
+            return ExitCode::SUCCESS;
+        }
+        return fail(
+            "this binary is not installed. Run `hippo install`, then use the installed `<data root>/bin/hippo`",
+        );
+    };
     let paths = Paths::new(root);
-    match cli.command {
+    match command {
         Command::Hook { event } => {
             let mut input = String::new();
             let _ = std::io::stdin().read_to_string(&mut input);
             let config = Config::load(&paths.config()).unwrap_or_default();
+            if hook_paused(&config, &event) {
+                return ExitCode::SUCCESS;
+            }
             let budget = Duration::from_millis(config.inject.budget_ms);
             let cold_budget = Duration::from_millis(config.inject.cold_budget_ms);
             if let Some(out) = run_hook(
@@ -308,10 +351,6 @@ fn main() -> ExitCode {
             Err(e) => fail(&e),
         },
         Command::Daemon => run_daemon(paths),
-        Command::Gui => match current_dir().and_then(|cwd| hippo::gui::run(paths, cwd)) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => fail(&e),
-        },
         Command::HooksConfig => match std::env::current_exe()
             .map_err(|e| e.to_string())
             .and_then(|exe| hook_settings(&paths, &exe))
@@ -325,8 +364,18 @@ fn main() -> ExitCode {
             }
             Err(e) => fail(&e),
         },
-        Command::Install(args) => run_install(&paths, &args, true, ui_lang(&paths)),
-        Command::Uninstall(args) => run_install(&paths, &args, false, ui_lang(&paths)),
+        Command::Uninstall(args) => run_uninstall(&paths, home.as_deref(), &args),
+        Command::Stop => {
+            let mut out = String::new();
+            let result = commands::stop_services(&paths.root, ui_lang(&paths), &mut out);
+            print!("{out}");
+            match result {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e),
+            }
+        }
+        Command::Purge { claude_dir, yes } => run_purge(&paths, home.as_deref(), claude_dir, yes),
+        Command::Install(_) | Command::Gui => unreachable!("handled above"),
         Command::LaunchdPlist => match std::env::current_exe() {
             Ok(exe) => {
                 print!("{}", launchd_plist(&exe, &paths));
@@ -343,27 +392,114 @@ fn current_dir() -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
-/// hook 설정과 메모리 파일의 안내 블록을 함께 바꾼다. (IF-CLI-6, FR-INS-7)
-fn run_install(paths: &Paths, args: &InstallArgs, install: bool, lang: Lang) -> ExitCode {
-    let scope = match args.scope {
-        ScopeArg::User => Scope::User,
-        ScopeArg::Project => {
-            let cwd = match std::env::current_dir() {
-                Ok(dir) => dir,
-                Err(e) => return fail(&e.to_string()),
-            };
-            match project_scope(args.project.clone(), &cwd) {
-                Ok(scope) => scope,
-                Err(e) => return fail(&e),
-            }
-        }
+/// GUI 데이터 루트는 자기 루트, PATH 링크의 루트, `~/.hippo` 순으로 고른다. (FR-GUI-22)
+fn run_gui(exe: &Path, home: Option<&Path>) -> ExitCode {
+    let Some(home) = home else {
+        return fail("HOME is not set");
     };
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(e) => return fail(&e.to_string()),
+    let paths = Paths::new(default_gui_root(exe, home));
+    match current_dir().and_then(|cwd| hippo::gui::run(paths, cwd)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => fail(&e),
+    }
+}
+
+/// 설치 대상의 기본값을 채운다. (IF-CLI-6)
+fn install_target(root: PathBuf, claude_dir: Option<PathBuf>, home: &Path) -> InstallTarget {
+    let claude_dir = claude_dir.unwrap_or_else(|| default_claude_dir(&root, home));
+    InstallTarget {
+        root,
+        claude_dir,
+        home: home.to_path_buf(),
+    }
+}
+
+/// 실행 파일, hook, 안내 블록, PATH 링크를 설치한다. (IF-CLI-6, FR-INS-*)
+fn run_install(exe: &Path, home: Option<&Path>, args: &InstallArgs) -> ExitCode {
+    let Some(home) = home else {
+        return fail("HOME is not set");
     };
+    let root = args
+        .data_dir
+        .clone()
+        .or_else(|| root_of_exe(exe))
+        .unwrap_or_else(|| default_data_root(home));
+    let lang = ui_lang(&Paths::new(root.clone()));
+    let target = install_target(root, args.claude_dir.clone(), home);
     let mut out = String::new();
-    let result = commands::run_install(paths, &scope, install, args.dry_run, &exe, lang, &mut out);
+    let result = commands::run_install(&target, args.dry_run, exe, lang, &mut out);
+    print!("{out}");
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => fail(&e),
+    }
+}
+
+/// hook, 안내 블록, PATH 링크를 지운다. (IF-CLI-6, FR-INS-9)
+fn run_uninstall(paths: &Paths, home: Option<&Path>, args: &UninstallArgs) -> ExitCode {
+    let Some(home) = home else {
+        return fail("HOME is not set");
+    };
+    let target = install_target(paths.root.clone(), args.claude_dir.clone(), home);
+    let mut out = String::new();
+    let result = commands::run_uninstall(&target, args.dry_run, ui_lang(paths), &mut out);
+    print!("{out}");
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => fail(&e),
+    }
+}
+
+/// 제거한 뒤 확인을 받아 데이터 루트를 지운다. (IF-CLI-13, FR-INS-13)
+fn run_purge(
+    paths: &Paths,
+    home: Option<&Path>,
+    claude_dir: Option<PathBuf>,
+    yes: bool,
+) -> ExitCode {
+    let Some(home) = home else {
+        return fail("HOME is not set");
+    };
+    let lang = ui_lang(paths);
+    let target = install_target(paths.root.clone(), claude_dir, home);
+    let mut out = String::new();
+    let result = commands::run_uninstall(&target, false, lang, &mut out);
+    print!("{out}");
+    if let Err(e) = result {
+        return fail(&e);
+    }
+    let root = std::path::absolute(&paths.root).unwrap_or_else(|_| paths.root.clone());
+    let shown = root.display();
+    println!(
+        "{}",
+        tr!(
+            lang,
+            "Data root to delete (all records): {shown}",
+            "지울 데이터 루트(모든 기록): {shown}"
+        )
+    );
+    let ask = || {
+        print!("{}", tr!(lang, "Delete? [y/N] ", "지울까요? [y/N] "));
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).ok().map(|_| line)
+    };
+    match confirm_delete(yes, std::io::stdin().is_terminal(), ask) {
+        Confirm::Proceed => {}
+        Confirm::Cancel => {
+            println!("{}", tr!(lang, "Cancelled.", "취소했습니다."));
+            return ExitCode::SUCCESS;
+        }
+        Confirm::NeedYes => {
+            return fail(&tr!(
+                lang,
+                "stdin is not a terminal; pass --yes to delete",
+                "표준 입력이 터미널이 아닙니다. 지우려면 --yes를 주십시오"
+            ));
+        }
+    }
+    let mut out = String::new();
+    let result = purge_data(&root, home, lang, &mut out);
     print!("{out}");
     match result {
         Ok(()) => ExitCode::SUCCESS,

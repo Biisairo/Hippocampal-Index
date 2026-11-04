@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use hippo::backends::{BackendError, build_embedder, vector_source};
 use hippo::client::{
-    HookAction, inject_output, launch_disabled, parse_hook, request_until_reply, run_hook,
+    HookAction, hook_paused, inject_output, launch_disabled, parse_hook, request_until_reply,
+    run_hook,
 };
 use hippo::config::{Config, Paths};
 use hippo::generations::active_dir;
@@ -627,4 +628,32 @@ fn request_until_reply_fails_when_connection_closes_without_reply() {
     let (_dir, socket, server) = fake_daemon(None);
     assert!(request_until_reply(&socket, &Request::Status).is_err());
     server.join().unwrap();
+}
+
+// ---- FR-CAP-8, FR-RET-12 ----
+
+#[test]
+fn pause_switches_skip_only_their_hooks() {
+    let on = Config::default();
+    assert!(on.inject.enabled && on.capture.enabled, "기본은 동작");
+    for event in [
+        "post-tool-batch",
+        "stop",
+        "stop-failure",
+        "session-end",
+        "user-prompt-submit",
+    ] {
+        assert!(!hook_paused(&on, event), "{event}");
+    }
+    let no_inject = Config::parse("[inject]\nenabled = false\n").unwrap();
+    assert!(hook_paused(&no_inject, "user-prompt-submit"));
+    assert!(!hook_paused(&no_inject, "stop"), "저장은 계속");
+    let no_capture = Config::parse("[capture]\nenabled = false\n").unwrap();
+    for event in ["post-tool-batch", "stop", "stop-failure", "session-end"] {
+        assert!(hook_paused(&no_capture, event), "{event}");
+    }
+    assert!(
+        !hook_paused(&no_capture, "user-prompt-submit"),
+        "주입은 계속"
+    );
 }

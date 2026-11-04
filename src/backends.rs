@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::config::{Config, Paths};
 use crate::embedder::{EmbedError, Embedder};
 use crate::lance::LanceVectorStore;
+use crate::layout::record_ollama_pid;
 use crate::ollama::{OllamaEmbedder, ServerLauncher, spawn_ollama};
 
 const OLLAMA_LOG: &str = "ollama.log";
@@ -29,7 +30,11 @@ pub fn build_embedder(config: &Config, paths: &Paths) -> Result<Arc<dyn Embedder
                 let command = c.ollama_command.clone();
                 let url = c.url.clone();
                 let log = paths.logs().join(OLLAMA_LOG);
-                Box::new(move || spawn_ollama(&command, &url, &log).map(|_| ())) as ServerLauncher
+                let root = paths.root.clone();
+                Box::new(move || {
+                    let pid = spawn_ollama(&command, &url, &log)?;
+                    record_ollama_pid(&root, pid)
+                }) as ServerLauncher
             });
             Ok(Arc::new(OllamaEmbedder::try_new_with_launcher(
                 c, launcher,

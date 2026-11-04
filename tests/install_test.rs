@@ -2,8 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use hippo::install::{
-    Action, InstallError, Scope, apply, is_hippo_command, is_installed, merge_install,
-    merge_uninstall, target_file,
+    Action, InstallError, apply, is_hippo_command, is_installed, merge_install, merge_uninstall,
+    settings_file,
 };
 use hippo::setup::hooks_config;
 use serde_json::{Value, json};
@@ -19,15 +19,10 @@ fn other_stop_hook() -> Value {
 // ---- FR-INS-1 ----
 
 #[test]
-fn target_files() {
+fn settings_file_is_in_claude_folder() {
     assert_eq!(
-        target_file(&Scope::Project(PathBuf::from("/p"))).unwrap(),
-        PathBuf::from("/p/.claude/settings.local.json")
-    );
-    assert!(
-        target_file(&Scope::User)
-            .unwrap()
-            .ends_with(".claude/settings.json")
+        settings_file(Path::new("/c")),
+        PathBuf::from("/c/settings.json")
     );
 }
 
@@ -306,20 +301,11 @@ const EXE: &str = "/opt/hippo bin/hippo";
 
 use hippo::install::{
     GUIDE_BEGIN, GUIDE_END, apply_memory, guide_block, memory_file, remove_block, upsert_block,
-    warn_untracked,
 };
 
 #[test]
-fn memory_files_follow_hook_scope() {
-    assert_eq!(
-        memory_file(&Scope::Project(PathBuf::from("/p"))).unwrap(),
-        PathBuf::from("/p/CLAUDE.local.md")
-    );
-    assert!(
-        memory_file(&Scope::User)
-            .unwrap()
-            .ends_with(".claude/CLAUDE.md")
-    );
+fn memory_file_is_in_claude_folder() {
+    assert_eq!(memory_file(Path::new("/c")), PathBuf::from("/c/CLAUDE.md"));
 }
 
 #[test]
@@ -476,34 +462,6 @@ fn symlinked_memory_file_is_refused() {
     assert_eq!(fs::read_to_string(&real).unwrap(), "x\n");
 }
 
-fn git(dir: &Path, args: &[&str]) {
-    let ok = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .unwrap()
-        .status
-        .success();
-    assert!(ok, "{args:?}");
-}
-
-#[test]
-fn warns_when_local_memory_file_is_not_git_ignored() {
-    let dir = tempfile::tempdir().unwrap();
-    let plain = dir.path().join("plain");
-    fs::create_dir_all(&plain).unwrap();
-    assert!(!warn_untracked(&plain), "git이 아니면 경고 없음");
-    let repo = dir.path().join("repo");
-    fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-q"]);
-    assert!(warn_untracked(&repo));
-    fs::write(repo.join(".gitignore"), "CLAUDE.local.md\n").unwrap();
-    assert!(!warn_untracked(&repo));
-}
-
 #[test]
 fn guide_block_uses_absolute_quoted_executable_path() {
     let block = guide_block(Path::new(EXE));
@@ -541,9 +499,9 @@ fn uninstall_deletes_settings_left_empty_and_empty_directory() {
     assert_eq!(left, json!({"model": "opus"}));
 }
 
-// ---- FR-INS-8, 9: 실행 파일 복사와 설치 목록 ----
+// ---- FR-INS-8: 실행 파일 복사 ----
 
-use hippo::install::{forget_install, install_binary, installed_exe, record_install};
+use hippo::install::{install_binary, installed_exe};
 use std::os::unix::fs::PermissionsExt;
 
 fn mode(p: &Path) -> u32 {
@@ -602,39 +560,6 @@ fn symlinked_install_path_is_refused() {
         Err(InstallError::Symlink(_))
     ));
     assert_eq!(fs::read(&elsewhere).unwrap(), b"keep");
-}
-
-#[test]
-fn binary_is_removed_only_after_last_install_is_forgotten() {
-    let dir = tempfile::tempdir().unwrap();
-    let src = dir.path().join("hippo-src");
-    fs::write(&src, b"bin").unwrap();
-    let root = dir.path().join("root");
-    install_binary(&src, &root, false).unwrap();
-    let user = dir.path().join("home/.claude/settings.json");
-    let project = dir.path().join("p/.claude/settings.local.json");
-    record_install(&root, &user).unwrap();
-    record_install(&root, &user).unwrap();
-    record_install(&root, &project).unwrap();
-    let listed = fs::read_to_string(root.join("bin/installs")).unwrap();
-    assert_eq!(listed.lines().count(), 2, "중복 없이 기록: {listed}");
-    assert_eq!(mode(&root.join("bin/installs")), 0o600);
-
-    assert!(
-        !forget_install(&root, &project, true).unwrap(),
-        "dry-run은 그대로"
-    );
-    assert!(!forget_install(&root, &project, false).unwrap());
-    assert!(installed_exe(&root).exists(), "다른 범위 설치가 남아 있음");
-    assert!(forget_install(&root, &user, false).unwrap());
-    assert!(
-        !root.join("bin").exists(),
-        "마지막 제거에서 실행 파일과 bin/ 삭제"
-    );
-    assert!(
-        !forget_install(&root, &user, false).unwrap(),
-        "이미 없으면 변경 없음"
-    );
 }
 
 // ---- FR-INS-10: 셸 표기 ----
@@ -710,4 +635,152 @@ fn is_installed_detects_hippo_hooks_only() {
     assert!(is_installed(&path));
     fs::write(&path, "not json").unwrap();
     assert!(!is_installed(&path));
+}
+
+// ---- FR-INS-8, 9, 11~13: 설치·제거·완전 삭제 동작 ----
+
+use hippo::commands::{InstallTarget, purge_data, run_install, run_uninstall, stop_services};
+use hippo::i18n::Lang;
+
+struct Env {
+    _dir: tempfile::TempDir,
+    target: InstallTarget,
+    exe: PathBuf,
+}
+
+fn env() -> Env {
+    let dir = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(dir.path()).unwrap();
+    let exe = base.join("build/hippo");
+    fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    fs::write(&exe, b"binary v1").unwrap();
+    let target = InstallTarget {
+        root: base.join("data"),
+        claude_dir: base.join("home/.claude"),
+        home: base.join("home"),
+    };
+    Env {
+        _dir: dir,
+        target,
+        exe,
+    }
+}
+
+fn install(e: &Env, dry_run: bool) -> Result<String, String> {
+    let mut out = String::new();
+    run_install(&e.target, dry_run, &e.exe, Lang::En, &mut out).map(|()| out)
+}
+
+fn uninstall(e: &Env, dry_run: bool) -> String {
+    let mut out = String::new();
+    run_uninstall(&e.target, dry_run, Lang::En, &mut out).unwrap();
+    out
+}
+
+#[test]
+fn install_copies_binary_writes_hooks_guide_link_and_record() {
+    let e = env();
+    let link = e.target.home.join(".local/bin/hippo");
+    let installed = e.target.root.join("bin/hippo");
+
+    let dry = install(&e, true).unwrap();
+    assert!(dry.contains("(dry-run) Would link"), "{dry}");
+    assert!(!installed.exists() && fs::symlink_metadata(&link).is_err());
+    assert!(!e.target.claude_dir.exists(), "dry-run은 쓰지 않음");
+
+    let out = install(&e, false).unwrap();
+    assert_eq!(fs::read(&installed).unwrap(), b"binary v1");
+    assert!(is_installed(&e.target.claude_dir.join("settings.json")));
+    let memory = fs::read_to_string(e.target.claude_dir.join("CLAUDE.md")).unwrap();
+    assert!(
+        memory.contains("/data/bin/hippo search"),
+        "안내 블록은 설치 경로: {memory}"
+    );
+    assert_eq!(fs::read_link(&link).unwrap(), installed);
+    assert_eq!(
+        fs::read_to_string(e.target.root.join("bin/claude-dir")).unwrap(),
+        format!("{}\n", e.target.claude_dir.display())
+    );
+    assert!(out.contains("Linked:"), "{out}");
+
+    let again = install(&e, false).unwrap();
+    assert!(
+        again.contains("Binary up to date") && again.contains("Link up to date"),
+        "{again}"
+    );
+}
+
+#[test]
+fn install_refuses_foreign_path_link_before_changing_anything() {
+    let e = env();
+    let link = e.target.home.join(".local/bin/hippo");
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("/elsewhere/bin/hippo", &link).unwrap();
+    assert!(install(&e, false).is_err());
+    assert!(!e.target.root.join("bin/hippo").exists(), "복사하지 않음");
+    assert!(
+        !e.target.claude_dir.exists(),
+        "hook과 안내 블록도 쓰지 않음"
+    );
+    assert_eq!(
+        fs::read_link(&link).unwrap(),
+        PathBuf::from("/elsewhere/bin/hippo")
+    );
+}
+
+#[test]
+fn uninstall_keeps_binary_and_removes_hooks_guide_link_and_record() {
+    let e = env();
+    install(&e, false).unwrap();
+    let link = e.target.home.join(".local/bin/hippo");
+    let dry = uninstall(&e, true);
+    assert!(dry.contains("(dry-run) Would remove link"), "{dry}");
+    assert!(fs::symlink_metadata(&link).is_ok());
+
+    let out = uninstall(&e, false);
+    assert!(out.contains("Removed link"), "{out}");
+    assert!(fs::symlink_metadata(&link).is_err());
+    assert!(!e.target.claude_dir.join("settings.json").exists());
+    assert!(!e.target.claude_dir.join("CLAUDE.md").exists());
+    assert!(
+        e.target.root.join("bin/hippo").exists(),
+        "실행 파일은 남김 (FR-INS-9)"
+    );
+    assert!(!e.target.root.join("bin/claude-dir").exists());
+    let none = uninstall(&e, false);
+    assert!(none.contains("No change"), "{none}");
+}
+
+#[test]
+fn uninstall_leaves_link_that_points_elsewhere() {
+    let e = env();
+    install(&e, false).unwrap();
+    let link = e.target.home.join(".local/bin/hippo");
+    fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink("/elsewhere/bin/hippo", &link).unwrap();
+    let out = uninstall(&e, false);
+    assert!(out.contains("does not point to this install"), "{out}");
+    assert!(fs::symlink_metadata(&link).is_ok());
+}
+
+#[test]
+fn purge_data_deletes_root_without_daemon() {
+    let e = env();
+    install(&e, false).unwrap();
+    fs::create_dir_all(e.target.root.join("projects/x")).unwrap();
+    uninstall(&e, false);
+    let mut out = String::new();
+    purge_data(&e.target.root, &e.target.home, Lang::En, &mut out).unwrap();
+    assert!(!e.target.root.exists(), "{out}");
+    assert!(out.contains("Deleted data root"), "{out}");
+}
+
+#[test]
+fn stop_without_daemon_or_ollama_changes_nothing() {
+    let e = env();
+    fs::create_dir_all(&e.target.root).unwrap();
+    let mut out = String::new();
+    stop_services(&e.target.root, Lang::En, &mut out).unwrap();
+    assert!(out.contains("Nothing to stop"), "{out}");
+    assert!(e.target.root.exists());
 }

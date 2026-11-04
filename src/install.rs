@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value};
 use similar::TextDiff;
 
-use crate::fsutil::{ensure_private_dir, open_private_append};
+use crate::fsutil::ensure_private_dir;
 use crate::setup::{home_dir, shell_path};
 
 #[derive(Debug, thiserror::Error)]
@@ -19,20 +19,12 @@ pub enum InstallError {
     Parse { path: PathBuf, message: String },
     #[error("unexpected settings structure: {0}")]
     Shape(String),
-    #[error("HOME is not set")]
-    NoHome,
     #[error(
         "refusing to modify through a symbolic link: {0} (apply to the real file path instead)"
     )]
     Symlink(PathBuf),
     #[error("memory file has `{GUIDE_BEGIN}` without `{GUIDE_END}`; fix it by hand")]
     UnclosedBlock,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Scope {
-    User,
-    Project(PathBuf),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -58,11 +50,8 @@ const HOOK_EVENTS: &[&str] = &[
     "user-prompt-submit",
 ];
 const EXE_NAME: &str = "hippo";
-const CLAUDE_DIR: &str = ".claude";
-const USER_SETTINGS: &str = "settings.json";
-const PROJECT_SETTINGS: &str = "settings.local.json";
-const USER_MEMORY: &str = "CLAUDE.md";
-const PROJECT_MEMORY: &str = "CLAUDE.local.md";
+const SETTINGS_FILE: &str = "settings.json";
+const MEMORY_FILE: &str = "CLAUDE.md";
 pub const GUIDE_BEGIN: &str = "<!-- hippo:begin -->";
 pub const GUIDE_END: &str = "<!-- hippo:end -->";
 /// Claude가 읽는 안내문. 언어 설정과 관계없이 영어이다. (IF-SKL-1, FR-UI-2)
@@ -80,25 +69,14 @@ const MAX_BACKUP_ATTEMPTS: u32 = 100;
 #[cfg(unix)]
 const PRIVATE_FILE_MODE: u32 = 0o600;
 
-pub fn target_file(scope: &Scope) -> Result<PathBuf, InstallError> {
-    Ok(match scope {
-        Scope::User => {
-            let home = std::env::var_os("HOME").ok_or(InstallError::NoHome)?;
-            PathBuf::from(home).join(CLAUDE_DIR).join(USER_SETTINGS)
-        }
-        Scope::Project(dir) => dir.join(CLAUDE_DIR).join(PROJECT_SETTINGS),
-    })
+/// hook을 넣을 설정 파일. (FR-INS-1)
+pub fn settings_file(claude_dir: &Path) -> PathBuf {
+    claude_dir.join(SETTINGS_FILE)
 }
 
-/// hook 범위에 맞는 메모리 파일. (FR-INS-7)
-pub fn memory_file(scope: &Scope) -> Result<PathBuf, InstallError> {
-    Ok(match scope {
-        Scope::User => {
-            let home = std::env::var_os("HOME").ok_or(InstallError::NoHome)?;
-            PathBuf::from(home).join(CLAUDE_DIR).join(USER_MEMORY)
-        }
-        Scope::Project(dir) => dir.join(PROJECT_MEMORY),
-    })
+/// 안내 블록을 넣을 메모리 파일. (FR-INS-7)
+pub fn memory_file(claude_dir: &Path) -> PathBuf {
+    claude_dir.join(MEMORY_FILE)
 }
 
 /// 안내 블록. 명령은 hippo 실행 파일 경로의 셸 표기로 쓴다. (FR-INS-7, FR-INS-10)
@@ -232,21 +210,6 @@ pub fn apply_memory(
     }
     let target = (!next.trim().is_empty()).then_some(next.as_str());
     write_change(path, existing.as_deref(), target, dry_run)
-}
-
-/// 프로젝트가 git 작업 트리 안인데 `CLAUDE.local.md`가 무시되지 않으면 true. (FR-INS-7)
-pub fn warn_untracked(project: &Path) -> bool {
-    let git = |args: &[&str]| {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(project)
-            .args(args)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-    };
-    git(&["rev-parse", "--is-inside-work-tree"]) && !git(&["check-ignore", "-q", PROJECT_MEMORY])
 }
 
 /// `<경로>/hippo hook <이벤트>` 형태인지 확인한다. (FR-INS-2)
@@ -530,7 +493,6 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
 }
 
 const BIN_DIR: &str = "bin";
-const INSTALLS_FILE: &str = "installs";
 #[cfg(unix)]
 const EXE_MODE: u32 = 0o700;
 const COMPARE_BUFFER: usize = 1 << 20;
@@ -591,7 +553,8 @@ pub fn install_binary(
     })
 }
 
-fn same_content(a: &Path, b: &Path) -> Result<bool, InstallError> {
+/// 두 파일의 내용이 같은지. 어느 쪽이든 없으면 false.
+pub fn same_content(a: &Path, b: &Path) -> Result<bool, InstallError> {
     use std::io::Read;
     let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::metadata(b)) else {
         return Ok(false);
@@ -611,56 +574,4 @@ fn same_content(a: &Path, b: &Path) -> Result<bool, InstallError> {
             return Ok(false);
         }
     }
-}
-
-fn installs_file(root: &Path) -> PathBuf {
-    root.join(BIN_DIR).join(INSTALLS_FILE)
-}
-
-fn read_installs(root: &Path) -> Result<Vec<String>, InstallError> {
-    Ok(read_existing(&installs_file(root))?
-        .unwrap_or_default()
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
-        .collect())
-}
-
-/// hook을 넣은 설정 파일을 설치 목록에 기록한다. 이미 있으면 그대로 둔다. (FR-INS-9)
-pub fn record_install(root: &Path, settings: &Path) -> Result<(), InstallError> {
-    let line = settings.to_string_lossy().into_owned();
-    if read_installs(root)?.contains(&line) {
-        return Ok(());
-    }
-    ensure_private_dir(&root.join(BIN_DIR))?;
-    open_private_append(&installs_file(root))?.write_all(format!("{line}\n").as_bytes())?;
-    Ok(())
-}
-
-/// 설치 목록에서 지우고, 남은 설치가 없으면 실행 파일과 목록, 빈 `bin/`을 지운다.
-/// 실행 파일을 지웠으면 true. (FR-INS-9)
-pub fn forget_install(root: &Path, settings: &Path, dry_run: bool) -> Result<bool, InstallError> {
-    let line = settings.to_string_lossy().into_owned();
-    let installs = read_installs(root)?;
-    if !installs.contains(&line) {
-        return Ok(false);
-    }
-    let rest: Vec<&String> = installs.iter().filter(|l| **l != line).collect();
-    if dry_run {
-        return Ok(rest.is_empty());
-    }
-    if !rest.is_empty() {
-        let text: String = rest.iter().map(|l| format!("{l}\n")).collect();
-        let mut tmp = tempfile::NamedTempFile::new_in(root.join(BIN_DIR))?;
-        tmp.write_all(text.as_bytes())?;
-        tmp.persist(installs_file(root)).map_err(|e| e.error)?;
-        return Ok(false);
-    }
-    let exe = installed_exe(root);
-    if fs::symlink_metadata(&exe).is_ok() {
-        fs::remove_file(&exe)?;
-    }
-    fs::remove_file(installs_file(root))?;
-    let _ = fs::remove_dir(root.join(BIN_DIR));
-    Ok(true)
 }

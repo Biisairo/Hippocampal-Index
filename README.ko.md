@@ -143,18 +143,28 @@ git clone git@github.com:Biisairo/Hippocampal-Index.git hippo && cd hippo
 cargo build --release
 ```
 
-### 3.2 바이너리 위치
+### 3.2 앱과 바이너리 위치
 
-`hippo install`은 자신을 데이터 루트의 **`~/.hippo/bin/hippo`로 복사**하고, hook 명령과 Claude 안내문에 이 경로를 씁니다. 데몬도 이 복사본으로 뜹니다. 그래서 빌드한 자리에서 바로 설치해도 되고, 그 뒤에 `cargo clean`을 하거나 저장소를 옮겨도 hook은 계속 동작합니다.
+hippo는 macOS 앱(`hippo.app`)이나 빌드한 실행 파일로 설치합니다. 앱은 다음 명령으로 만듭니다.
 
 ```bash
-./target/release/hippo install --scope user --dry-run
+scripts/bundle-app.sh            # target/hippo.app을 만듭니다(ad-hoc 서명)
 ```
 
+앱을 열면 GUI 창이 뜹니다. 앱을 여는 것만으로는 아무것도 설치하지 않습니다. 설치는 GUI의 **Claude 적용** 탭이나 `hippo install`로 합니다.
+
+설치는 실행 파일을 **데이터 루트의 `bin/hippo`(기본 `~/.hippo/bin/hippo`)로 복사**하고, hook 명령과 Claude 안내문에 이 경로를 씁니다. 데몬도 이 복사본으로 뜹니다. 그래서 앱이나 빌드 폴더를 지우거나 옮겨도 hook은 계속 동작합니다.
+
+```bash
+./target/release/hippo install --dry-run
+```
+
+- **데이터 루트는 실행 파일 위치로 정합니다.** `<루트>/bin/hippo`로 실행하면 `<루트>`가 데이터 루트입니다. `--root` 옵션은 없습니다. 다른 데이터 루트를 쓰려면 `install --data-dir <경로>`로 그 루트에 설치합니다.
+- 설치하지 않은 실행 파일(앱 안의 실행 파일, `target/release/hippo`)로는 `install`과 `gui`만 쓸 수 있습니다.
+- 설치는 `~/.local/bin/hippo`에 설치 경로를 가리키는 링크를 만듭니다. `~/.local/bin`이 PATH에 있으면 터미널에서 `hippo`를 바로 쓸 수 있습니다. PATH에 없으면 경고만 출력하고 셸 설정은 바꾸지 않습니다. 다른 곳을 가리키는 `~/.local/bin/hippo`가 이미 있으면 아무것도 바꾸지 않고 오류로 끝납니다.
 - hook 명령과 Claude 안내문에는 경로를 `~/.hippo/bin/hippo`처럼 `~`로 적습니다. 생성된 설정 파일이 공유되어도 계정 이름이 드러나지 않습니다. (launchd plist는 셸을 거치지 않으므로 절대 경로를 씁니다.)
-- 다시 빌드한 뒤에는 `install`을 다시 실행해야 새 바이너리가 복사됩니다. 내용이 같으면 복사하지 않습니다.
+- 새 버전으로 바꾸려면 새 앱(또는 다시 빌드한 실행 파일)으로 설치를 다시 실행합니다. 내용이 같으면 복사하지 않습니다. 실행 파일을 바꿨으면 이전 데몬을 내리고, 다음 요청이 새 실행 파일로 데몬을 띄웁니다. GUI는 설치된 실행 파일이 앱과 다르면 "업데이트 필요"를 보여 줍니다.
 - 복사는 APFS 파일 복제를 쓰므로 디스크를 거의 더 쓰지 않습니다.
-- 어느 설정 파일에 설치했는지는 `~/.hippo/bin/installs`에 기록됩니다. `uninstall`로 마지막 설치까지 지우면 복사본도 지웁니다.
 
 아래 예시에서 설치 전 명령은 `./target/release/hippo`, 설치 후 명령은 `~/.hippo/bin/hippo`를 씁니다.
 
@@ -197,16 +207,14 @@ launchd는 데몬이 비정상 종료했을 때만 다시 띄우고, 유휴 종�
 
 ### 3.5 hook 등록
 
-`hippo install`은 Claude Code 설정 파일에 hook을 병합합니다. `hippo` hook 항목만 바꾸고, 다른 hook과 설정은 그대로 둡니다. **먼저 미리보기로 확인하십시오.**
+`hippo install`은 Claude 폴더(기본 `~/.claude`)의 `settings.json`에 hook을 병합합니다. `hippo` hook 항목만 바꾸고, 다른 hook과 설정은 그대로 둡니다. **먼저 미리보기로 확인하십시오.**
 
 ```bash
-# 특정 프로젝트만: <프로젝트>/.claude/settings.local.json (개인 파일, git에 올라가지 않음)
-./target/release/hippo install --scope project --project ~/work/my-app --dry-run
-./target/release/hippo install --scope project --project ~/work/my-app
+./target/release/hippo install --dry-run
+./target/release/hippo install
 
-# 모든 세션: ~/.claude/settings.json
-./target/release/hippo install --scope user --dry-run
-./target/release/hippo install --scope user
+# 데이터 루트나 Claude 폴더를 바꿀 때
+./target/release/hippo install --data-dir ~/hippo-data --claude-dir ~/work/my-app/.claude
 ```
 
 `install`이 하는 일:
@@ -217,20 +225,23 @@ launchd는 데몬이 비정상 종료했을 때만 다시 띄우고, 유휴 종�
 - 다시 실행해도 결과가 같으면 아무것도 바꾸지 않습니다("변경 없음").
 - 심볼릭 링크를 거쳐서는 쓰지 않고, JSON이 깨진 설정 파일은 건드리지 않습니다.
 - 파일은 2칸 들여쓰기 JSON으로 다시 쓰입니다. 키 순서와 값은 유지되지만, 원래 형식은 달라질 수 있습니다. 원본은 백업에 남습니다.
-- Claude가 `hippo search`와 `hippo show`를 쓸 수 있다는 영어 안내 블록을 메모리 파일에 넣습니다. 명령은 설치에 쓴 hippo 실행 파일의 절대 경로로 적으므로 `hippo`가 PATH에 없어도 됩니다. `--scope user`는 `~/.claude/CLAUDE.md`, `--scope project`는 `<프로젝트>/CLAUDE.local.md`(공식 문서가 권장하는 개인용 파일)입니다. 블록은 `<!-- hippo:begin -->`과 `<!-- hippo:end -->` 사이에 있고, 이 표식은 Claude Code가 컨텍스트에 넣기 전에 지우므로 토큰을 쓰지 않습니다. 블록 밖의 내용은 그대로 둡니다. `CLAUDE.local.md`가 git에서 무시되지 않으면 경고만 출력하고, `.gitignore`는 바꾸지 않습니다.
+- Claude가 `hippo search`와 `hippo show`를 쓸 수 있다는 영어 안내 블록을 메모리 파일에 넣습니다. 명령은 설치 경로로 적으므로 `hippo`가 PATH에 없어도 됩니다. 메모리 파일은 `<Claude 폴더>/CLAUDE.md`입니다. 블록은 `<!-- hippo:begin -->`과 `<!-- hippo:end -->` 사이에 있고, 이 표식은 Claude Code가 컨텍스트에 넣기 전에 지우므로 토큰을 쓰지 않습니다. 블록 밖의 내용은 그대로 둡니다.
+- 사용한 Claude 폴더를 `<데이터 루트>/bin/claude-dir`에 기록합니다. 다음 `install`, `uninstall`, `purge`와 GUI는 `--claude-dir`이 없으면 이 값을 씁니다.
 
-hook 블록만 출력해 직접 넣을 수도 있습니다: `hippo hooks-config`. `uninstall`은 hook 항목과 안내 블록만 지웁니다. hippo 내용만 있던 설정 파일과 메모리 파일은 백업 없이 지우고, 그래서 비게 된 `.claude/` 디렉터리도 지웁니다. 다른 내용이 남는 파일은 백업한 뒤 고칩니다.
+hook 블록만 출력해 직접 넣을 수도 있습니다: `hippo hooks-config`. `uninstall`은 hook 항목, 안내 블록, `~/.local/bin/hippo` 링크만 지웁니다. 실행 파일과 기록은 남습니다. hippo 내용만 있던 설정 파일과 메모리 파일은 백업 없이 지우고, 그래서 비게 된 `.claude/` 디렉터리도 지웁니다. 다른 내용이 남는 파일은 백업한 뒤 고칩니다.
 
 hook을 등록한 뒤에는 Claude Code 세션을 새로 시작하십시오.
 
 ### 3.6 제거
 
 ```bash
-~/.hippo/bin/hippo uninstall --scope user          # 또는 --scope project --project <경로>
-launchctl bootout gui/$(id -u)/com.hippo.daemon
+launchctl bootout gui/$(id -u)/com.hippo.daemon     # launchd에 등록했다면
 rm ~/Library/LaunchAgents/com.hippo.daemon.plist
-rm -rf ~/.hippo                          # 저장된 기억이 모두 지워집니다
+~/.hippo/bin/hippo uninstall     # hook, 안내 블록, PATH 링크만 지웁니다. 기록은 남습니다
+~/.hippo/bin/hippo purge         # uninstall 뒤 데이터 루트를 통째로 지웁니다. 저장된 기억이 모두 지워집니다
 ```
+
+`purge`는 지울 경로를 보여 주고 확인을 받습니다(`--yes`로 건너뜁니다). 데몬과 hippo가 띄운 Ollama 서버를 내린 뒤 지웁니다. 데몬이 재색인 중이면 지우지 않습니다. 앱은 휴지통으로 옮기면 됩니다.
 
 ---
 
@@ -268,7 +279,10 @@ hippo show <prompt_id> --scope project  # 현재 프로젝트에서만 찾기
 
 ```bash
 hippo status
+hippo stop       # 데몬과 hippo가 띄운 Ollama를 지금 멈춤. 다음 hook이나 명령이 데몬을 다시 띄움
 ```
+
+주입이나 저장만 잠시 멈추려면 `[inject] enabled` 또는 `[capture] enabled`를 `false`로 둡니다. GUI 상태 탭의 **일시정지**/**재생** 버튼도 같은 키를 바꿉니다. hook은 매번 설정을 읽으므로 데몬을 다시 시작하지 않아도 됩니다. 저장을 재생하면, 열려 있던 세션은 일시정지 동안의 기록도 다음 수집 때 저장합니다.
 
 ```
 spool_pending: 0                  # 데몬이 꺼져 있을 때 쌓인 요청
@@ -327,17 +341,19 @@ hippo import --dry-run                   # 후보 세션과 처리 내용만 보
 hippo gui
 ```
 
-네이티브 창(egui)을 엽니다. 브라우저나 웹뷰는 쓰지 않습니다. 창을 닫으면 명령이 끝납니다. 명령을 실행한 폴더가 모든 요청의 현재 폴더이고, 경로 입력란의 기본값입니다.
+네이티브 창(egui)을 엽니다. 브라우저나 웹뷰는 쓰지 않습니다. 창을 닫으면 명령이 끝납니다. 앱(`hippo.app`)을 열어도 이 창이 뜹니다. 명령을 실행한 폴더가 모든 요청의 현재 폴더이고, 경로 입력란의 기본값입니다(Finder에서 연 앱은 `/`).
+
+창의 데이터 루트는 실행 파일의 데이터 루트이고, 설치하지 않은 실행 파일이면 `~/.local/bin/hippo` 링크가 가리키는 루트, 링크가 없으면 `~/.hippo`입니다. 그 루트에 실행 파일이 없거나 앱과 다르면 위쪽에 안내를 띄우고, Claude 적용 탭과 정보 탭만 쓸 수 있습니다.
 
 | 탭 | 하는 일 |
 |----|---------|
-| 상태 | 2초마다 데몬 상태를 물어 스풀, 재색인 상태, 프로젝트별 표(임베딩 대기, 처리 속도, 남은 시간)를 보여 줍니다. 창이 열려 있는 동안 데몬은 내려가지 않습니다. |
+| 상태 | **멈추기**(`hippo stop`과 같음. 멈춘 뒤에는 폴링도 멈추고 **다시 시작**을 기다림), 주입과 저장의 **일시정지**/**재생**. 2초마다 데몬 상태를 물어 스풀, 재색인 상태, 프로젝트별 표(임베딩 대기, 처리 속도, 남은 시간)를 보여 줍니다. 창이 열려 있는 동안 데몬은 내려가지 않습니다. |
 | 기록 | 프로젝트 하나의 기록을 둘러봅니다. 세션 목록(최신순) → 그 세션의 턴 목록(시간순) → 턴 상세 순서입니다. 목록은 50개씩 나눠 보여 줍니다. 목록 위의 필터에 글자를 넣으면 그 글자가 든 반복이 있는 세션과 턴만 남깁니다(3자 이상은 전문 검색, 그보다 짧으면 단순 포함 비교). 턴마다 임베딩 상태를 `완료` 또는 `대기 n`으로 보여 줍니다. 턴 상세는 `show --with-results`와 같은 내용을 반복별로 나눠 보여 주고, 도구 출력은 접어 둡니다. 목록 위의 질의란에서는 이 프로젝트의 하이브리드 검색(결과를 누르면 그 턴을 엽니다)이나 **주입 미리 보기**를 할 수 있습니다. 주입 미리 보기는 자동 주입과 같은 설정과 규칙으로 계산하되, 세션은 제외하지 않고 시간 예산도 적용하지 않습니다. 후보마다 RRF 순위, 유사도, 판정(`선택`, `임계값 미만`, `FTS 전용`, `같은 턴`, `길이 한도 초과`, `개수 초과`)을 보여 주고, 실제로 넣을 텍스트와 걸린 시간도 함께 보여 줍니다. 주입하지 않는 경우에는 그 사유를 보여 줍니다. 단계마다 **삭제** 버튼이 있고, 누르면 [4.7](#47-기록-지우기)의 미리 보기를 보여 준 뒤 확인을 받습니다. |
 | 설정 | `config.toml`의 모든 키를 설명, 기본값 여부와 함께 보여 줍니다. 저장할 때는 바꾼 키만 고치고 직접 쓴 주석은 그대로 둡니다. 기본값으로 되돌린 키는 파일에서 지웁니다. 저장 전에 결과를 검사하며, 잘못된 설정은 쓰지 않습니다. 데몬을 다시 시작해야 하면 **데몬 다시 시작** 버튼이 나타나고, 재색인이 필요한 변경이면 그것도 알려 줍니다. |
 | 가져오기 | **미리 보기**는 처리 내용과 후보 세션 표를 보여 줍니다(`--dry-run`과 같음). `새 세션`과 `실시간만`인 세션을 처음에 선택해 둡니다. **선택한 세션 가져오기**는 체크한 세션만 보냅니다. **멈춤**을 누르면 지금 세션을 마친 뒤 멈춥니다. 임베딩 진행은 상태 폴링 값으로 보여 줍니다. |
 | 검색 | `search`와 `show`. 반복 결과마다 **기록에서 열기**가 있어, 누르면 기록 탭에서 그 프로젝트와 턴을 엽니다. |
 | 프로젝트 | `project list`와 `reindex` |
-| Claude 적용 | 사용자 범위나 프로젝트 범위에 hippo가 적용되어 있는지 보여 줍니다. **적용/해제 미리 보기**는 `--dry-run`과 같은 diff를 보여 줍니다. **적용**과 **해제**는 같은 입력으로 미리 보기를 한 뒤에만 누를 수 있고, 확인을 한 번 더 받습니다. |
+| Claude 적용 | 데이터 루트와 Claude 폴더를 고르고, 실행 파일 설치 상태, hook 적용 여부, PATH 링크를 보여 줍니다. **미리 보기**는 `--dry-run`과 같은 결과를 보여 줍니다. **적용**과 **해제**는 같은 입력으로 미리 보기를 한 뒤에만 누를 수 있고, 확인을 한 번 더 받습니다. **완전 삭제**는 `purge`와 같습니다. |
 | 정보 | 버전, README, LICENSE |
 
 창의 문구는 `[ui] language`를 따릅니다. 한글은 macOS 시스템 폰트로 표시합니다. 색은 기본으로 macOS의 라이트·다크 모드를 따릅니다. 한쪽으로 고정하려면 `[ui] theme`을 `light`나 `dark`로 둡니다. 설정 탭에서 테마를 저장하면 바로 바뀝니다.
@@ -399,6 +415,10 @@ total_chars = 12000                # 주입 전체 길이 한도. 넘는 턴은 
 budget_ms = 800                    # UserPromptSubmit hook의 시간 예산
 cold_budget_ms = 2500              # hook이 데몬을 새로 띄울 때(콜드 시작)의 예산. budget_ms 이상
 min_prompt_chars = 11              # 앞뒤 공백을 뺀 길이가 이보다 짧은 프롬프트는 주입하지 않음
+enabled = true                     # false면 주입 일시정지. 다음 프롬프트부터 적용(데몬 재시작 불필요)
+
+[capture]
+enabled = true                     # false면 저장 일시정지. 재생하면 열린 세션은 밀린 기록도 저장
 
 [index]
 vector_index_threshold = 100000    # 벡터 수가 이 값에 이르면 ANN 인덱스를 만듦
@@ -457,7 +477,8 @@ pattern = 'HCI-\d{6}'
 ~/.hippo/            (0700)
 ├─ config.toml
 ├─ bin/hippo                  (0700) 설치한 실행 파일. hook과 안내문이 이 경로를 씀
-├─ bin/installs               (0600) hook을 넣은 설정 파일 목록
+├─ bin/claude-dir             (0600) 설치에 쓴 Claude 폴더
+├─ ollama.pid                 (0600) hippo가 띄운 Ollama 서버의 pid
 ├─ registry.sqlite            (0600) 목록 DB: 프로젝트, 위치, 루트 커밋, 세션 → 프로젝트
 ├─ projects/<id>/             (0700) 프로젝트 하나
 │  ├─ records.sqlite          (0600) 기준 데이터
@@ -560,7 +581,7 @@ cargo fmt
 - 자동 주입의 품질은 `inject.threshold`에 달려 있습니다. "방금 주입됐어?"처럼 과거에 같은 말을 한 적이 있는 메타 질문에는 관련 없는 기억이 들어올 수 있습니다(SRS 부록 C).
 - "버그"처럼 2자인 한국어 단어는 키워드 검색으로 찾을 수 없습니다(FTS5 trigram은 3자 이상 필요). 이런 단어는 벡터 검색이 담당합니다.
 - 대화형 세션에서 아직 확인하지 못한 것: 백그라운드 알림 뒤 hook 실행 여부(OPEN-1), Esc 중단(OPEN-2), compaction(OPEN-3), `Stop` 실행 시점에 마지막 줄이 기록되어 있는지(OPEN-6).
-- hook은 항상 기본 데이터 루트(`~/.hippo`)를 씁니다. `--root`는 hook 명령에 들어가지 않습니다.
+- 설치 기록은 Claude 폴더 하나만 남깁니다. 같은 데이터 루트로 여러 Claude 폴더에 설치했다면, `purge` 전에 나머지 폴더는 `uninstall --claude-dir <경로>`로 직접 해제해야 합니다.
 - 데몬이 시그널로 종료되면 소켓 파일이 남습니다. 다음 시작 때 지워집니다.
 - 아직 보존 기간 정책이 없습니다. `forget`이나 `project remove`로 지우기 전까지 기억이 계속 쌓입니다([4.7](#47-기록-지우기) 참고).
 - 결과(도구 출력)의 중복 제거는 프로젝트 안에서만 합니다. 같은 출력이 두 프로젝트에 있으면 각각 저장합니다.
