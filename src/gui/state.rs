@@ -253,6 +253,29 @@ impl InstallForm {
     }
 }
 
+/// 상태 폴링을 막는 조건들. (FR-GUI-3, FR-GUI-10)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PollGate {
+    /// 설치 상태가 `설치됨`인지.
+    pub installed: bool,
+    /// 수동 중지나 완전 삭제 뒤의 멈춤 상태.
+    pub paused: bool,
+    /// 수동 중지가 진행 중인지.
+    pub stopping: bool,
+    /// Claude 적용 탭의 작업이 진행 중인지.
+    pub install_busy: bool,
+}
+
+/// 폴링은 데몬을 띄우므로, 막는 조건이 하나라도 있으면 하지 않는다.
+pub fn should_poll(gate: PollGate) -> bool {
+    gate.installed && !gate.paused && !gate.stopping && !gate.install_busy
+}
+
+/// 완전 삭제는 확인을 받았고 진행 중인 상태 요청이 없을 때 시작한다. (FR-GUI-10)
+pub fn purge_may_start(confirmed: bool, status_running: bool) -> bool {
+    confirmed && !status_running
+}
+
 /// 기록 탭의 한 페이지 크기. (FR-GUI-13)
 pub const PAGE_SIZE: usize = 50;
 

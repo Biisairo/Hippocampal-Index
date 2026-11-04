@@ -23,9 +23,9 @@ use crate::config_edit::{
 };
 use crate::gui::images;
 use crate::gui::state::{
-    DeleteTarget, ImportForm, ImportProgress, InstallAction, InstallForm, PreviewKey, RecordsView,
-    Reload, Toast, Toasts, default_project, embed_state, page_count, resolve_import_args,
-    run_import, skip_label, verdict_label,
+    DeleteTarget, ImportForm, ImportProgress, InstallAction, InstallForm, PollGate, PreviewKey,
+    RecordsView, Reload, Toast, Toasts, default_project, embed_state, page_count, purge_may_start,
+    resolve_import_args, run_import, should_poll, skip_label, verdict_label,
 };
 use crate::gui::text::describe;
 use crate::gui::theme;
@@ -298,6 +298,10 @@ struct Install {
     checked: Option<(String, String)>,
     confirm: Option<InstallAction>,
     confirm_purge: bool,
+    /// 확인한 완전 삭제. 진행 중인 상태 요청이 끝나면 시작한다. (FR-GUI-10)
+    purge_pending: bool,
+    /// 진행 중인 작업이 완전 삭제인지. 끝나면 GUI를 멈춤 상태로 둔다.
+    purging: bool,
     check: Task<InstallCheck>,
     task: Task<InstallOutcome>,
 }
@@ -503,6 +507,8 @@ impl App {
                 checked: None,
                 confirm: None,
                 confirm_purge: false,
+                purge_pending: false,
+                purging: false,
                 check: Task::default(),
                 task: Task::default(),
             },
@@ -534,8 +540,12 @@ impl App {
                 .map_or(0, |d| d.as_secs() as i64);
             self.status_at = local_time(now);
         }
-        let ready = self.state == Some(InstallState::Installed);
-        let polling = ready && !self.paused && !self.stop_task.running;
+        let polling = should_poll(PollGate {
+            installed: self.state == Some(InstallState::Installed),
+            paused: self.paused,
+            stopping: self.stop_task.running,
+            install_busy: self.install.task.running || self.install.purge_pending,
+        });
         if polling && Instant::now() >= self.next_poll && !self.status_task.running {
             self.next_poll = Instant::now() + POLL;
             let paths = self.paths.clone();
@@ -1800,6 +1810,19 @@ impl App {
                     self.state = None;
                 }
             }
+            if i.purging {
+                i.purging = false;
+                self.paused = true;
+                self.status = None;
+            }
+        }
+        if purge_may_start(i.purge_pending, self.status_task.running) {
+            i.purge_pending = false;
+            i.purging = true;
+            self.paused = true;
+            let target = target.clone();
+            i.task
+                .start(&ctx, move || (None, purge_text(&target, lang)));
         }
         card(ui, &tr!(lang, "Where to apply", "적용 위치"), |ui| {
             form(ui, "install-args", |ui, w| {
@@ -1919,7 +1942,7 @@ impl App {
             ));
             if ui
                 .add_enabled(
-                    !i.task.running,
+                    !i.task.running && !i.purge_pending,
                     button(tr!(lang, "Delete everything", "완전 삭제")),
                 )
                 .clicked()
@@ -1984,8 +2007,7 @@ impl App {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if primary(ui, true, tr!(lang, "Delete", "지우기")).clicked() {
-                        let target = target.clone();
-                        i.task.start(&ctx, move || (None, purge_text(&target, lang)));
+                        i.purge_pending = true;
                         i.confirm_purge = false;
                     }
                     if ui.add(button(tr!(lang, "Cancel", "취소"))).clicked() {

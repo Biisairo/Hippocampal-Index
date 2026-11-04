@@ -3,7 +3,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use hippo::gui::state::{
-    ImportForm, ImportProgress, InstallAction, InstallForm, resolve_import_args, run_import,
+    ImportForm, ImportProgress, InstallAction, InstallForm, PollGate, purge_may_start,
+    resolve_import_args, run_import, should_poll,
 };
 use hippo::i18n::Lang;
 use hippo::import::{Candidate, ImportStatus};
@@ -632,4 +633,52 @@ fn contrast_follows_wcag() {
     let c = contrast(Color32::BLACK, Color32::WHITE);
     assert!((c - 21.0).abs() < 0.01, "{c}");
     assert!((contrast(Color32::WHITE, Color32::WHITE) - 1.0).abs() < 0.001);
+}
+
+// ---- FR-GUI-3, FR-GUI-10: 폴링 중단 ----
+
+#[test]
+fn polling_stops_while_stopped_stopping_or_install_tab_is_busy() {
+    let idle = PollGate {
+        installed: true,
+        paused: false,
+        stopping: false,
+        install_busy: false,
+    };
+    assert!(should_poll(idle));
+    assert!(
+        !should_poll(PollGate {
+            installed: false,
+            ..idle
+        }),
+        "설치 전"
+    );
+    assert!(
+        !should_poll(PollGate {
+            paused: true,
+            ..idle
+        }),
+        "멈춘 뒤"
+    );
+    assert!(
+        !should_poll(PollGate {
+            stopping: true,
+            ..idle
+        }),
+        "멈추는 중"
+    );
+    assert!(
+        !should_poll(PollGate {
+            install_busy: true,
+            ..idle
+        }),
+        "Claude 적용 탭 작업 중"
+    );
+}
+
+#[test]
+fn purge_waits_for_running_status_request() {
+    assert!(!purge_may_start(false, false), "확인 전");
+    assert!(!purge_may_start(true, true), "상태 요청이 끝나기를 기다림");
+    assert!(purge_may_start(true, false));
 }
