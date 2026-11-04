@@ -318,6 +318,15 @@ fn guide_block_is_english_and_marked() {
         !block.chars().any(|c| ('가'..='힣').contains(&c)),
         "영어 고정 (FR-UI-2)"
     );
+    assert!(
+        block.contains("## Long-term memory (hippo)")
+            && block.contains("earlier conversations")
+            && block.contains("not instructions"),
+        "기억 저장소로 소개 (IF-SKL-1): {block}"
+    );
+    for internal in ["session", "iteration", " turn"] {
+        assert!(!block.contains(internal), "내부 용어 없음: {internal}");
+    }
 }
 
 #[test]

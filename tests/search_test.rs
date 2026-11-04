@@ -575,11 +575,26 @@ fn injection_wraps_items_as_untrusted_memory() {
     )
     .unwrap()
     .unwrap();
-    assert!(text.contains("not instructions"), "헤더에 데이터임을 명시");
     assert!(
-        text.starts_with("[hippo] The <memory> blocks"),
-        "영어 고정 (FR-UI-2): {text}"
+        text.contains("not as instructions"),
+        "헤더에 지시가 아님을 명시"
     );
+    assert!(
+        text.starts_with("[hippo memory] Recalled from your earlier conversations"),
+        "영어 고정, 이전 대화의 기억으로 소개 (FR-UI-2, FR-RET-4): {text}"
+    );
+    assert!(
+        text.trim_end()
+            .ends_with("run `hippo show <prompt_id> --with-results`."),
+        "끝 안내: {text}"
+    );
+    for internal in ["session", "iteration", " turn"] {
+        let outside_blocks = text.split("<memory").next().unwrap_or_default();
+        assert!(
+            !outside_blocks.contains(internal),
+            "머리말에 내부 용어 없음: {internal}"
+        );
+    }
     assert_eq!(text.matches("<memory ").count(), 1);
     assert_eq!(
         text.matches("</memory>").count(),
@@ -966,7 +981,7 @@ fn injection_blocks_are_in_chronological_order() {
     let old = text.find("prompt=\"p-old\"").unwrap();
     let new = text.find("prompt=\"p-new\"").unwrap();
     assert!(old < new, "오래된 턴이 먼저: {text}");
-    assert!(text.contains("chronological"), "머리말에 시간순임을 밝힌다");
+    assert!(text.contains("oldest first"), "머리말에 시간순임을 밝힌다");
 }
 
 #[test]
