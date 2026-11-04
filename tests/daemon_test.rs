@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use common::*;
 use hippo::backends::{VectorSource, vector_source};
-use hippo::client::{Launcher, ensure_daemon, launch_disabled, request, run_hook};
+use hippo::client::{
+    Launcher, ensure_daemon, launch_disabled, request, request_until_reply, run_hook,
+};
 use hippo::config::{Config, Paths};
 use hippo::daemon::{DaemonError, DaemonHandle, start};
 use hippo::embedder::Embedder;
@@ -2567,6 +2569,47 @@ fn in_flight_embedding_batch_does_not_store_vectors_of_forgotten_records() {
         vectors.count().unwrap(),
         0,
         "지운 레코드의 벡터가 남지 않음"
+    );
+    handle.shutdown();
+}
+
+/// 조회 요청의 시간 제한(30초)보다 길게 기다린다.
+const LONGER_THAN_QUERY_TIMEOUT: Duration = Duration::from_secs(31);
+
+#[test]
+fn delete_waits_for_long_embedding_batch_and_reports_success() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    let e = env();
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let handle = start(
+        e.paths.clone(),
+        config(),
+        Arc::new(GatedEmbedder {
+            inner: HashEmbedder::new(256, 8_000),
+            entered: entered.clone(),
+            release: release.clone(),
+        }),
+        memory_source(&e.paths, Arc::new(MemoryVectorStore::default())),
+    )
+    .unwrap();
+    ingest(&e.paths, &e.transcript, HookEvent::Stop);
+    wait_until(|| entered.load(SeqCst));
+    let socket = e.paths.socket();
+    let forget = std::thread::spawn(move || {
+        request_until_reply(
+            &socket,
+            &forget_req(ForgetTarget::Session(S2.into()), None, false),
+        )
+    });
+    std::thread::sleep(LONGER_THAN_QUERY_TIMEOUT);
+    assert!(!forget.is_finished(), "묶음이 끝날 때까지 오류 없이 기다림");
+    release.store(true, SeqCst);
+    assert!(delete_report(forget.join().unwrap().unwrap()).is_some());
+    assert_eq!(
+        totals(&status(&e.paths)).0,
+        0,
+        "성공 응답 뒤에는 지워져 있음"
     );
     handle.shutdown();
 }

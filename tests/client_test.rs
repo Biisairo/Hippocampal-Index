@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use hippo::backends::{BackendError, build_embedder, vector_source};
-use hippo::client::{HookAction, inject_output, launch_disabled, parse_hook, run_hook};
+use hippo::client::{
+    HookAction, inject_output, launch_disabled, parse_hook, request_until_reply, run_hook,
+};
 use hippo::config::{Config, Paths};
 use hippo::generations::active_dir;
 use hippo::i18n::Lang;
@@ -581,4 +583,43 @@ fn older_import_messages_without_new_fields_still_parse() {
         (sessions[0].size, sessions[0].status),
         (0, ImportStatus::New)
     );
+}
+
+/// 요청 한 줄을 읽은 뒤 `reply`를 보내거나(Some), 응답 없이 연결을 닫는(None) 가짜 데몬.
+fn fake_daemon(
+    reply: Option<Response>,
+) -> (tempfile::TempDir, PathBuf, std::thread::JoinHandle<()>) {
+    use std::io::{BufRead, BufReader, Write};
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let socket = dir.path().join("hippo.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        if let Some(reply) = reply {
+            let mut stream = stream;
+            writeln!(stream, "{}", serde_json::to_string(&reply).unwrap()).unwrap();
+        }
+    });
+    (dir, socket, server)
+}
+
+#[test]
+fn request_until_reply_returns_the_reply() {
+    let (_dir, socket, server) = fake_daemon(Some(Response::Done));
+    assert_eq!(
+        request_until_reply(&socket, &Request::Status).unwrap(),
+        Response::Done
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn request_until_reply_fails_when_connection_closes_without_reply() {
+    let (_dir, socket, server) = fake_daemon(None);
+    assert!(request_until_reply(&socket, &Request::Status).is_err());
+    server.join().unwrap();
 }

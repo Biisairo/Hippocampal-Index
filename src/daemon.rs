@@ -846,6 +846,7 @@ fn import_plan(shared: &Shared, from: String, to: String) -> Result<Response, St
         shared,
         |reply| WriteJob::ImportPrepare { from, to, reply },
         "import",
+        Some(CONNECTION_TIMEOUT),
     );
     let Response::ImportPlan {
         project_id,
@@ -1420,24 +1421,36 @@ fn handle_connection(shared: &Arc<Shared>, stream: UnixStream) {
     shared.touch();
 }
 
-/// 쓰기 스레드에 작업을 넘기고 응답을 기다린다.
-fn send_write(shared: &Shared, make: impl FnOnce(Reply) -> WriteJob, what: &str) -> Response {
+fn send_write(
+    shared: &Shared,
+    make: impl FnOnce(Reply) -> WriteJob,
+    what: &str,
+    wait: Option<Duration>,
+) -> Response {
     let (tx, rx) = mpsc::channel();
     if shared.write_tx.send(make(tx)).is_err() {
         return Response::Error {
             message: "write worker stopped".into(),
         };
     }
-    rx.recv_timeout(CONNECTION_TIMEOUT)
-        .unwrap_or_else(|_| Response::Error {
-            message: format!("{what} timed out"),
-        })
+    let reply = match wait {
+        Some(timeout) => rx
+            .recv_timeout(timeout)
+            .map_err(|_| format!("{what} timed out")),
+        None => rx.recv().map_err(|_| "write worker stopped".to_string()),
+    };
+    reply.unwrap_or_else(|message| Response::Error { message })
 }
 
 fn handle_request(shared: &Arc<Shared>, req: Request) -> Response {
     let result: Result<Response, String> = match req {
         Request::Ingest(ingest_req) => {
-            return send_write(shared, |tx| WriteJob::Ingest(ingest_req, tx), "ingest");
+            return send_write(
+                shared,
+                |tx| WriteJob::Ingest(ingest_req, tx),
+                "ingest",
+                Some(CONNECTION_TIMEOUT),
+            );
         }
         Request::ImportPrepare { from, to, dry_run } => {
             if dry_run {
@@ -1460,6 +1473,7 @@ fn handle_request(shared: &Arc<Shared>, req: Request) -> Response {
                     reply,
                 },
                 "import",
+                Some(CONNECTION_TIMEOUT),
             );
         }
         Request::Reindex { scope, cwd } => return start_reindex(shared, &scope, &cwd),
@@ -1540,8 +1554,10 @@ fn handle_request(shared: &Arc<Shared>, req: Request) -> Response {
         Request::Status => status(shared).map(Response::Status),
         Request::ProjectList => project_list(shared).map(|text| Response::Text { text }),
         Request::Shutdown => request_shutdown(shared),
-        req @ (Request::ProjectRemove { .. } | Request::Forget { .. }) => {
-            return send_write(shared, |reply| WriteJob::Delete(req, reply), "delete");
+        req @ (Request::ProjectRemove { dry_run, .. } | Request::Forget { dry_run, .. }) => {
+            // 실제 삭제는 끝날 때까지 기다려, 응답이 곧 삭제 결과가 되게 한다. (FR-DEL-6)
+            let wait = dry_run.then_some(CONNECTION_TIMEOUT);
+            return send_write(shared, |reply| WriteJob::Delete(req, reply), "delete", wait);
         }
     };
     result.unwrap_or_else(|message| {

@@ -88,13 +88,22 @@ pub fn ensure_daemon(paths: &Paths, launcher: Launcher, wait: Duration) -> bool 
 }
 
 pub fn request(socket: &Path, req: &Request, timeout: Duration) -> Result<Response, ClientError> {
+    exchange(socket, req, Some(timeout))
+}
+
+/// 응답이 올 때까지 시간 제한 없이 기다린다. 응답 전에 연결이 끊기면 오류. (FR-DEL-4)
+pub fn request_until_reply(socket: &Path, req: &Request) -> Result<Response, ClientError> {
+    exchange(socket, req, None)
+}
+
+fn exchange(
+    socket: &Path,
+    req: &Request,
+    timeout: Option<Duration>,
+) -> Result<Response, ClientError> {
     let mut stream = UnixStream::connect(socket).map_err(ClientError::Connect)?;
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(ClientError::Io)?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(ClientError::Io)?;
+    stream.set_read_timeout(timeout).map_err(ClientError::Io)?;
+    stream.set_write_timeout(timeout).map_err(ClientError::Io)?;
     let mut line = serde_json::to_string(req)?;
     line.push('\n');
     stream.write_all(line.as_bytes()).map_err(ClientError::Io)?;

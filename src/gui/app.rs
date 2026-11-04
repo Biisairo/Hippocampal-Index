@@ -11,7 +11,9 @@ use egui_extras::{Column, TableBuilder};
 
 use crate::client::request;
 use crate::commands::render_delete_report;
-use crate::commands::{SESSION_ID_SHORT, project_scope, query, run_install, scope_arg};
+use crate::commands::{
+    SESSION_ID_SHORT, project_scope, query, query_until_reply, run_install, scope_arg,
+};
 use crate::config::PatternEntry;
 use crate::config::{Config, Paths};
 use crate::config_edit::{
@@ -1371,7 +1373,7 @@ impl App {
                 let req = target.request(&cwd, false);
                 let paths = paths.clone();
                 r.delete_task
-                    .start(&ctx, move || (target, query(&paths, &req, QUERY_TIMEOUT)));
+                    .start(&ctx, move || (target, query_until_reply(&paths, &req)));
             }
             if confirmed || close || modal.should_close() {
                 r.confirm = None;

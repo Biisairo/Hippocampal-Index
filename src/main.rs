@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use hippo::backends::{build_embedder, vector_source};
-use hippo::client::{STARTUP_WAIT, ensure_daemon, request, run_hook};
+use hippo::client::{STARTUP_WAIT, ensure_daemon, request, request_until_reply, run_hook};
 use hippo::commands::{
     self, Confirm, ImportTally, SCOPE_ALL, SCOPE_PROJECT, absolute, confirm_delete, hook_settings,
     launcher, project_scope, render_delete_report, scope_arg, session_line,
@@ -415,11 +415,19 @@ fn run_delete(paths: &Paths, make: impl Fn(bool) -> Request, yes: bool, dry_run:
     };
     let lang = config.ui.language;
     ensure_daemon(paths, launcher(&config), STARTUP_WAIT);
-    let send = |dry_run: bool| match request(&paths.socket(), &make(dry_run), QUERY_TIMEOUT) {
-        Ok(Response::Delete { report }) => Ok(report),
-        Ok(Response::Error { message }) => Err(message),
-        Ok(other) => Err(format!("unexpected response: {other:?}")),
-        Err(e) => Err(e.to_string()),
+    // 실제 삭제는 끝날 때까지 기다린다. 응답이 곧 삭제 결과이다. (FR-DEL-4)
+    let send = |dry_run: bool| {
+        let reply = if dry_run {
+            request(&paths.socket(), &make(true), QUERY_TIMEOUT)
+        } else {
+            request_until_reply(&paths.socket(), &make(false))
+        };
+        match reply {
+            Ok(Response::Delete { report }) => Ok(report),
+            Ok(Response::Error { message }) => Err(message),
+            Ok(other) => Err(format!("unexpected response: {other:?}")),
+            Err(e) => Err(e.to_string()),
+        }
     };
     let report = match send(true) {
         Ok(Some(report)) => report,

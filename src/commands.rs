@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::client::{
-    Launcher, STARTUP_WAIT, ensure_daemon, launch_disabled, request, spawn_daemon_process,
+    Launcher, STARTUP_WAIT, ensure_daemon, launch_disabled, request, request_until_reply,
+    spawn_daemon_process,
 };
 use crate::config::{Config, Paths};
 use crate::i18n::Lang;
@@ -36,9 +37,22 @@ pub fn launcher(config: &Config) -> Launcher<'static> {
 
 /// 데몬이 없으면 설정에 따라 띄운 뒤 요청한다. (IF-CLI-1, FR-GUI-1)
 pub fn query(paths: &Paths, req: &Request, timeout: Duration) -> Result<Response, String> {
+    send_query(paths, req, Some(timeout))
+}
+
+/// `query`와 같지만 응답이 올 때까지 시간 제한 없이 기다린다. (FR-GUI-15)
+pub fn query_until_reply(paths: &Paths, req: &Request) -> Result<Response, String> {
+    send_query(paths, req, None)
+}
+
+fn send_query(paths: &Paths, req: &Request, timeout: Option<Duration>) -> Result<Response, String> {
     let config = Config::load(&paths.config()).map_err(|e| e.to_string())?;
     ensure_daemon(paths, launcher(&config), STARTUP_WAIT);
-    request(&paths.socket(), req, timeout).map_err(|e| e.to_string())
+    let reply = match timeout {
+        Some(timeout) => request(&paths.socket(), req, timeout),
+        None => request_until_reply(&paths.socket(), req),
+    };
+    reply.map_err(|e| e.to_string())
 }
 
 /// 상대 경로는 클라이언트의 현재 디렉터리 기준으로 바꾼다. 데몬의 현재 디렉터리와 다르기 때문이다.
