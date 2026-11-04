@@ -338,8 +338,8 @@ fn spool_is_drained_on_start() {
     };
     spool::append(&e.paths.spool(), &req).unwrap();
     let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
-    wait_until(|| totals(&status(&e.paths)).0 == 2);
-    assert_eq!(spool::pending_count(&e.paths.spool()), 0);
+    // 데몬은 스풀 요청을 수집한 뒤에 파일을 지우므로, 두 조건을 함께 기다린다.
+    wait_until(|| totals(&status(&e.paths)).0 == 2 && spool::pending_count(&e.paths.spool()) == 0);
     handle.shutdown();
 }
 

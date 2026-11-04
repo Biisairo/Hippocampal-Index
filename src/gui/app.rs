@@ -2220,7 +2220,7 @@ fn field_editor(ui: &mut egui::Ui, field: &mut Field, lang: Lang) {
                             [TEXT_FIELD_WIDTH - LIST_BUTTON_WIDTH, FIELD_HEIGHT],
                             egui::TextEdit::singleline(item),
                         );
-                        if ui.small_button("✕").clicked() {
+                        if ui.small_button("×").clicked() {
                             remove = Some(n);
                         }
                     });
@@ -2228,7 +2228,14 @@ fn field_editor(ui: &mut egui::Ui, field: &mut Field, lang: Lang) {
                 if let Some(n) = remove {
                     items.remove(n);
                 }
-                if ui.small_button(tr!(lang, "+ add", "+ 추가")).clicked() {
+                if ui
+                    .add(
+                        egui::Button::new(tr!(lang, "+ add", "+ 추가"))
+                            .small()
+                            .wrap_mode(egui::TextWrapMode::Extend),
+                    )
+                    .clicked()
+                {
                     items.push(String::new());
                 }
             });
@@ -2249,7 +2256,7 @@ fn field_editor(ui: &mut egui::Ui, field: &mut Field, lang: Lang) {
                             ],
                             egui::TextEdit::singleline(&mut p.pattern).hint_text("pattern (regex)"),
                         );
-                        if ui.small_button("✕").clicked() {
+                        if ui.small_button("×").clicked() {
                             remove = Some(n);
                         }
                     });
@@ -2257,7 +2264,14 @@ fn field_editor(ui: &mut egui::Ui, field: &mut Field, lang: Lang) {
                 if let Some(n) = remove {
                     patterns.remove(n);
                 }
-                if ui.small_button(tr!(lang, "+ add", "+ 추가")).clicked() {
+                if ui
+                    .add(
+                        egui::Button::new(tr!(lang, "+ add", "+ 추가"))
+                            .small()
+                            .wrap_mode(egui::TextWrapMode::Extend),
+                    )
+                    .clicked()
+                {
                     patterns.push(PatternEntry {
                         kind: String::new(),
                         pattern: String::new(),
