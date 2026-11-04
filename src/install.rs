@@ -119,12 +119,33 @@ fn block_range(lines: &[&str]) -> Result<Option<(usize, usize)>, InstallError> {
     Ok(Some((begin, begin + end)))
 }
 
-fn join_lines(lines: &[&str]) -> String {
-    if lines.is_empty() {
-        return String::new();
+/// 줄 끝을 포함한 줄들. 마지막 줄은 줄 끝이 없을 수 있다.
+fn split_lines(text: &str) -> Vec<&str> {
+    text.split_inclusive('\n').collect()
+}
+
+/// 새로 넣는 줄의 줄 끝. 첫 줄의 줄 끝을 따르고, 없으면 LF. (FR-INS-7)
+fn line_ending(text: &str) -> &'static str {
+    if text
+        .split_inclusive('\n')
+        .next()
+        .is_some_and(|first| first.ends_with("\r\n"))
+    {
+        "\r\n"
+    } else {
+        "\n"
     }
-    let mut text = lines.join("\n");
-    text.push('\n');
+}
+
+/// 줄 끝이 없는 줄에는 `eol`을 붙여 잇는다.
+fn join_lines<S: AsRef<str>>(lines: &[S], eol: &str) -> String {
+    let mut text = String::new();
+    for line in lines {
+        text.push_str(line.as_ref());
+        if !line.as_ref().ends_with('\n') {
+            text.push_str(eol);
+        }
+    }
     text
 }
 
@@ -132,36 +153,44 @@ fn join_lines(lines: &[&str]) -> String {
 fn keep_final_newline(mut text: String, original: &str) -> String {
     if !original.is_empty() && !original.ends_with('\n') && text.ends_with('\n') {
         text.pop();
+        if text.ends_with('\r') {
+            text.pop();
+        }
     }
     text
 }
 
 /// 블록이 있으면 교체하고, 없으면 빈 줄 하나를 두고 끝에 덧붙인다. (FR-INS-7)
 pub fn upsert_block(text: &str, block: &str) -> Result<String, InstallError> {
-    let block = block.to_string();
-    let lines: Vec<&str> = text.lines().collect();
+    let lines = split_lines(text);
+    let eol = line_ending(text);
+    let block_lines: Vec<String> = block.lines().map(|l| format!("{l}{eol}")).collect();
     match block_range(&lines)? {
         Some((begin, end)) => {
-            let block_lines: Vec<&str> = block.lines().collect();
             let next: Vec<&str> = lines[..begin]
                 .iter()
-                .chain(block_lines.iter())
-                .chain(lines[end + 1..].iter())
                 .copied()
+                .chain(block_lines.iter().map(String::as_str))
+                .chain(lines[end + 1..].iter().copied())
                 .collect();
-            Ok(keep_final_newline(join_lines(&next), text))
+            Ok(keep_final_newline(join_lines(&next, eol), text))
         }
-        None if text.trim().is_empty() => Ok(block),
-        None => Ok(keep_final_newline(
-            format!("{}\n{block}", join_lines(&lines)),
-            text,
-        )),
+        None if text.trim().is_empty() => Ok(block.to_string()),
+        None => {
+            let next: Vec<&str> = lines
+                .iter()
+                .copied()
+                .chain([eol])
+                .chain(block_lines.iter().map(String::as_str))
+                .collect();
+            Ok(keep_final_newline(join_lines(&next, eol), text))
+        }
     }
 }
 
 /// 블록만 지운다. 블록 앞에 덧붙일 때 둔 빈 줄도 함께 지운다. (FR-INS-7)
 pub fn remove_block(text: &str) -> Result<String, InstallError> {
-    let lines: Vec<&str> = text.lines().collect();
+    let lines = split_lines(text);
     let Some((begin, end)) = block_range(&lines)? else {
         return Ok(text.to_string());
     };
@@ -174,7 +203,10 @@ pub fn remove_block(text: &str) -> Result<String, InstallError> {
     if begin > 0 && next[begin - 1].trim().is_empty() && after_blank {
         next.remove(begin - 1);
     }
-    Ok(keep_final_newline(join_lines(&next), text))
+    Ok(keep_final_newline(
+        join_lines(&next, line_ending(text)),
+        text,
+    ))
 }
 
 /// 메모리 파일에 안내 블록을 넣거나(`Some`) 지운다(`None`). 공백만 남으면 파일을 지운다. (FR-INS-7)

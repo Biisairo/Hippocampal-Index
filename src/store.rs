@@ -267,6 +267,7 @@ const FILE_MODE: u32 = 0o600;
 const UNKNOWN_BG_TOOL: &str = "background";
 const MIN_FTS_TOKEN_CHARS: usize = 3;
 const SUMMARY_CHARS: usize = 80;
+const TRUNCATION_MARK: char = '…';
 
 #[derive(Serialize, Deserialize)]
 struct ToolCallRow {
@@ -1323,14 +1324,15 @@ fn filter_matches(filter: &str) -> Option<(&'static str, String)> {
     })
 }
 
-/// 공백을 한 칸으로 줄이고 `SUMMARY_CHARS`자로 자른다. (FR-GUI-13)
+/// 공백을 한 칸으로 줄이고 `SUMMARY_CHARS`자로 자른다. 잘렸으면 `…`를 붙인다. (FR-GUI-13)
 fn summary_line(text: &str) -> String {
-    text.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(SUMMARY_CHARS)
-        .collect()
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() <= SUMMARY_CHARS {
+        return line;
+    }
+    let mut cut: String = line.chars().take(SUMMARY_CHARS).collect();
+    cut.push(TRUNCATION_MARK);
+    cut
 }
 
 fn kind_str(kind: BackgroundKind) -> &'static str {

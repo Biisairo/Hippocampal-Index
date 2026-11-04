@@ -1253,7 +1253,9 @@ fn session_page_is_newest_first_with_counts_and_paging() {
         "공백을 한 칸으로: {}",
         sa.first_prompt
     );
-    assert_eq!(sa.first_prompt.chars().count(), 80);
+    assert_eq!(sa.first_prompt.chars().count(), 81, "80자와 잘림 표시");
+    assert!(sa.first_prompt.ends_with('…'), "{}", sa.first_prompt);
+    assert_eq!(page.items[0].first_prompt, "sc 질문", "짧으면 표시 없음");
     let second = store.session_page("", 1, 1).unwrap();
     assert_eq!(second.total, 3);
     assert_eq!(session_ids(&second.items), vec!["sb"]);
@@ -1287,6 +1289,7 @@ fn turn_page_is_oldest_first_with_embedding_state() {
     assert_eq!(first.iterations, 2);
     assert_eq!(first.pending, 3, "반복 2개와 연결 결과 1개");
     assert!(first.prompt.starts_with("첫 질문"));
+    assert!(first.prompt.ends_with('…'), "{}", first.prompt);
     assert_eq!(page.items[1].prompt, "두 번째 턴 xy");
     let jobs = store.embed_jobs(100).unwrap();
     store.complete_embed_jobs(&jobs).unwrap();

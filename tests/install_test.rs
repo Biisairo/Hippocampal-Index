@@ -352,6 +352,36 @@ fn install_then_remove_keeps_a_file_without_final_newline_byte_identical() {
 }
 
 #[test]
+fn install_then_remove_keeps_crlf_and_mixed_line_endings_byte_identical() {
+    let block = guide_block(Path::new(EXE));
+    for original in [
+        "# Mine\r\nkeep this\r\n",
+        "# Mine\r\nlast line",
+        "# Mine\r\nlf line\nlast\r\n",
+        "# Mine\r\n\r\n",
+    ] {
+        let installed = upsert_block(original, &block).unwrap();
+        assert!(
+            installed.starts_with("# Mine\r\n"),
+            "기존 줄 끝 유지: {original:?}"
+        );
+        assert!(
+            installed.contains(&format!("{GUIDE_BEGIN}\r\n")),
+            "새 줄은 첫 줄의 줄 끝: {original:?}"
+        );
+        assert_eq!(
+            upsert_block(&installed, &block).unwrap(),
+            installed,
+            "다시 넣어도 같음: {original:?}"
+        );
+        assert_eq!(remove_block(&installed).unwrap(), original);
+    }
+    let crlf_block = block.replace('\n', "\r\n");
+    let middle = format!("top\r\n\r\n{crlf_block}bottom\r\n");
+    assert_eq!(remove_block(&middle).unwrap(), "top\r\n\r\nbottom\r\n");
+}
+
+#[test]
 fn block_is_appended_replaced_and_removed_without_touching_other_text() {
     let original = "# Mine\nkeep this\n";
     let installed = upsert_block(original, &guide_block(Path::new(EXE))).unwrap();
