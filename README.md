@@ -52,7 +52,7 @@ On every prompt, it finds related turns in other sessions of the same project an
 
 ## Quick start
 
-1. Install Ollama and pull the embedding model: `brew install ollama && ollama pull qwen3-embedding:0.6b`
+1. Install Ollama, start it as a service, and pull the embedding model: `brew install ollama && brew services start ollama && ollama pull qwen3-embedding:0.6b`
 2. Download the app from [Releases](https://github.com/Biisairo/Hippocampal-Index/releases) and open it.
 3. In the app's **Claude setup** tab, press **Preview**, then **Apply**.
 4. Start a new Claude Code session.

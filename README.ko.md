@@ -52,7 +52,7 @@ Claude Code hook이 agentic loop의 반복이 끝날 때마다 데몬에 알립�
 
 ## 빠른 시작
 
-1. Ollama를 설치하고 임베딩 모델을 받습니다: `brew install ollama && ollama pull qwen3-embedding:0.6b`
+1. Ollama를 설치해 서비스로 띄우고 임베딩 모델을 받습니다: `brew install ollama && brew services start ollama && ollama pull qwen3-embedding:0.6b`
 2. [Releases](https://github.com/Biisairo/Hippocampal-Index/releases)에서 앱을 받아 엽니다.
 3. 앱 창의 **Claude 적용** 탭에서 **미리 보기**를 누른 뒤 **적용**을 누릅니다.
 4. Claude Code 세션을 새로 시작합니다.
