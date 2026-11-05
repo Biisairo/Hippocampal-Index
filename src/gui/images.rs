@@ -60,3 +60,52 @@ pub fn readme_text(markdown: &str) -> String {
     }
     out
 }
+
+/// README의 상대 링크를 바꿀 저장소 주소. (FR-GUI-11)
+pub const REPO_BLOB_URL: &str = "https://github.com/Biisairo/Hippocampal-Index/blob/main/";
+const FENCE: &str = "```";
+const KEPT_LINK_PREFIXES: [&str; 4] = ["http://", "https://", "mailto:", "#"];
+
+/// 마크다운으로 보여 줄 README. 이미지를 빼고, 상대 링크를 저장소 주소로 바꾼다.
+/// 코드 블록과 코드 글자(`` ` ``) 안은 바꾸지 않는다. (FR-GUI-11)
+pub fn readme_markdown(markdown: &str) -> String {
+    let mut out = String::new();
+    let mut fenced = false;
+    for line in readme_text(markdown).lines() {
+        if line.trim_start().starts_with(FENCE) {
+            fenced = !fenced;
+            out.push_str(line);
+        } else if fenced {
+            out.push_str(line);
+        } else {
+            for (i, part) in line.split('`').enumerate() {
+                if i > 0 {
+                    out.push('`');
+                }
+                if i % 2 == 0 {
+                    out.push_str(&absolute_links(part));
+                } else {
+                    out.push_str(part);
+                }
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// `](대상)`의 대상이 상대 경로이면 앞에 저장소 주소를 붙인다.
+fn absolute_links(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("](") {
+        let (head, tail) = rest.split_at(at + 2);
+        out.push_str(head);
+        if !KEPT_LINK_PREFIXES.iter().any(|p| tail.starts_with(p)) {
+            out.push_str(REPO_BLOB_URL);
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
+}

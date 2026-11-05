@@ -55,6 +55,7 @@ transcripts_dir = "/t"
 [ui]
 language = "ko"
 theme = "dark"
+start_tab = "search"
 [[redact.patterns]]
 kind = "k"
 pattern = 'P-\d+'
@@ -89,10 +90,10 @@ fn fields_read_every_key_and_save_round_trips() {
     let all = Config::parse(ALL_KEYS).unwrap();
     let defaults = fields(&Config::default());
     let set = fields(&all);
-    assert_eq!(set.len(), 36);
+    assert_eq!(set.len(), 37);
     assert_eq!(
         changed(&defaults, &set).len(),
-        36,
+        37,
         "모든 키가 설정값을 읽음"
     );
     let d = dir();
@@ -244,6 +245,12 @@ fn restart_and_reindex_needs_follow_changed_keys() {
         (needs_restart(&theme), needs_reindex(&theme)),
         (false, false),
         "테마는 GUI만 쓴다"
+    );
+    let start = one("ui", "start_tab", FieldValue::Text("last".into()));
+    assert_eq!(
+        (needs_restart(&start), needs_reindex(&start)),
+        (false, false),
+        "시작 탭은 GUI만 쓴다"
     );
     let threshold = one("inject", "threshold", FieldValue::Float(0.5));
     assert_eq!(

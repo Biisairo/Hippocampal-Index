@@ -16,7 +16,7 @@ use crate::commands::{
     run_uninstall, scope_arg, stop_services,
 };
 use crate::config::PatternEntry;
-use crate::config::{Config, Paths, Theme};
+use crate::config::{Config, Paths, StartTab, Theme};
 use crate::config_edit::{
     CAPTURE_ENABLED, Field, FieldValue, INJECT_ENABLED, SaveOutcome, changed, fields,
     needs_reindex, needs_restart, save,
@@ -25,8 +25,9 @@ use crate::gui::images;
 use crate::gui::picker::{pick_folder, start_folder};
 use crate::gui::state::{
     DeleteTarget, ImportForm, ImportProgress, InstallAction, InstallForm, PollGate, PreviewKey,
-    RecordsView, Reload, Toast, Toasts, default_project, embed_state, page_count, purge_may_start,
-    queue_summary, resolve_import_args, run_import, should_poll, skip_label, verdict_label,
+    RecordsView, Reload, Tab, Toast, Toasts, default_project, embed_state, initial_tab, page_count,
+    preview_scope_ok, purge_may_start, queue_summary, read_last_tab, resolve_import_args,
+    run_import, should_poll, skip_label, verdict_label, write_last_tab,
 };
 use crate::gui::text::describe;
 use crate::gui::theme;
@@ -164,30 +165,7 @@ impl<T: Send + 'static> Task<T> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Tab {
-    Status,
-    Records,
-    Settings,
-    Import,
-    Search,
-    Projects,
-    Install,
-    About,
-}
-
 impl Tab {
-    const ALL: [Tab; 8] = [
-        Tab::Status,
-        Tab::Records,
-        Tab::Settings,
-        Tab::Import,
-        Tab::Search,
-        Tab::Projects,
-        Tab::Install,
-        Tab::About,
-    ];
-
     fn label(self, lang: Lang) -> String {
         match self {
             Tab::Status => tr!(lang, "Status", "상태"),
@@ -240,6 +218,10 @@ struct Search {
     output: String,
     /// 구조화 검색 결과와 안내. 있으면 `output` 대신 보여 준다. (FR-GUI-17)
     hits: Option<(Vec<HitView>, Vec<String>)>,
+    /// 주입 미리 보기 모드. (FR-GUI-9)
+    preview_mode: bool,
+    /// 주입 미리 보기 결과와 걸린 시간. 있으면 `output` 대신 보여 준다. (FR-GUI-9)
+    preview: Option<(InjectionPlan, u64)>,
     task: Task<Reply>,
 }
 
@@ -519,6 +501,9 @@ pub struct App {
     art: Art,
     readme_en: String,
     readme_ko: String,
+    markdown: egui_commonmark::CommonMarkCache,
+    /// 마지막으로 기록한 탭. 보이는 탭과 다르면 다시 기록한다. (FR-GUI-25)
+    recorded_tab: Tab,
 }
 
 impl App {
@@ -533,9 +518,11 @@ impl App {
         ctx.set_visuals_of(egui::Theme::Light, theme::visuals(false));
         ctx.set_visuals_of(egui::Theme::Dark, theme::visuals(true));
         ctx.set_theme(theme::preference(ui_config.theme));
+        let tab = initial_tab(ui_config.start_tab, read_last_tab(&paths.gui_last_tab()));
         Self {
             lang,
-            tab: Tab::Status,
+            tab,
+            recorded_tab: tab,
             status: None,
             status_at: String::new(),
             status_task: Task::default(),
@@ -560,6 +547,8 @@ impl App {
                 with_results: false,
                 output: String::new(),
                 hits: None,
+                preview_mode: false,
+                preview: None,
                 task: Task::default(),
             },
             records: Records::default(),
@@ -592,8 +581,9 @@ impl App {
             picker: Task::default(),
             about_license: false,
             art: Art::load(ctx),
-            readme_en: images::readme_text(README_EN),
-            readme_ko: images::readme_text(README_KO),
+            readme_en: images::readme_markdown(README_EN),
+            readme_ko: images::readme_markdown(README_KO),
+            markdown: egui_commonmark::CommonMarkCache::default(),
             paths,
             cwd,
         }
@@ -1211,15 +1201,15 @@ impl App {
             lang,
         };
         if let Some(reply) = s.task.poll() {
+            s.hits = None;
+            s.preview = None;
+            s.output.clear();
             match reply {
-                Ok(Response::Hits { hits, notes }) => {
-                    s.hits = Some((hits, notes));
-                    s.output.clear();
+                Ok(Response::Hits { hits, notes }) => s.hits = Some((hits, notes)),
+                Ok(Response::InjectPreview { plan, elapsed_ms }) => {
+                    s.preview = Some((plan, elapsed_ms));
                 }
-                other => {
-                    s.hits = None;
-                    s.output = text_of(other);
-                }
+                other => s.output = text_of(other),
             }
         }
         let mut search_clicked = false;
@@ -1244,32 +1234,53 @@ impl App {
                     );
                     ui.end_row();
                     ui.label(tr!(lang, "Kind / limit", "종류 / 개수"));
-                    ui.horizontal(|ui| {
-                        egui::ComboBox::from_id_salt("kind")
-                            .selected_text(kind_name(s.kind))
-                            .show_ui(ui, |ui| {
-                                for kind in
-                                    [SearchKind::Iteration, SearchKind::Result, SearchKind::Both]
-                                {
-                                    ui.selectable_value(&mut s.kind, kind, kind_name(kind));
-                                }
-                            });
-                        ui.add(egui::DragValue::new(&mut s.limit).range(1..=100));
+                    ui.add_enabled_ui(!s.preview_mode, |ui| {
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_salt("kind")
+                                .selected_text(kind_name(s.kind))
+                                .show_ui(ui, |ui| {
+                                    for kind in [
+                                        SearchKind::Iteration,
+                                        SearchKind::Result,
+                                        SearchKind::Both,
+                                    ] {
+                                        ui.selectable_value(&mut s.kind, kind, kind_name(kind));
+                                    }
+                                });
+                            ui.add(egui::DragValue::new(&mut s.limit).range(1..=100));
+                        });
                     });
                     ui.end_row();
                 });
                 ui.add_space(4.0);
+                let scope_ok = !s.preview_mode || preview_scope_ok(&s.scope);
                 ui.horizontal(|ui| {
+                    ui.radio_value(&mut s.preview_mode, false, tr!(lang, "Search", "검색"));
+                    ui.radio_value(
+                        &mut s.preview_mode,
+                        true,
+                        tr!(lang, "Injection preview", "주입 미리 보기"),
+                    );
                     if primary(
                         ui,
-                        !s.task.running && !s.query.trim().is_empty(),
-                        tr!(lang, "Search", "검색"),
+                        !s.task.running && !s.query.trim().is_empty() && scope_ok,
+                        tr!(lang, "Run", "실행"),
                     )
                     .clicked()
                     {
                         search_clicked = true;
                     }
                 });
+                if !scope_ok {
+                    ui.colored_label(
+                        warn_color(ui),
+                        tr!(
+                            lang,
+                            "Injection works inside one project. Set the scope to project or a path.",
+                            "주입은 프로젝트 하나 안에서만 합니다. 범위를 project나 경로로 두십시오."
+                        ),
+                    );
+                }
             });
             card(&mut cols[1], &tr!(lang, "Show a turn", "턴 보기"), |ui| {
                 let hint = tr!(lang, "empty | project | <path>", "비움 | project | <경로>");
@@ -1308,7 +1319,18 @@ impl App {
                 });
             });
         });
-        if search_clicked && !s.task.running && !s.query.trim().is_empty() {
+        if search_clicked && s.preview_mode {
+            if !s.task.running && !s.query.trim().is_empty() && preview_scope_ok(&s.scope) {
+                let req = Request::InjectPreview {
+                    scope: scope_arg(&self.cwd, s.scope.trim()),
+                    cwd: self.cwd.clone(),
+                    prompt: s.query.clone(),
+                };
+                let paths = self.paths.clone();
+                s.task
+                    .start(&ctx, move || query(&paths, &req, QUERY_TIMEOUT));
+            }
+        } else if search_clicked && !s.task.running && !s.query.trim().is_empty() {
             let req = Request::Search {
                 query: s.query.clone(),
                 kind: s.kind,
@@ -1341,8 +1363,8 @@ impl App {
             }
         });
         let mut open = None;
-        match &s.hits {
-            Some((hits, notes)) => {
+        match (&s.hits, &s.preview) {
+            (Some((hits, notes)), _) => {
                 egui::ScrollArea::vertical()
                     .id_salt("search-hits")
                     .auto_shrink([false, false])
@@ -1350,7 +1372,13 @@ impl App {
                         open = hit_rows(ui, hits, notes, true, lang);
                     });
             }
-            None => output(
+            (None, Some((plan, elapsed_ms))) => {
+                egui::ScrollArea::vertical()
+                    .id_salt("search-preview")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| preview_view(ui, plan, *elapsed_ms, lang));
+            }
+            (None, None) => output(
                 ui,
                 "search-output",
                 &s.output,
@@ -2236,12 +2264,31 @@ impl App {
             ui.selectable_value(&mut self.about_license, false, "README");
             ui.selectable_value(&mut self.about_license, true, "LICENSE");
         });
-        let text = match (self.about_license, lang) {
-            (true, _) => LICENSE,
-            (false, Lang::En) => self.readme_en.as_str(),
-            (false, Lang::Ko) => self.readme_ko.as_str(),
+        if self.about_license {
+            output(ui, "about-text", LICENSE, "");
+            return;
+        }
+        let readme = match lang {
+            Lang::En => self.readme_en.as_str(),
+            Lang::Ko => self.readme_ko.as_str(),
         };
-        output(ui, "about-text", text, "");
+        egui::ScrollArea::vertical()
+            .id_salt("about-readme")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui_commonmark::CommonMarkViewer::new().show(ui, &mut self.markdown, readme);
+            });
+    }
+
+    /// 보이는 탭이 바뀌었으면 화면 스레드 밖에서 기록한다. (FR-GUI-25)
+    fn record_tab(&mut self) {
+        if self.tab == self.recorded_tab {
+            return;
+        }
+        self.recorded_tab = self.tab;
+        let file = self.paths.gui_last_tab();
+        let tab = self.tab;
+        thread::spawn(move || write_last_tab(&file, tab));
     }
 }
 
@@ -2256,6 +2303,7 @@ impl eframe::App for App {
         if self.state.is_some() && !ready && !matches!(self.tab, Tab::Install | Tab::About) {
             self.tab = Tab::Install;
         }
+        self.record_tab();
         egui::Panel::top("tabs")
             .frame(
                 egui::Frame::side_top_panel(ui.style())
@@ -2786,6 +2834,7 @@ fn field_editor(ui: &mut egui::Ui, field: &mut Field, lang: Lang, browse: &mut B
     let is_path = (field.section, field.key) == ("import", "transcripts_dir");
     let is_language = (field.section, field.key) == ("ui", "language");
     let is_theme = (field.section, field.key) == ("ui", "theme");
+    let is_start_tab = (field.section, field.key) == ("ui", "start_tab");
     let is_multiline = (field.section, field.key) == ("embedder", "query_prefix");
     match &mut field.value {
         FieldValue::Bool(b) => {
@@ -2820,6 +2869,16 @@ fn field_editor(ui: &mut egui::Ui, field: &mut Field, lang: Lang, browse: &mut B
                 .show_ui(ui, |ui| {
                     for theme in Theme::ALL {
                         ui.selectable_value(s, theme.as_str().to_string(), theme.as_str());
+                    }
+                });
+        }
+        FieldValue::Text(s) if is_start_tab => {
+            egui::ComboBox::from_id_salt("start_tab")
+                .selected_text(s.clone())
+                .width(NUMBER_WIDTH)
+                .show_ui(ui, |ui| {
+                    for tab in StartTab::ALL {
+                        ui.selectable_value(s, tab.as_str().to_string(), tab.as_str());
                     }
                 });
         }

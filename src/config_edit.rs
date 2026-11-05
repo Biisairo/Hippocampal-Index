@@ -13,8 +13,9 @@ use crate::fsutil::ensure_private_dir;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const LANGUAGE: (&str, &str) = ("ui", "language");
 const THEME: (&str, &str) = ("ui", "theme");
+const START_TAB: (&str, &str) = ("ui", "start_tab");
 /// hook이 매번 읽는 키. 바꿔도 데몬을 다시 시작할 필요가 없다. (FR-GUI-6)
-const NO_RESTART: &[(&str, &str)] = &[LANGUAGE, THEME, INJECT_ENABLED, CAPTURE_ENABLED];
+const NO_RESTART: &[(&str, &str)] = &[LANGUAGE, THEME, START_TAB, INJECT_ENABLED, CAPTURE_ENABLED];
 pub const INJECT_ENABLED: (&str, &str) = ("inject", "enabled");
 pub const CAPTURE_ENABLED: (&str, &str) = ("capture", "enabled");
 const REINDEX_EMBEDDER_KEYS: &[&str] = &["backend", "model", "dimension", "max_input_tokens"];
@@ -144,6 +145,7 @@ pub fn fields(c: &Config) -> Vec<Field> {
         ),
         ("ui", "language", text(lang)),
         ("ui", "theme", text(c.ui.theme.as_str())),
+        ("ui", "start_tab", text(c.ui.start_tab.as_str())),
         (
             "redact",
             "patterns",

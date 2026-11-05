@@ -559,7 +559,10 @@ fn texts(toasts: &Toasts) -> Vec<&str> {
 
 // ---- FR-GUI-11, FR-GUI-20 ----
 
-use hippo::gui::images::{CHARACTER, ICON, ICON_SMALL, LOGO, LOGO_DARK, decode_png, readme_text};
+use hippo::gui::images::{
+    CHARACTER, ICON, ICON_SMALL, LOGO, LOGO_DARK, REPO_BLOB_URL, decode_png, readme_markdown,
+    readme_text,
+};
 
 #[test]
 fn embedded_images_decode_with_expected_sizes() {
@@ -732,4 +735,111 @@ fn queue_summary_adds_live_import_and_rates() {
             per_min: None,
         }
     );
+}
+
+#[test]
+fn readme_markdown_points_relative_links_at_github_only() {
+    let md = "<p align=\"center\"><img src=\"a.png\"></p>\n\
+[Start](docs/ko/getting-started.md) and [web](https://x.dev/a) and [top](#usage)\n\
+[mail](mailto:a@b.c) [lic](LICENSE)\n\
+`[code](docs/x.md)` then [real](docs/y.md)\n\
+```\n[fenced](docs/z.md)\n```\n";
+    let base = REPO_BLOB_URL;
+    assert_eq!(
+        readme_markdown(md),
+        format!(
+            "[Start]({base}docs/ko/getting-started.md) and [web](https://x.dev/a) and [top](#usage)\n\
+[mail](mailto:a@b.c) [lic]({base}LICENSE)\n\
+`[code](docs/x.md)` then [real]({base}docs/y.md)\n\
+```\n[fenced](docs/z.md)\n```\n"
+        )
+    );
+    assert_eq!(
+        REPO_BLOB_URL,
+        "https://github.com/Biisairo/Hippocampal-Index/blob/main/"
+    );
+}
+
+// ---- FR-UI-4, FR-GUI-1, FR-GUI-25 ----
+
+use hippo::config::StartTab;
+use hippo::gui::state::{Tab, initial_tab, read_last_tab, write_last_tab};
+
+#[test]
+fn tabs_follow_the_required_order_and_keys_round_trip() {
+    assert_eq!(
+        Tab::ALL,
+        [
+            Tab::About,
+            Tab::Status,
+            Tab::Records,
+            Tab::Projects,
+            Tab::Search,
+            Tab::Import,
+            Tab::Install,
+            Tab::Settings,
+        ]
+    );
+    for tab in Tab::ALL {
+        assert_eq!(Tab::from_key(tab.key()), Some(tab));
+    }
+    assert_eq!(Tab::Install.key(), "claude_setup");
+    assert_eq!(Tab::from_key("last"), None);
+    assert_eq!(Tab::from_key(""), None);
+}
+
+#[test]
+fn initial_tab_uses_setting_or_last_recorded_tab() {
+    assert_eq!(initial_tab(StartTab::About, Some(Tab::Search)), Tab::About);
+    assert_eq!(initial_tab(StartTab::Records, None), Tab::Records);
+    assert_eq!(initial_tab(StartTab::ClaudeSetup, None), Tab::Install);
+    assert_eq!(initial_tab(StartTab::Settings, None), Tab::Settings);
+    assert_eq!(initial_tab(StartTab::Last, Some(Tab::Import)), Tab::Import);
+    assert_eq!(
+        initial_tab(StartTab::Last, None),
+        Tab::About,
+        "기록이 없으면 정보"
+    );
+}
+
+#[test]
+fn last_tab_record_round_trips_and_skips_missing_root() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let file = d.path().join("gui-last-tab");
+    assert_eq!(read_last_tab(&file), None, "파일이 없으면 None");
+
+    write_last_tab(&file, Tab::Projects);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "projects\n");
+    assert_eq!(read_last_tab(&file), Some(Tab::Projects));
+    let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+
+    write_last_tab(&file, Tab::Install);
+    assert_eq!(read_last_tab(&file), Some(Tab::Install));
+
+    std::fs::write(&file, "garbage\n").unwrap();
+    assert_eq!(read_last_tab(&file), None, "해석할 수 없으면 None");
+
+    let missing = d.path().join("no-root").join("gui-last-tab");
+    write_last_tab(&missing, Tab::Status);
+    assert!(
+        !missing.parent().unwrap().exists(),
+        "데이터 루트를 만들지 않는다"
+    );
+}
+
+// ---- FR-GUI-9 ----
+
+use hippo::gui::state::preview_scope_ok;
+
+#[test]
+fn search_tab_injection_preview_needs_a_single_project_scope() {
+    assert!(preview_scope_ok("project"));
+    assert!(preview_scope_ok(" ~/work/app "));
+    assert!(preview_scope_ok("/abs/path"));
+    assert!(!preview_scope_ok("all"));
+    assert!(!preview_scope_ok(" all "));
+    assert!(!preview_scope_ok(""));
+    assert!(!preview_scope_ok("   "));
 }

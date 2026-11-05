@@ -1,11 +1,14 @@
-//! 화면과 분리한 GUI 상태 로직. (FR-GUI-7, FR-GUI-8, FR-GUI-10, FR-GUI-13~17)
+//! 화면과 분리한 GUI 상태 로직. (FR-GUI-1, FR-GUI-7~10, FR-GUI-13~17, FR-GUI-25)
 
+use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::commands::{ImportTally, absolute, session_line};
+use crate::commands::{ImportTally, SCOPE_ALL, absolute, session_line};
+use crate::config::StartTab;
+use crate::fsutil::set_private_file;
 use crate::i18n::Lang;
 use crate::import::{Candidate, ImportStatus};
 use crate::protocol::{Request, Response, Scope, StatusInfo};
@@ -13,6 +16,87 @@ use crate::registry::is_project_id;
 use crate::search::{SkipReason, Verdict};
 use crate::store::ForgetTarget;
 use crate::tr;
+
+/// GUI 탭. `ALL`이 탭 막대의 순서이다. (FR-GUI-1)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    About,
+    Status,
+    Records,
+    Projects,
+    Search,
+    Import,
+    Install,
+    Settings,
+}
+
+impl Tab {
+    pub const ALL: [Tab; 8] = [
+        Tab::About,
+        Tab::Status,
+        Tab::Records,
+        Tab::Projects,
+        Tab::Search,
+        Tab::Import,
+        Tab::Install,
+        Tab::Settings,
+    ];
+
+    /// `[ui] start_tab`과 마지막 탭 기록에 쓰는 이름. (FR-UI-4, FR-GUI-25)
+    pub fn key(self) -> &'static str {
+        match self {
+            Tab::About => StartTab::About.as_str(),
+            Tab::Status => StartTab::Status.as_str(),
+            Tab::Records => StartTab::Records.as_str(),
+            Tab::Projects => StartTab::Projects.as_str(),
+            Tab::Search => StartTab::Search.as_str(),
+            Tab::Import => StartTab::Import.as_str(),
+            Tab::Install => StartTab::ClaudeSetup.as_str(),
+            Tab::Settings => StartTab::Settings.as_str(),
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Tab> {
+        Tab::ALL.into_iter().find(|t| t.key() == key)
+    }
+}
+
+/// 창을 열 때의 탭. `last`이면 기록한 탭, 기록이 없으면 정보 탭이다. (FR-UI-4)
+pub fn initial_tab(start: StartTab, last: Option<Tab>) -> Tab {
+    match start {
+        StartTab::About => Tab::About,
+        StartTab::Status => Tab::Status,
+        StartTab::Records => Tab::Records,
+        StartTab::Projects => Tab::Projects,
+        StartTab::Search => Tab::Search,
+        StartTab::Import => Tab::Import,
+        StartTab::ClaudeSetup => Tab::Install,
+        StartTab::Settings => Tab::Settings,
+        StartTab::Last => last.unwrap_or(Tab::About),
+    }
+}
+
+/// 마지막 탭 기록을 읽는다. 없거나 해석할 수 없으면 `None`. (FR-GUI-25)
+pub fn read_last_tab(file: &Path) -> Option<Tab> {
+    let text = fs::read_to_string(file).ok()?;
+    Tab::from_key(text.trim())
+}
+
+/// 마지막 탭을 기록한다. 데이터 루트가 없으면 만들지 않고, 실패는 무시한다. (FR-GUI-25)
+pub fn write_last_tab(file: &Path, tab: Tab) {
+    if !file.parent().is_some_and(Path::is_dir) {
+        return;
+    }
+    if fs::write(file, format!("{}\n", tab.key())).is_ok() {
+        let _ = set_private_file(file);
+    }
+}
+
+/// 검색 탭의 주입 미리 보기를 할 수 있는 범위인지. 프로젝트 하나여야 한다. (FR-GUI-9)
+pub fn preview_scope_ok(scope: &str) -> bool {
+    let scope = scope.trim();
+    !scope.is_empty() && scope != SCOPE_ALL
+}
 
 /// 가져오기 탭의 입력과 미리 보기 결과. (FR-GUI-7)
 #[derive(Debug, Clone, Default)]

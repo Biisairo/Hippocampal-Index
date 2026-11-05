@@ -1,4 +1,4 @@
-//! 설정 키 설명. README 5장과 같은 내용이다. (FR-GUI-4)
+//! 설정 키 설명. docs/<언어>/configuration.md와 같은 내용이다. (FR-GUI-4)
 
 use crate::i18n::Lang;
 
@@ -127,6 +127,10 @@ pub fn describe(section: &str, key: &str, lang: Lang) -> &'static str {
         ("ui", "theme") => (
             "GUI theme: system (follow macOS), light or dark",
             "GUI 테마: system(macOS 설정을 따름), light, dark",
+        ),
+        ("ui", "start_tab") => (
+            "Tab shown when the window opens. last: the tab you saw last",
+            "창을 열 때 보여 줄 탭. last는 마지막으로 본 탭",
         ),
         ("redact", "patterns") => (
             "Extra secret patterns (regular expressions)",

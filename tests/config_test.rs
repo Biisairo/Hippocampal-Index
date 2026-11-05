@@ -239,3 +239,29 @@ fn ui_theme_defaults_to_system_and_accepts_light_and_dark() {
     }
     assert!(Config::parse("[ui]\ntheme = \"blue\"\n").is_err());
 }
+
+#[test]
+fn ui_start_tab_defaults_to_about_and_accepts_every_tab_and_last() {
+    use hippo::config::StartTab;
+    assert_eq!(Config::default().ui.start_tab, StartTab::About);
+    for (text, tab) in [
+        ("about", StartTab::About),
+        ("status", StartTab::Status),
+        ("records", StartTab::Records),
+        ("projects", StartTab::Projects),
+        ("search", StartTab::Search),
+        ("import", StartTab::Import),
+        ("claude_setup", StartTab::ClaudeSetup),
+        ("settings", StartTab::Settings),
+        ("last", StartTab::Last),
+    ] {
+        let parsed = Config::parse(&format!("[ui]\nstart_tab = \"{text}\"\n"))
+            .unwrap()
+            .ui
+            .start_tab;
+        assert_eq!(parsed, tab);
+        assert_eq!(tab.as_str(), text);
+    }
+    assert_eq!(StartTab::ALL.len(), 9);
+    assert!(Config::parse("[ui]\nstart_tab = \"home\"\n").is_err());
+}

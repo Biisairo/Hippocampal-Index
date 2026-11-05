@@ -130,6 +130,53 @@ pub struct UiSection {
     pub language: Lang,
     /// GUI 테마. (FR-UI-3)
     pub theme: Theme,
+    /// GUI 창을 열 때의 탭. (FR-UI-4)
+    pub start_tab: StartTab,
+}
+
+/// GUI 창을 열 때 보여 줄 탭. `Last`는 마지막으로 본 탭이다. (FR-UI-4)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartTab {
+    #[default]
+    About,
+    Status,
+    Records,
+    Projects,
+    Search,
+    Import,
+    ClaudeSetup,
+    Settings,
+    Last,
+}
+
+impl StartTab {
+    pub const ALL: [StartTab; 9] = [
+        StartTab::About,
+        StartTab::Status,
+        StartTab::Records,
+        StartTab::Projects,
+        StartTab::Search,
+        StartTab::Import,
+        StartTab::ClaudeSetup,
+        StartTab::Settings,
+        StartTab::Last,
+    ];
+
+    /// 설정 파일에 쓰는 값.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StartTab::About => "about",
+            StartTab::Status => "status",
+            StartTab::Records => "records",
+            StartTab::Projects => "projects",
+            StartTab::Search => "search",
+            StartTab::Import => "import",
+            StartTab::ClaudeSetup => "claude_setup",
+            StartTab::Settings => "settings",
+            StartTab::Last => "last",
+        }
+    }
 }
 
 /// GUI 테마. `System`은 운영 체제의 라이트·다크 모드를 따른다. (FR-UI-3)
@@ -270,6 +317,10 @@ impl Paths {
     }
     pub fn config(&self) -> PathBuf {
         self.root.join("config.toml")
+    }
+    /// GUI가 마지막으로 본 탭. (FR-GUI-25)
+    pub fn gui_last_tab(&self) -> PathBuf {
+        self.root.join("gui-last-tab")
     }
     pub fn socket(&self) -> PathBuf {
         self.root.join("hippo.sock")
