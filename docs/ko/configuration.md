@@ -53,7 +53,7 @@ answer_tools = ["AskUserQuestion", "ExitPlanMode"]   # 결과(사용자의 답)�
 [inject]
 threshold = 0.50                   # 자동 주입의 최소 벡터 유사도
 top_k = 3                          # 주입할 턴 수
-total_chars = 12000                # 주입 전체 길이 한도. 넘는 턴은 자르지 않고 통째로 뺌
+total_chars = 8000                 # 주입 전체 길이 한도. 넘는 턴은 자르지 않고 통째로 뺌
 budget_ms = 800                    # UserPromptSubmit hook의 시간 예산
 cold_budget_ms = 2500              # hook이 데몬을 새로 띄울 때(콜드 시작)의 예산. budget_ms 이상
 min_prompt_chars = 11              # 앞뒤 공백을 뺀 길이가 이보다 짧은 프롬프트는 주입하지 않음

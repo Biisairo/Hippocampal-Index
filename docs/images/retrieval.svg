@@ -78,7 +78,7 @@
   <text class="note" x="518" y="496">· keep iterations with similarity ≥ 0.50</text>
   <text class="note" x="518" y="516">  (keyword-only hits are not injected)</text>
   <text class="note" x="518" y="536">· group them by turn (same prompt id)</text>
-  <text class="note" x="518" y="556">· up to 3 turns, at most 12,000 characters</text>
+  <text class="note" x="518" y="556">· up to 3 turns, at most 8,000 characters</text>
 
   <path d="M500 511 L464 511" stroke="#8E7CC3" stroke-width="2" marker-end="url(#arrow)"/>
 

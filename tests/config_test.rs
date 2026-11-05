@@ -22,7 +22,7 @@ fn defaults_match_srs() {
             c.inject.budget_ms,
             c.inject.cold_budget_ms
         ),
-        (0.50, 3, 12_000, 800, 2_500)
+        (0.50, 3, 8_000, 800, 2_500)
     );
     assert_eq!(c.inject.min_prompt_chars, 11);
     assert_eq!(

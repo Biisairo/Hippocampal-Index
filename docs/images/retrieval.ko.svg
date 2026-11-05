@@ -78,7 +78,7 @@
   <text class="note" x="518" y="496">· 유사도 0.50 이상인 반복만 남김</text>
   <text class="note" x="518" y="516">  (키워드로만 찾은 반복은 주입하지 않음)</text>
   <text class="note" x="518" y="536">· 턴(같은 prompt id)으로 묶음</text>
-  <text class="note" x="518" y="556">· 최대 3턴, 12,000자 이하</text>
+  <text class="note" x="518" y="556">· 최대 3턴, 8,000자 이하</text>
 
   <path d="M500 511 L464 511" stroke="#8E7CC3" stroke-width="2" marker-end="url(#arrow)"/>
 

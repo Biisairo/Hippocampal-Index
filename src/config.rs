@@ -401,7 +401,7 @@ impl Default for InjectSection {
         Self {
             threshold: 0.50,
             top_k: 3,
-            total_chars: 12_000,
+            total_chars: 8_000,
             budget_ms: 800,
             cold_budget_ms: 2_500,
             min_prompt_chars: 11,

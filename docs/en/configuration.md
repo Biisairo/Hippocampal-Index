@@ -54,7 +54,7 @@ answer_tools = ["AskUserQuestion", "ExitPlanMode"]   # tools whose result (the u
 [inject]
 threshold = 0.50                   # minimum vector similarity for automatic injection
 top_k = 3                          # number of turns to inject
-total_chars = 12000                # length limit of the whole injection; a turn over it is dropped whole, not cut
+total_chars = 8000                 # length limit of the whole injection; a turn over it is dropped whole, not cut
 budget_ms = 800                    # time budget of the UserPromptSubmit hook
 cold_budget_ms = 2500              # budget when the hook has to start the daemon (cold start); at least budget_ms
 min_prompt_chars = 11              # prompts shorter than this (without surrounding spaces) get no injection
