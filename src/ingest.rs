@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::bg::{BackgroundKind, TaskNotification, background_start, extract_agent_report};
 use crate::embed_text::build_embed_text;
 use crate::redact::Redactor;
-use crate::store::{Batch, NewCompletion, NewIteration, RecordStore, StoreError};
+use crate::store::{Batch, NewCompletion, NewIteration, RecordStore, Source, StoreError};
 use crate::transcript::{Event, Extractor, ExtractorState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,7 +34,16 @@ pub struct IngestRequest {
 pub struct IngestReport {
     pub iterations: usize,
     pub completions: usize,
+    /// 처리 전 안전 offset. 상태가 없던 세션이면 `None`. (FR-OBS-2)
+    pub offset_before: Option<u64>,
+    /// 처리 후 안전 offset. 처리하지 않았으면 `None`.
+    pub offset_after: Option<u64>,
+    /// 아무것도 처리하지 않은 사유.
+    pub skipped: Option<&'static str>,
 }
+
+/// 기준 턴을 찾지 못해 처리하지 않음. (FR-EXT-12, FR-OBS-2)
+pub const SKIP_NO_ANCHOR: &str = "no-anchor";
 
 /// 세션 하나를 가져온 결과. (FR-IMP-7)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +85,8 @@ enum Finish {
     Hook(HookEvent),
     /// 모든 도구 호출에 결과가 있는 반복만 확정한다. (FR-IMP-3)
     Complete,
+    /// 확정하지 않는다. 라인으로 완료된 반복만 저장한다. (FR-CAP-9)
+    Pending,
 }
 
 /// 저장할 반복과 완료 기록. fork 복사본으로 건너뛴 반복 수를 함께 센다.
@@ -96,6 +107,7 @@ pub fn ingest(
     let known = records
         .session_state(&req.session_id)?
         .filter(|s| s.safe_offset <= bytes.len() as u64);
+    let offset_before = known.as_ref().map(|s| s.safe_offset);
     let state = match known {
         Some(state) => state,
         None => {
@@ -104,7 +116,10 @@ pub fn ingest(
                 .as_deref()
                 .and_then(|p| prompt_start(&bytes, p))
             else {
-                return Ok(IngestReport::default());
+                return Ok(IngestReport {
+                    skipped: Some(SKIP_NO_ANCHOR),
+                    ..IngestReport::default()
+                });
             };
             ExtractorState {
                 safe_offset: anchor,
@@ -121,11 +136,56 @@ pub fn ingest(
         Finish::Hook(req.event),
     );
     let collected = collect(records, redactor, options, events, req, false)?;
+    let after = extractor.state();
     let report = IngestReport {
         iterations: collected.iterations.len(),
         completions: collected.completions.len(),
+        offset_before,
+        offset_after: Some(after.safe_offset),
+        skipped: None,
     };
-    save(records, req, collected, extractor.state(), false)?;
+    save(records, req, collected, after, Source::Live)?;
+    Ok(report)
+}
+
+/// 따라잡기. 상태가 있는 세션만 안전 offset 뒤를 읽고, 열린 반복은 확정하지 않는다. (FR-CAP-9)
+pub fn catch_up(
+    records: &mut RecordStore,
+    redactor: &Redactor,
+    options: &IngestOptions,
+    session_id: &str,
+    transcript_path: &Path,
+) -> Result<IngestReport, IngestError> {
+    let bytes = read_transcript(transcript_path)?;
+    let Some(state) = records
+        .session_state(session_id)?
+        .filter(|s| s.safe_offset < bytes.len() as u64)
+    else {
+        return Ok(IngestReport::default());
+    };
+    let req = IngestRequest {
+        event: HookEvent::Stop,
+        session_id: session_id.to_string(),
+        transcript_path: transcript_path.to_path_buf(),
+        prompt_id: None,
+    };
+    let mut extractor = Extractor::new(state.clone());
+    let events = read_events(
+        &mut extractor,
+        &bytes,
+        state.safe_offset as usize,
+        Finish::Pending,
+    );
+    let collected = collect(records, redactor, options, events, &req, false)?;
+    let after = extractor.state();
+    let report = IngestReport {
+        iterations: collected.iterations.len(),
+        completions: collected.completions.len(),
+        offset_before: Some(state.safe_offset),
+        offset_after: Some(after.safe_offset),
+        skipped: None,
+    };
+    save(records, &req, collected, after, Source::CatchUp)?;
     Ok(report)
 }
 
@@ -190,7 +250,7 @@ pub fn import_session(
         completions: collected.completions.len(),
         fork_skipped: collected.fork_skipped,
     };
-    save(records, &req, collected, state, true)?;
+    save(records, &req, collected, state, Source::Import)?;
     Ok(report)
 }
 
@@ -305,7 +365,7 @@ fn save(
     req: &IngestRequest,
     collected: Collected,
     state: ExtractorState,
-    bulk: bool,
+    source: Source,
 ) -> Result<(), IngestError> {
     records.apply(&Batch {
         session_id: req.session_id.clone(),
@@ -313,7 +373,8 @@ fn save(
         iterations: collected.iterations,
         completions: collected.completions,
         state,
-        bulk,
+        bulk: source == Source::Import,
+        source,
     })?;
     Ok(())
 }
@@ -356,6 +417,7 @@ fn read_events(
         Finish::Hook(HookEvent::Stop | HookEvent::StopFailure) => extractor.finish_turn(),
         Finish::Hook(HookEvent::SessionEnd) => extractor.finish_session(),
         Finish::Complete => extractor.finish_complete(),
+        Finish::Pending => Vec::new(),
     });
     events
 }

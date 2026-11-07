@@ -1643,6 +1643,7 @@ fn startup_queue_orders_jobs_across_projects_by_enqueue_time() {
                 completions: vec![],
                 state: hippo::transcript::ExtractorState::default(),
                 bulk: false,
+                source: hippo::store::Source::Live,
             })
             .unwrap();
         std::thread::sleep(Duration::from_millis(5));
@@ -1710,6 +1711,7 @@ fn startup_queue_embeds_bulk_jobs_after_normal_jobs() {
                 completions: vec![],
                 state: hippo::transcript::ExtractorState::default(),
                 bulk,
+                source: hippo::store::Source::Live,
             })
             .unwrap();
         std::thread::sleep(Duration::from_millis(5));
@@ -3064,5 +3066,243 @@ fn structured_search_returns_project_and_prompt_of_each_hit() {
     let all = hits(Scope::All);
     let projects: std::collections::HashSet<_> = all.iter().map(|h| h.project_id.clone()).collect();
     assert_eq!(projects.len(), 2, "all 범위는 두 프로젝트");
+    handle.shutdown();
+}
+
+// ---- 따라잡기 (FR-CAP-9) ----
+
+const TURN_END_LINE: &str = "{\"type\":\"system\",\"subtype\":\"turn_duration\"}\n";
+
+/// S2 fixture를 다른 세션으로 바꾼 사본. 반복 id가 겹치지 않도록 message id도 바꾼다.
+fn s2_as(session: &str, tag: &str) -> String {
+    read_fixture("s2_tools.jsonl")
+        .replace(S2, session)
+        .replace("msg_011Cgd", &format!("msg_{tag}11Cgd"))
+}
+
+fn ingest_as(paths: &Paths, session: &str, transcript: &Path) {
+    let req = Request::Ingest(IngestRequest {
+        event: HookEvent::Stop,
+        session_id: session.into(),
+        transcript_path: transcript.to_path_buf(),
+        prompt_id: Some(S2_PROMPT.into()),
+    });
+    assert!(matches!(
+        request(&paths.socket(), &req, TIMEOUT).unwrap(),
+        Response::Done
+    ));
+}
+
+fn set_mtime(path: &Path, age: Duration) {
+    let file = fs::File::options().write(true).open(path).unwrap();
+    file.set_modified(std::time::SystemTime::now() - age)
+        .unwrap();
+}
+
+#[test]
+fn catch_up_on_start_reads_settled_tails_only() {
+    let e = env();
+    let dir = e.transcript.parent().unwrap().to_path_buf();
+    let sessions = [
+        ("aaaaaaaa-0000-4000-8000-000000000001", "A"),
+        ("bbbbbbbb-0000-4000-8000-000000000002", "B"),
+        ("cccccccc-0000-4000-8000-000000000003", "C"),
+    ];
+    let full: Vec<String> = sessions.iter().map(|(s, t)| s2_as(s, t)).collect();
+    let paths: Vec<PathBuf> = sessions
+        .iter()
+        .map(|(s, _)| dir.join(format!("{s}.jsonl")))
+        .collect();
+    let head =
+        |content: &str| -> String { content.split_inclusive('\n').take(8).collect::<String>() };
+    fs::write(&paths[0], head(&full[0])).unwrap();
+    fs::write(&paths[1], head(&full[1])).unwrap();
+    fs::write(&paths[2], &full[2]).unwrap();
+
+    let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
+    for ((session, _), path) in sessions.iter().zip(&paths) {
+        ingest_as(&e.paths, session, path);
+    }
+    assert_eq!(totals(&status(&e.paths)).0, 4, "Stop이 마지막 줄 전에 읽음");
+    handle.shutdown();
+
+    fs::write(&paths[0], format!("{}{TURN_END_LINE}", full[0])).unwrap();
+    fs::write(&paths[1], format!("{}{TURN_END_LINE}", full[1])).unwrap();
+    fs::write(&paths[2], format!("{}{TURN_END_LINE}", full[2])).unwrap();
+    set_mtime(&paths[0], Duration::from_secs(60));
+    fs::remove_file(&paths[2]).unwrap();
+
+    let handle = relaunch(|| launch(&e.paths, Arc::new(MemoryVectorStore::default()))).unwrap();
+    wait_until(|| totals(&status(&e.paths)).0 == 5);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        totals(&status(&e.paths)).0,
+        5,
+        "수정된 지 5초가 지나지 않은 세션은 건너뜀"
+    );
+    let records = project_records(&e.paths);
+    assert_eq!(
+        records
+            .session_state(sessions[0].0)
+            .unwrap()
+            .unwrap()
+            .safe_offset,
+        fs::metadata(&paths[0]).unwrap().len()
+    );
+    let a = sessions[0].0;
+    let caught: Vec<String> = log_lines(&e.paths, "hippo.log")
+        .into_iter()
+        .filter(|l| l.starts_with("capture catch-up "))
+        .collect();
+    assert_eq!(caught.len(), 1, "{caught:?}");
+    assert!(caught[0].starts_with(&format!("capture catch-up session={a} ")));
+    assert!(caught[0].contains(" saved=1 completions=0 offset="));
+    assert_eq!(
+        records
+            .iteration(&format!("{a}:msg_A11CgdDWSCFzKY2UKTTKNZ8A"))
+            .unwrap()
+            .unwrap()
+            .source
+            .as_deref(),
+        Some("catch_up")
+    );
+    handle.shutdown();
+}
+
+// ---- 관찰 기록 (FR-OBS-2, FR-OBS-3, FR-OBS-5, FR-OBS-7) ----
+
+fn log_lines(paths: &Paths, name: &str) -> Vec<String> {
+    fs::read_to_string(paths.logs().join(name))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.get(20..).unwrap_or_default().to_string())
+        .collect()
+}
+
+#[test]
+fn capture_log_and_hook_log_lines() {
+    let e = env();
+    let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
+    let missing = Request::Ingest(IngestRequest {
+        event: HookEvent::PostToolBatch,
+        session_id: S2.into(),
+        transcript_path: e.transcript.clone(),
+        prompt_id: Some("no-such-prompt".into()),
+    });
+    request(&e.paths.socket(), &missing, TIMEOUT).unwrap();
+    let input = json!({"session_id": S2, "transcript_path": e.transcript, "cwd": s2_cwd(), "prompt_id": S2_PROMPT}).to_string();
+    hook_no_autostart(&e.paths, Duration::from_millis(800), "stop", &input);
+    let id = only_project(&e.paths);
+    let size = fs::metadata(&e.transcript).unwrap().len();
+    let daemon = log_lines(&e.paths, "hippo.log");
+    assert!(
+        daemon.contains(&format!(
+            "capture post-tool-batch session={S2} project={id} skipped=no-anchor"
+        )),
+        "{daemon:?}"
+    );
+    assert!(
+        daemon.contains(&format!(
+            "capture stop session={S2} project={id} saved=2 completions=0 offset=-->{size}"
+        )),
+        "{daemon:?}"
+    );
+    let hooks = log_lines(&e.paths, "hook.log");
+    assert!(
+        hooks.iter().any(
+            |l| l.starts_with(&format!("hook stop session={S2} delivered elapsed="))
+                && l.ends_with("ms")
+        ),
+        "{hooks:?}"
+    );
+    handle.shutdown();
+    hook_no_autostart(&e.paths, Duration::from_millis(100), "stop", &input);
+    hook_no_autostart(
+        &e.paths,
+        Duration::from_millis(100),
+        "user-prompt-submit",
+        &json!({"session_id": S2, "cwd": s2_cwd(), "prompt": "데몬이 없을 때의 주입 요청입니다"})
+            .to_string(),
+    );
+    let hooks = log_lines(&e.paths, "hook.log");
+    assert!(
+        hooks
+            .iter()
+            .any(|l| l.starts_with(&format!("hook stop session={S2} spooled "))),
+        "{hooks:?}"
+    );
+    assert!(
+        hooks
+            .iter()
+            .any(|l| l.starts_with(&format!("hook user-prompt-submit session={S2} no-daemon "))),
+        "{hooks:?}"
+    );
+}
+
+#[test]
+fn paused_hook_is_logged() {
+    let e = env();
+    let input = json!({"session_id": S2, "transcript_path": e.transcript}).to_string();
+    fs::create_dir_all(&e.paths.root).unwrap();
+    hippo::client::log_paused(&e.paths, "stop", &input);
+    let hooks = log_lines(&e.paths, "hook.log");
+    assert!(
+        hooks
+            .iter()
+            .any(|l| l.starts_with(&format!("hook stop session={S2} paused elapsed="))),
+        "{hooks:?}"
+    );
+}
+
+#[test]
+fn injections_are_recorded_and_counted_in_status() {
+    let e = env();
+    let handle = launch(&e.paths, Arc::new(MemoryVectorStore::default())).unwrap();
+    ingest(&e.paths, &e.transcript, HookEvent::Stop);
+    wait_until(|| totals(&status(&e.paths)).1 == 0);
+    let embed_text = project_records(&e.paths)
+        .iterations_for_prompt(S2_PROMPT)
+        .unwrap()[1]
+        .embed_text
+        .clone();
+    let ask = |session: &str, cwd: &str, prompt: &str| {
+        let input = json!({"session_id": session, "cwd": cwd, "prompt": prompt}).to_string();
+        hook_no_autostart(
+            &e.paths,
+            Duration::from_secs(5),
+            "user-prompt-submit",
+            &input,
+        )
+    };
+    assert!(ask("other", &s2_cwd(), &embed_text).is_some());
+    assert!(ask("other", &s2_cwd(), "짧음").is_none());
+    assert!(ask("other", "/nonexistent/hippo-no-project", &embed_text).is_none());
+
+    let st = status(&e.paths);
+    let inject = &st.projects[0].inject;
+    assert_eq!(
+        (inject.requests, inject.injected, inject.skipped),
+        (2, 1, 1)
+    );
+    assert_eq!(inject.skip_reasons, vec![("too_short".to_string(), 1)]);
+    assert!(
+        log_lines(&e.paths, "hippo.log").contains(&"inject session=other no-project".to_string())
+    );
+    let hooks = log_lines(&e.paths, "hook.log");
+    assert!(
+        hooks
+            .iter()
+            .any(|l| l.starts_with("hook user-prompt-submit session=other injected chars="))
+    );
+    assert!(
+        hooks
+            .iter()
+            .any(|l| l.starts_with("hook user-prompt-submit session=other no-context "))
+    );
+    let rendered = st.render(Lang::En);
+    assert!(
+        rendered.contains("inject (7d): requests 2, injected 1 (50%), no match 0, skipped 1, timeout 0, error 0; agent: opened 0, search 0, show 0"),
+        "{rendered}"
+    );
     handle.shutdown();
 }

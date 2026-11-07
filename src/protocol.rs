@@ -8,7 +8,7 @@ use crate::i18n::Lang;
 use crate::import::Candidate;
 use crate::ingest::{ImportOutcome, IngestRequest};
 use crate::search::{HitView, InjectionPlan, IterationView, SearchKind, escape_control};
-use crate::store::{ForgetCounts, ForgetTarget, Page, SessionSummary, TurnSummary};
+use crate::store::{ForgetCounts, ForgetTarget, InjectStats, Page, SessionSummary, TurnSummary};
 use crate::tr;
 
 /// 요청이 다룰 프로젝트. `Project`는 요청의 `cwd`가 속한 프로젝트, `Path`는 그 경로가 속한 프로젝트,
@@ -157,6 +157,9 @@ pub struct ProjectStatus {
     pub compatibility: String,
     /// 최근 5분 동안의 임베딩 처리 속도(분당 작업 수). 처리한 작업이 없으면 없다. (IF-CLI-5)
     pub embed_per_min: Option<u64>,
+    /// 최근 7일의 주입 통계와 기억 활용 수. (FR-OBS-7)
+    #[serde(default)]
+    pub inject: InjectStats,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,6 +249,7 @@ impl StatusInfo {
                 p.vectors,
                 p.compatibility
             ));
+            out.push_str(&format!("  {}\n", inject_line(&p.inject)));
         }
         if self.reindex == REINDEX_RUNNING {
             return escape_control(&out);
@@ -300,6 +304,30 @@ fn queue_split(p: &ProjectStatus, lang: Lang) -> String {
         lang,
         " [live {live}, import {import}]",
         " [실시간 {live}, 가져오기 {import}]"
+    )
+}
+
+/// 주입 요청 중 실제로 주입한 비율(%). 요청이 없으면 `None`. (FR-OBS-7)
+pub fn inject_ratio(s: &InjectStats) -> Option<u64> {
+    (s.injected * 100).checked_div(s.requests)
+}
+
+/// `hippo status`의 프로젝트별 주입 통계 줄. 요청이 0이면 비율을 쓰지 않는다. (FR-OBS-7)
+pub fn inject_line(s: &InjectStats) -> String {
+    let ratio = inject_ratio(s)
+        .map(|p| format!(" ({p}%)"))
+        .unwrap_or_default();
+    format!(
+        "inject (7d): requests {}, injected {}{ratio}, no match {}, skipped {}, timeout {}, error {}; agent: opened {}, search {}, show {}",
+        s.requests,
+        s.injected,
+        s.no_match,
+        s.skipped,
+        s.timeout,
+        s.error,
+        s.opened,
+        s.search,
+        s.show
     )
 }
 

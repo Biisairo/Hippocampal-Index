@@ -97,6 +97,7 @@ impl Extractor {
             match v.get("type").and_then(Value::as_str) {
                 Some("user") => self.on_user(&v, start, &mut events),
                 Some("assistant") => self.on_assistant(&v, start, &mut events),
+                Some("system") if is_turn_end(&v) => events.extend(self.close_open()),
                 _ => {}
             }
         }
@@ -305,6 +306,13 @@ pub const TASK_NOTIFICATION_TAG: &str = "<task-notification>";
 const AGENT_MESSAGE_TAG: &str = "<agent-message";
 const SYSTEM_REMINDER_OPEN: &str = "<system-reminder>";
 const SYSTEM_REMINDER_CLOSE: &str = "</system-reminder>";
+
+/// Claude Code가 턴 끝에 남기는 `system` 라인의 `subtype`. (FR-EXT-7 d)
+const TURN_END_SUBTYPES: [&str; 2] = ["turn_duration", "stop_hook_summary"];
+
+fn is_turn_end(v: &Value) -> bool {
+    str_field(v, "subtype").is_some_and(|s| TURN_END_SUBTYPES.contains(&s))
+}
 
 fn str_field<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str)

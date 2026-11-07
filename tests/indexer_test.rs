@@ -72,6 +72,7 @@ fn store_with(iterations: Vec<NewIteration>) -> RecordStore {
             completions: vec![],
             state: ExtractorState::default(),
             bulk: false,
+            source: hippo::store::Source::Live,
         })
         .unwrap();
     store

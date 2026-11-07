@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use common::*;
 use hippo::ingest::{
-    HookEvent, ImportOutcome, ImportReport, IngestError, IngestOptions, IngestRequest,
+    HookEvent, ImportOutcome, ImportReport, IngestError, IngestOptions, IngestRequest, catch_up,
     import_session, ingest, session_start_cwd,
 };
 use hippo::redact::Redactor;
@@ -828,4 +828,69 @@ fn user_answer_is_part_of_embed_text() {
         "{}",
         it.embed_text
     );
+}
+
+// ---- 따라잡기 (FR-CAP-9) ----
+
+const TURN_END: &str = "{\"type\":\"system\",\"subtype\":\"turn_duration\",\"sessionId\":\"afd070e6-4625-4b31-8c43-f1f553949222\"}\n";
+
+fn catch_up_run(store: &mut RecordStore, path: &Path) -> hippo::ingest::IngestReport {
+    catch_up(store, &Redactor::new(&[]).unwrap(), &opts(), S2, path).unwrap()
+}
+
+/// Stop 처리가 마지막 assistant 라인이 기록되기 전에 읽은 상태를 만든다.
+fn stale_stop(dir: &Path) -> (RecordStore, PathBuf, String) {
+    let content = read_fixture("s2_tools.jsonl");
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let path = dir.join("t.jsonl");
+    fs::write(&path, lines[..8].concat()).unwrap();
+    let mut store = RecordStore::open_in_memory().unwrap();
+    assert_eq!(run(&mut store, HookEvent::Stop, S2, &path).iterations, 1);
+    (store, path, content)
+}
+
+#[test]
+fn catch_up_stores_last_iteration_after_turn_end_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, path, content) = stale_stop(dir.path());
+    let start = store.session_state(S2).unwrap().unwrap().start_offset;
+    fs::write(&path, format!("{content}{TURN_END}")).unwrap();
+    assert_eq!(catch_up_run(&mut store, &path).iterations, 1);
+    assert_eq!(store.counts().unwrap().iterations, 2);
+    let state = store.session_state(S2).unwrap().unwrap();
+    assert_eq!(state.safe_offset, fs::metadata(&path).unwrap().len());
+    assert_eq!(state.start_offset, start, "시작 offset은 바꾸지 않음");
+    assert_eq!(catch_up_run(&mut store, &path).iterations, 0, "멱등");
+}
+
+#[test]
+fn catch_up_does_not_finish_turn_without_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, path, content) = stale_stop(dir.path());
+    fs::write(&path, &content).unwrap();
+    assert_eq!(catch_up_run(&mut store, &path).iterations, 0);
+    assert_eq!(store.counts().unwrap().iterations, 1);
+}
+
+#[test]
+fn catch_up_keeps_iteration_with_pending_tool_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let content = read_fixture("s2_tools.jsonl");
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let path = dir.path().join("t.jsonl");
+    fs::write(&path, lines[..2].concat()).unwrap();
+    let mut store = RecordStore::open_in_memory().unwrap();
+    run(&mut store, HookEvent::PostToolBatch, S2, &path);
+    fs::write(&path, lines[..4].concat()).unwrap();
+    assert_eq!(catch_up_run(&mut store, &path).iterations, 0);
+    assert_eq!(store.counts().unwrap().iterations, 0);
+}
+
+#[test]
+fn catch_up_ignores_unknown_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = copy_fixture(dir.path(), "s2_tools.jsonl");
+    let mut store = RecordStore::open_in_memory().unwrap();
+    assert_eq!(catch_up_run(&mut store, &path).iterations, 0);
+    assert!(store.session_state(S2).unwrap().is_none());
 }

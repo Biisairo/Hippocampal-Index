@@ -21,8 +21,9 @@
 | 임베딩 큐가 줄지 않음(`embed_jobs`) | 모델을 받았는지(`ollama list`), `hippo`가 Ollama를 띄울 수 있었는지(`~/.hippo/logs/ollama.log`, `hippo.log`) 확인합니다. 작업은 5초마다 다시 시도합니다 |
 | 검색 결과에 "벡터 검색을 쓰지 못해 키워드 검색 결과만 표시합니다"가 나옴 | 임베딩에 실패했습니다(Ollama를 띄우지 못했거나 모델이 없음). 복구될 때까지 키워드 검색 결과만 나옵니다 |
 | 호환성이 `mismatch` | 모델이나 차원이 바뀌었습니다. 프로젝트 탭에서 **재색인**을 누릅니다(`hippo reindex`) |
+| 자동 주입이 되는지 모르겠음 | 상태 탭의 **주입 (최근 7일)** 표(또는 `hippo status`의 `inject (7d)` 줄)에서 요청 수, 주입 수, 무주입 사유, 에이전트가 기억을 열어 본 수를 봅니다. 프롬프트마다의 결과는 `~/.hippo/logs/hook.log`에 남습니다 |
 | 자동 주입이 되지 않음 | 주입이 일시정지 상태인지 상태 탭에서 확인합니다. 주입은 같은 프로젝트의 다른 세션만 대상입니다. [주입 미리 보기](usage.md#이-프로젝트에-질의)로 사유를 보고, 필요하면 `[inject] threshold`를 낮춥니다 |
-| 새 대화가 기록되지 않음 | 저장이 일시정지 상태인지 확인합니다. hook을 적용한 뒤 Claude Code 세션을 새로 시작했는지 확인합니다 |
+| 새 대화가 기록되지 않음 | 저장이 일시정지 상태인지 확인합니다. hook을 적용한 뒤 Claude Code 세션을 새로 시작했는지 확인합니다. `~/.hippo/logs/hook.log`에 그 세션의 `hook … session=<id>` 줄이 없으면 hook이 실행되지 않은 것입니다(안전 모드, `setting_sources=[]`로 띄운 Agent SDK 세션 등). 줄이 있으면 `hippo.log`의 `capture … session=<id>` 줄에서 저장한 반복 수와 건너뛴 사유를 봅니다 |
 | 적용할 때 `refusing to modify through a symbolic link` | 설정 파일이 심볼릭 링크입니다. 실제 파일이 있는 Claude 폴더를 고르거나, `hippo hooks-config` 출력을 직접 넣으십시오 |
 | 스풀 대기(`spool_pending`)가 0보다 큼 | 데몬이 꺼져 있던 동안의 요청입니다. 데몬이 시작되면 처리됩니다 |
 | `lance-*`나 `protoc`에서 빌드 실패 | `brew reinstall protobuf` 뒤 `protoc --version`을 확인합니다 |

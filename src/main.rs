@@ -6,7 +6,7 @@ use std::time::Duration;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use hippo::backends::{build_embedder, vector_source};
 use hippo::client::{
-    STARTUP_WAIT, ensure_daemon, hook_paused, request, request_until_reply, run_hook,
+    STARTUP_WAIT, ensure_daemon, hook_paused, log_paused, request, request_until_reply, run_hook,
 };
 use hippo::commands::{
     self, Confirm, ImportTally, InstallTarget, SCOPE_ALL, SCOPE_PROJECT, absolute, confirm_delete,
@@ -217,6 +217,7 @@ fn main() -> ExitCode {
             let _ = std::io::stdin().read_to_string(&mut input);
             let config = Config::load(&paths.config()).unwrap_or_default();
             if hook_paused(&config, &event) {
+                log_paused(&paths, &event, &input);
                 return ExitCode::SUCCESS;
             }
             let budget = Duration::from_millis(config.inject.budget_ms);

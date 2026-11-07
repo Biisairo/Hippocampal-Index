@@ -55,6 +55,8 @@
 - 이 hook들은 `async: true`로 실행되므로 세션을 느리게 만들지 않습니다.
 - hook 입력은 수집 신호로만 쓰고, 실제 내용은 세션 transcript(JSONL)에서 읽습니다.
 - `hippo`는 세션마다 안전 offset을 기억해 둡니다. 그래서 같은 줄을 두 번 읽거나 같은 반복을 두 번 저장하지 않습니다.
+- Claude Code가 transcript에 마지막 응답을 쓰기 전에 `Stop` hook이 실행될 수 있습니다. 그래서 transcript의 턴 종료 줄(`turn_duration`, `stop_hook_summary`)도 반복이 끝났다는 신호로 씁니다.
+- 데몬은 시작할 때와 60초마다, 읽지 않은 내용이 남은 세션을 다시 읽습니다(따라잡기). 5초 이상 바뀌지 않은 transcript만 읽습니다. 그래서 hook이 놓친 마지막 응답도 다음 프롬프트 없이 저장됩니다.
 
 ### 실시간 수집은 hook이 알려 준 턴부터 시작합니다
 
@@ -149,7 +151,8 @@ hook, CLI 명령, 앱은 DB를 직접 열지 않고, 소켓으로 데몬에 요�
 │  ├─ vectors/<이름>/ACTIVE
 │  └─ vectors/<이름>/<세대>/   LanceDB 파일
 ├─ spool/                     데몬이 꺼져 있을 때 쌓인 요청
-├─ logs/hippo.log             데몬 오류 로그
+├─ logs/hippo.log             데몬 로그: 오류, 수집 처리(capture), 주입 대상 없음. 5 MiB가 넘으면 hippo.log.1로 넘김
+├─ logs/hook.log              hook 결과(전달, 스풀, 주입 글자 수 등). 5 MiB가 넘으면 hook.log.1로 넘김
 ├─ logs/daemon.err            자동으로 띄운 데몬의 시작 오류
 ├─ hippo.sock                 (0600) 데몬 소켓
 └─ hippo.lock                 단일 실행 잠금

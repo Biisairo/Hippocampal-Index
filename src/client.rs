@@ -12,6 +12,7 @@ use crate::config::{Config, Paths};
 use crate::fsutil::{ensure_private_dir, open_private_append};
 use crate::ingest::{HookEvent, IngestRequest};
 use crate::install::installed_exe;
+use crate::logfile::append_line;
 use crate::protocol::{Request, Response};
 use crate::spool;
 
@@ -177,17 +178,23 @@ pub fn run_hook(
     input: &str,
     launcher: Launcher,
 ) -> Option<String> {
+    let started = Instant::now();
     match parse_hook(event_arg, input) {
         HookAction::Skip => None,
         HookAction::Ingest(req) => {
             let message = Request::Ingest(req.clone());
             // 데몬이 응답했으면(오류 응답 포함) 전달된 것으로 본다. 오류 요청을 스풀에 넣으면 같은 오류가 반복된다.
-            let delivered = request(&paths.socket(), &message, INGEST_TIMEOUT).is_ok()
-                || (ensure_daemon(paths, launcher, STARTUP_WAIT)
-                    && request(&paths.socket(), &message, INGEST_TIMEOUT).is_ok());
-            if !delivered {
+            let result = if request(&paths.socket(), &message, INGEST_TIMEOUT).is_ok() {
+                "delivered"
+            } else if ensure_daemon(paths, launcher, STARTUP_WAIT)
+                && request(&paths.socket(), &message, INGEST_TIMEOUT).is_ok()
+            {
+                "started-daemon"
+            } else {
                 let _ = spool::append(&paths.spool(), &req);
-            }
+                "spooled"
+            };
+            log_hook(paths, event_arg, &req.session_id, result, started);
             None
         }
         HookAction::Inject {
@@ -195,35 +202,90 @@ pub fn run_hook(
             cwd,
             session_id,
         } => {
-            let started = Instant::now();
-            let budget = if UnixStream::connect(paths.socket()).is_ok() {
-                budget
-            } else {
-                cold_budget
-            };
-            if !ensure_daemon(paths, launcher, budget) {
-                return None;
-            }
-            // 모델이 내려가 있으면 데몬이 콜드 예산까지 늘리므로 그만큼 기다린다. (FR-RET-5)
-            let remaining = cold_budget.max(budget).saturating_sub(started.elapsed());
-            if remaining.is_zero() {
-                return None;
-            }
-            match request(
-                &paths.socket(),
-                &Request::Inject {
-                    prompt,
-                    cwd,
-                    session_id,
-                    budget_ms: Some(budget.as_millis() as u64),
-                },
-                remaining,
-            ) {
-                Ok(Response::Inject {
-                    context: Some(context),
-                }) => Some(inject_output(&context)),
-                _ => None,
-            }
+            let (out, result) = inject_hook(
+                paths,
+                budget,
+                cold_budget,
+                prompt,
+                cwd,
+                &session_id,
+                launcher,
+                started,
+            );
+            log_hook(paths, event_arg, &session_id, &result, started);
+            out
         }
     }
+}
+
+/// 자동 주입 hook. 출력과 hook 로그의 결과를 돌려준다. (FR-RET-5, FR-OBS-3)
+#[allow(clippy::too_many_arguments)]
+fn inject_hook(
+    paths: &Paths,
+    budget: Duration,
+    cold_budget: Duration,
+    prompt: String,
+    cwd: String,
+    session_id: &str,
+    launcher: Launcher,
+    started: Instant,
+) -> (Option<String>, String) {
+    let budget = if UnixStream::connect(paths.socket()).is_ok() {
+        budget
+    } else {
+        cold_budget
+    };
+    if !ensure_daemon(paths, launcher, budget) {
+        return (None, HOOK_NO_DAEMON.to_string());
+    }
+    // 모델이 내려가 있으면 데몬이 콜드 예산까지 늘리므로 그만큼 기다린다. (FR-RET-5)
+    let remaining = cold_budget.max(budget).saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return (None, HOOK_TIMEOUT.to_string());
+    }
+    let req = Request::Inject {
+        prompt,
+        cwd,
+        session_id: session_id.to_string(),
+        budget_ms: Some(budget.as_millis() as u64),
+    };
+    match request(&paths.socket(), &req, remaining) {
+        Ok(Response::Inject {
+            context: Some(context),
+        }) => (
+            Some(inject_output(&context)),
+            format!("injected chars={}", context.chars().count()),
+        ),
+        Ok(_) => (None, "no-context".to_string()),
+        Err(ClientError::Connect(_)) => (None, HOOK_NO_DAEMON.to_string()),
+        Err(_) => (None, HOOK_TIMEOUT.to_string()),
+    }
+}
+
+const HOOK_LOG: &str = "hook.log";
+const HOOK_NO_DAEMON: &str = "no-daemon";
+const HOOK_TIMEOUT: &str = "timeout";
+
+/// `logs/hook.log`에 한 줄을 남긴다. 데이터 루트가 없으면 남기지 않는다. (FR-OBS-3)
+fn log_hook(paths: &Paths, event_arg: &str, session_id: &str, result: &str, started: Instant) {
+    if !paths.root.is_dir() || ensure_private_dir(&paths.logs()).is_err() {
+        return;
+    }
+    append_line(
+        &paths.logs().join(HOOK_LOG),
+        &format!(
+            "hook {event_arg} session={session_id} {result} elapsed={}ms",
+            started.elapsed().as_millis()
+        ),
+    );
+}
+
+/// 일시정지로 건너뛴 hook을 남긴다. 해석할 수 없는 입력과 서브에이전트 hook은 남기지 않는다. (FR-OBS-3)
+pub fn log_paused(paths: &Paths, event_arg: &str, input: &str) {
+    let session = match parse_hook(event_arg, input) {
+        HookAction::Ingest(req) => req.session_id,
+        HookAction::Inject { session_id, .. } => session_id,
+        HookAction::Skip => return,
+    };
+    log_hook(paths, event_arg, &session, "paused", Instant::now());
 }

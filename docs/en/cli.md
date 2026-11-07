@@ -146,11 +146,14 @@ reindex: idle                     # idle | running | done | failed: <project id>
 projects: 2
 [3f9c…] /Users/me/work/app/.git
   iterations: 1520  results: 980  embed_jobs: 0  vectors: 2610  compatibility: compatible
+  inject (7d): requests 120, injected 41 (34%), no match 52, skipped 27, timeout 0, error 0; agent: opened 3, search 8, show 5
 [a71d…] /Users/me/notes  (location missing)
   iterations: 40  results: 12  embed_jobs: 0  vectors: 52  compatibility: compatible
+  inject (7d): requests 0, injected 0, no match 0, skipped 0, timeout 0, error 0; agent: opened 0, search 0, show 0
 ```
 
 - `embed_jobs` is the number of iterations and results waiting for embedding. When there is a backlog, it is split into live and import (`hippo import`) work. If work was done in the last 5 minutes, the rate and the estimated time left are shown too. For example: `embed_jobs: 601 [live 1, import 600] (120/min, about 6 min left)`.
+- `inject (7d)` counts the automatic injections of the last 7 days: how many prompts were checked, injected, had no match, were skipped (too short, a task notification, and so on), timed out, or failed. `agent:` counts the agent's `hippo` calls in the same period. `opened` means it ran `hippo show` on a turn it was given by injection.
 - `compatibility` is one of `empty`, `compatible`, `mismatch`. `(location missing)` means the location no longer exists. If a project needs a reindex, `status` says so.
 
 ---

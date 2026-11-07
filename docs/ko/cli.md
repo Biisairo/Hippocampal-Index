@@ -146,11 +146,14 @@ reindex: idle                     # idle | running | done | failed: <프로젝�
 projects: 2
 [3f9c…] /Users/me/work/app/.git
   iterations: 1520  results: 980  embed_jobs: 0  vectors: 2610  compatibility: compatible
+  inject (7d): requests 120, injected 41 (34%), no match 52, skipped 27, timeout 0, error 0; agent: opened 3, search 8, show 5
 [a71d…] /Users/me/notes  (위치 없음)
   iterations: 40  results: 12  embed_jobs: 0  vectors: 52  compatibility: compatible
+  inject (7d): requests 0, injected 0, no match 0, skipped 0, timeout 0, error 0; agent: opened 0, search 0, show 0
 ```
 
 - `embed_jobs`는 임베딩을 기다리는 반복과 결과의 수입니다. 대기가 있으면 실시간 작업과 가져오기 작업으로 나눠 보여 주고, 최근 5분 동안 처리한 작업이 있으면 속도와 남은 예상 시간도 나옵니다. 예: `embed_jobs: 601 [실시간 1, 가져오기 600] (분당 120건, 약 6분 남음)`.
+- `inject (7d)`는 최근 7일의 자동 주입을 셉니다. 확인한 프롬프트 수와, 그중 주입한 수, 후보가 없던 수, 건너뛴 수(너무 짧음, 작업 완료 알림 등), 시간 초과, 오류입니다. `agent:`는 같은 기간에 에이전트가 실행한 `hippo` 명령의 수입니다. `opened`는 주입받은 턴을 `hippo show`로 열어 본 경우입니다.
 - `compatibility`는 `empty`, `compatible`, `mismatch` 중 하나입니다. 재색인이 필요한 프로젝트가 있으면 `status`가 알려 줍니다.
 
 ---

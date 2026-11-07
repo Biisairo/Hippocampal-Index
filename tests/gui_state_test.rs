@@ -700,6 +700,7 @@ fn project(jobs: u64, import: u64, rate: Option<u64>) -> hippo::protocol::Projec
         vectors: 0,
         compatibility: "compatible".into(),
         embed_per_min: rate,
+        inject: Default::default(),
     }
 }
 

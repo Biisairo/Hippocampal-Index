@@ -83,6 +83,7 @@ impl Env {
                     completions: vec![],
                     state: ExtractorState::default(),
                     bulk: false,
+                    source: hippo::store::Source::Live,
                 })
                 .unwrap();
         }
@@ -464,6 +465,7 @@ fn render_turn_lists_iterations_and_results() {
             completions: vec![],
             state: ExtractorState::default(),
             bulk: false,
+            source: hippo::store::Source::Live,
         })
         .unwrap();
     let plain = render_turn(&records, &prompt_id, false, Lang::En).unwrap();
@@ -520,6 +522,7 @@ fn render_turn_shows_background_completions() {
             }],
             state: ExtractorState::default(),
             bulk: false,
+            source: hippo::store::Source::Live,
         })
         .unwrap();
     let out = render_turn(&records, &prompt_id, true, Lang::En).unwrap();
@@ -1460,6 +1463,7 @@ fn turn_views_hold_show_with_results_content() {
             completions: vec![],
             state: ExtractorState::default(),
             bulk: false,
+            source: hippo::store::Source::Live,
         })
         .unwrap();
     let views = turn_views(&records, &prompt_id).unwrap();

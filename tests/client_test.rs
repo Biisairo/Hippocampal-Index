@@ -428,6 +428,7 @@ fn status_info(iterations: u64, vectors: u64, compatibility: &str, reindex: &str
             vectors,
             compatibility: compatibility.into(),
             embed_per_min: None,
+            inject: Default::default(),
         }],
     }
 }

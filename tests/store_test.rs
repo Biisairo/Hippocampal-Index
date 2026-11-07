@@ -22,6 +22,7 @@ fn batch_from_fixture(name: &str) -> Batch {
         completions: vec![],
         state: ex.state(),
         bulk: false,
+        source: hippo::store::Source::Live,
     }
 }
 
@@ -75,6 +76,7 @@ fn batch(session: &str, iterations: Vec<NewIteration>, completions: Vec<NewCompl
         completions,
         state: ExtractorState::default(),
         bulk: false,
+        source: hippo::store::Source::Live,
     }
 }
 

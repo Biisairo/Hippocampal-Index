@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 use crate::bg::{BackgroundKind, TaskNotification, background_start};
 use crate::embed_text::is_hippo_call;
-use crate::transcript::{ExtractorState, Iteration, IterationInput};
+use crate::transcript::{ExtractorState, Iteration, IterationInput, ToolCall};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -50,6 +50,75 @@ pub struct Batch {
     pub state: ExtractorState,
     /// 가져오기로 등록하는 임베딩 작업이면 true. (FR-IMP-5)
     pub bulk: bool,
+    pub source: Source,
+}
+
+/// 반복을 저장한 경로. (FR-OBS-4)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Live,
+    CatchUp,
+    Import,
+}
+
+impl Source {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::CatchUp => "catch_up",
+            Self::Import => "import",
+        }
+    }
+}
+
+/// 자동 주입 요청 하나의 결과. (FR-OBS-5)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectOutcome {
+    Injected,
+    NoMatch,
+    Skipped,
+    Timeout,
+    Error,
+}
+
+impl InjectOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Injected => "injected",
+            Self::NoMatch => "no_match",
+            Self::Skipped => "skipped",
+            Self::Timeout => "timeout",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InjectionRecord {
+    pub session_id: String,
+    pub at_ms: i64,
+    pub outcome: InjectOutcome,
+    pub reason: Option<String>,
+    pub turns: usize,
+    pub chars: usize,
+    pub elapsed_ms: u64,
+    pub prompt_ids: Vec<String>,
+}
+
+/// 최근 7일의 주입 통계와 기억 활용 수. (FR-OBS-7)
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InjectStats {
+    pub requests: u64,
+    pub injected: u64,
+    pub no_match: u64,
+    pub skipped: u64,
+    pub timeout: u64,
+    pub error: u64,
+    /// (사유, 수). 사유 이름 순서이다.
+    pub skip_reasons: Vec<(String, u64)>,
+    pub opened: u64,
+    pub search: u64,
+    pub show: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -74,6 +143,9 @@ pub struct StoredIteration {
     pub tool_calls: Vec<StoredToolCall>,
     pub response_text: String,
     pub embed_text: String,
+    /// 저장 시각(Unix 밀리초)과 저장 경로. 이전 버전이 저장한 행은 비어 있다. (FR-OBS-4)
+    pub stored_at: Option<i64>,
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,7 +330,23 @@ CREATE TABLE IF NOT EXISTS embed_jobs (
 CREATE TABLE IF NOT EXISTS sessions (session_id TEXT PRIMARY KEY, transcript_path TEXT NOT NULL, state TEXT NOT NULL);
 CREATE VIRTUAL TABLE IF NOT EXISTS iterations_fts USING fts5(embed_text, content='iterations', tokenize='trigram');
 CREATE VIRTUAL TABLE IF NOT EXISTS results_fts USING fts5(text, content='results', tokenize='trigram');
+CREATE TABLE IF NOT EXISTS injections (
+    session_id TEXT NOT NULL, at_ms INTEGER NOT NULL, outcome TEXT NOT NULL, reason TEXT,
+    turns INTEGER NOT NULL, chars INTEGER NOT NULL, elapsed_ms INTEGER NOT NULL, prompt_ids TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS injections_at ON injections(at_ms);
+CREATE INDEX IF NOT EXISTS injections_session ON injections(session_id);
+CREATE TABLE IF NOT EXISTS memory_uses (
+    iteration_id TEXT NOT NULL, tool_use_id TEXT NOT NULL, session_id TEXT NOT NULL, ts TEXT NOT NULL,
+    kind TEXT NOT NULL, prompt_id TEXT, PRIMARY KEY (iteration_id, tool_use_id)
+);
+CREATE INDEX IF NOT EXISTS memory_uses_ts ON memory_uses(ts);
 ";
+
+/// 나중에 더한 열. 원본 저장소를 열 때 없으면 추가한다. (FR-OBS-4)
+const ADDED_ITERATION_COLUMNS: [(&str, &str); 2] = [("stored_at", "INTEGER"), ("source", "TEXT")];
+/// 통계 기간. (FR-OBS-7)
+const STATS_WINDOW_MS: i64 = 7 * 86_400_000;
 
 const PENDING_STATUS: &str = "pending";
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -294,13 +382,87 @@ impl RecordStore {
 
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch(SCHEMA)?;
+        let existing = table_columns(&conn, "main", "iterations")?;
+        for (name, kind) in ADDED_ITERATION_COLUMNS {
+            if !existing.iter().any(|c| c == name) {
+                conn.execute_batch(&format!("ALTER TABLE iterations ADD COLUMN {name} {kind}"))?;
+            }
+        }
         Ok(Self { conn })
+    }
+
+    /// 자동 주입 요청 하나를 기록한다. (FR-OBS-5)
+    pub fn record_injection(&mut self, rec: &InjectionRecord) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO injections (session_id, at_ms, outcome, reason, turns, chars, elapsed_ms, prompt_ids)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                rec.session_id,
+                rec.at_ms,
+                rec.outcome.as_str(),
+                rec.reason,
+                i64::try_from(rec.turns).unwrap_or(i64::MAX),
+                i64::try_from(rec.chars).unwrap_or(i64::MAX),
+                i64::try_from(rec.elapsed_ms).unwrap_or(i64::MAX),
+                serde_json::to_string(&rec.prompt_ids)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// `now_ms`까지 최근 7일의 주입 통계와 기억 활용 수. (FR-OBS-7)
+    pub fn inject_stats(&self, now_ms: i64) -> Result<InjectStats> {
+        let since = now_ms - STATS_WINDOW_MS;
+        let mut stats = InjectStats::default();
+        let mut stmt = self.conn.prepare(
+            "SELECT outcome, reason, COUNT(*) FROM injections WHERE at_ms >= ?1
+             GROUP BY outcome, reason ORDER BY reason",
+        )?;
+        let rows = stmt.query_map([since], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (outcome, reason, n) = row?;
+            let n = n.unsigned_abs();
+            stats.requests += n;
+            match outcome.as_str() {
+                "injected" => stats.injected += n,
+                "no_match" => stats.no_match += n,
+                "skipped" => {
+                    stats.skipped += n;
+                    stats.skip_reasons.push((reason.unwrap_or_default(), n));
+                }
+                "timeout" => stats.timeout += n,
+                _ => stats.error += n,
+            }
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, COUNT(*) FROM memory_uses
+             WHERE ts >= strftime('%Y-%m-%dT%H:%M:%SZ', ?1, 'unixepoch') GROUP BY kind",
+        )?;
+        let rows = stmt.query_map([since.div_euclid(1000)], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (kind, n) = row?;
+            let n = n.unsigned_abs();
+            match kind.as_str() {
+                "opened" => stats.opened += n,
+                "search" => stats.search += n,
+                _ => stats.show += n,
+            }
+        }
+        Ok(stats)
     }
 
     pub fn apply(&mut self, batch: &Batch) -> Result<()> {
         let tx = self.conn.transaction()?;
         for it in &batch.iterations {
-            insert_iteration(&tx, it, batch.bulk)?;
+            insert_iteration(&tx, it, batch.bulk, batch.source)?;
         }
         for c in &batch.completions {
             insert_completion(&tx, c, batch.bulk)?;
@@ -337,6 +499,25 @@ impl RecordStore {
             )
             .optional()?;
         Ok(raw.map(|s| serde_json::from_str(&s)).transpose()?)
+    }
+
+    /// 상태가 있는 세션마다 (session id, transcript 경로, 상태). (FR-CAP-9)
+    pub fn sessions(&self) -> Result<Vec<(String, String, ExtractorState)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT session_id, transcript_path, state FROM sessions")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(id, path, state)| Ok((id, path, serde_json::from_str(&state)?)))
+            .collect()
     }
 
     pub fn iteration(&self, id: &str) -> Result<Option<StoredIteration>> {
@@ -822,82 +1003,50 @@ impl RecordStore {
     fn load_iterations(&self, where_clause: &str, arg: &str) -> Result<Vec<StoredIteration>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT id, session_id, prompt_id, message_id, iteration_index, cwd, ts, inputs, tool_calls,
-                    response_text, embed_text FROM iterations {where_clause}"
+                    response_text, embed_text, stored_at, source FROM iterations {where_clause}"
         ))?;
-        type Raw = (
-            String,
-            String,
-            Option<String>,
-            String,
-            u32,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-        );
         let rows = stmt.query_map([arg], |r| {
             Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-                r.get(7)?,
-                r.get(8)?,
-                r.get(9)?,
-                r.get(10)?,
+                StoredIteration {
+                    id: r.get(0)?,
+                    session_id: r.get(1)?,
+                    prompt_id: r.get(2)?,
+                    message_id: r.get(3)?,
+                    iteration_index: r.get(4)?,
+                    cwd: r.get(5)?,
+                    ts: r.get(6)?,
+                    inputs: Vec::new(),
+                    tool_calls: Vec::new(),
+                    response_text: r.get(9)?,
+                    embed_text: r.get(10)?,
+                    stored_at: r.get(11)?,
+                    source: r.get(12)?,
+                },
+                r.get::<_, String>(7)?,
+                r.get::<_, String>(8)?,
             ))
         })?;
-        let raw: Vec<Raw> = rows.collect::<rusqlite::Result<_>>()?;
+        let raw: Vec<(StoredIteration, String, String)> = rows.collect::<rusqlite::Result<_>>()?;
         raw.into_iter()
-            .map(
-                |(
-                    id,
-                    session_id,
-                    prompt_id,
-                    message_id,
-                    iteration_index,
-                    cwd,
-                    ts,
-                    inputs,
-                    calls,
-                    response_text,
-                    embed_text,
-                )| {
-                    let links = self.result_links(&id)?;
-                    let rows: Vec<ToolCallRow> = serde_json::from_str(&calls)?;
-                    let tool_calls = rows
-                        .into_iter()
-                        .map(|c| StoredToolCall {
-                            result_id: links
-                                .iter()
-                                .find(|(t, _)| *t == c.id)
-                                .map(|(_, r)| r.clone()),
-                            id: c.id,
-                            name: c.name,
-                            input: c.input,
-                            is_error: c.is_error,
-                        })
-                        .collect();
-                    Ok(StoredIteration {
-                        id,
-                        session_id,
-                        prompt_id,
-                        message_id,
-                        iteration_index,
-                        cwd,
-                        ts,
-                        inputs: serde_json::from_str(&inputs)?,
-                        tool_calls,
-                        response_text,
-                        embed_text,
+            .map(|(mut it, inputs, calls)| {
+                let links = self.result_links(&it.id)?;
+                let rows: Vec<ToolCallRow> = serde_json::from_str(&calls)?;
+                it.tool_calls = rows
+                    .into_iter()
+                    .map(|c| StoredToolCall {
+                        result_id: links
+                            .iter()
+                            .find(|(t, _)| *t == c.id)
+                            .map(|(_, r)| r.clone()),
+                        id: c.id,
+                        name: c.name,
+                        input: c.input,
+                        is_error: c.is_error,
                     })
-                },
-            )
+                    .collect();
+                it.inputs = serde_json::from_str(&inputs)?;
+                Ok(it)
+            })
             .collect()
     }
 
@@ -942,7 +1091,12 @@ pub fn iteration_id(session_id: &str, message_id: &str) -> String {
     format!("{session_id}:{message_id}")
 }
 
-fn insert_iteration(tx: &Transaction, new: &NewIteration, bulk: bool) -> Result<()> {
+fn insert_iteration(
+    tx: &Transaction,
+    new: &NewIteration,
+    bulk: bool,
+    source: Source,
+) -> Result<()> {
     let it = &new.iteration;
     let id = iteration_id(&it.session_id, &it.message_id);
     let calls: Vec<ToolCallRow> = it
@@ -957,8 +1111,8 @@ fn insert_iteration(tx: &Transaction, new: &NewIteration, bulk: bool) -> Result<
         .collect();
     let inserted = tx.execute(
         "INSERT OR IGNORE INTO iterations (id, session_id, prompt_id, message_id, iteration_index, cwd, ts,
-             inputs, tool_calls, response_text, embed_text)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             inputs, tool_calls, response_text, embed_text, stored_at, source)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             id,
             it.session_id,
@@ -971,6 +1125,8 @@ fn insert_iteration(tx: &Transaction, new: &NewIteration, bulk: bool) -> Result<
             serde_json::to_string(&calls)?,
             it.texts.join("\n"),
             new.embed_text,
+            now_millis(),
+            source.as_str(),
         ],
     )?;
     if inserted == 0 {
@@ -980,6 +1136,7 @@ fn insert_iteration(tx: &Transaction, new: &NewIteration, bulk: bool) -> Result<
         "INSERT INTO iterations_fts (rowid, embed_text) VALUES (last_insert_rowid(), ?1)",
         [&new.embed_text],
     )?;
+    insert_memory_uses(tx, &id, it)?;
     enqueue(tx, RecordKind::Iteration, &id, bulk)?;
     for call in &it.tool_calls {
         if let Some(result) = &call.result
@@ -1103,7 +1260,51 @@ fn now_millis() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
-const ITERATION_COLUMNS: &str = "id, session_id, prompt_id, message_id, iteration_index, cwd, ts, inputs, tool_calls, response_text, embed_text";
+const ITERATION_COLUMNS: &str = "id, session_id, prompt_id, message_id, iteration_index, cwd, ts, inputs, tool_calls, response_text, embed_text, stored_at, source";
+/// 두 열이 없는 이전 원본 저장소에서 병합할 때의 선택 목록. (FR-OBS-4)
+const OLD_ITERATION_COLUMNS: &str = "id, session_id, prompt_id, message_id, iteration_index, cwd, ts, inputs, tool_calls, response_text, embed_text, NULL, NULL";
+
+/// 테이블의 열 이름. `schema`는 `main` 또는 붙인 DB 이름이다.
+fn table_columns(conn: &Connection, schema: &str, table: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA {schema}.table_info({table})"))?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// 반복의 hippo 호출을 활용 기록으로 남긴다. (FR-OBS-6)
+fn insert_memory_uses(tx: &Transaction, iteration_id: &str, it: &Iteration) -> Result<()> {
+    let hippo_calls: Vec<&ToolCall> = it.tool_calls.iter().filter(|c| is_hippo_call(c)).collect();
+    if hippo_calls.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = tx.prepare(
+        "SELECT prompt_ids FROM injections WHERE session_id = ?1 AND outcome = 'injected'",
+    )?;
+    let mut injected: Vec<String> = Vec::new();
+    for raw in stmt.query_map([&it.session_id], |r| r.get::<_, String>(0))? {
+        injected.extend(serde_json::from_str::<Vec<String>>(&raw?)?);
+    }
+    for call in hippo_calls {
+        let command = call
+            .input
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let words: Vec<&str> = command.split_whitespace().collect();
+        let (kind, target) = match injected.iter().find(|p| command.contains(p.as_str())) {
+            Some(p) => ("opened", Some(p.as_str())),
+            None if words.contains(&"search") => ("search", None),
+            None if words.contains(&"show") => ("show", None),
+            None => continue,
+        };
+        tx.execute(
+            "INSERT OR IGNORE INTO memory_uses (iteration_id, tool_use_id, session_id, ts, kind, prompt_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![iteration_id, call.id, it.session_id, it.ts, kind, target],
+        )?;
+    }
+    Ok(())
+}
 const RESULT_COLUMNS: &str = "id, tool_name, text, first_seen_ts, indexed";
 
 /// `src`로 붙인 원본 저장소의 행을 한 트랜잭션으로 가져온다. FTS 행은 새로 추가한 행에만 만든다.
@@ -1111,13 +1312,22 @@ fn merge_attached(conn: &mut Connection, enqueue: bool) -> Result<MergeReport> {
     let tx = conn.transaction()?;
     let now = now_millis();
     let mut report = MergeReport::default();
-    for (table, fts, text, kind, columns, indexed) in [
+    let src_has_added = table_columns(&tx, "src", "iterations")?
+        .iter()
+        .any(|c| c == ADDED_ITERATION_COLUMNS[0].0);
+    let iteration_select = if src_has_added {
+        ITERATION_COLUMNS
+    } else {
+        OLD_ITERATION_COLUMNS
+    };
+    for (table, fts, text, kind, columns, select, indexed) in [
         (
             "iterations",
             "iterations_fts",
             "embed_text",
             RecordKind::Iteration,
             ITERATION_COLUMNS,
+            iteration_select,
             "1",
         ),
         (
@@ -1126,6 +1336,7 @@ fn merge_attached(conn: &mut Connection, enqueue: bool) -> Result<MergeReport> {
             "text",
             RecordKind::Result,
             RESULT_COLUMNS,
+            RESULT_COLUMNS,
             "indexed = 1",
         ),
     ] {
@@ -1133,7 +1344,7 @@ fn merge_attached(conn: &mut Connection, enqueue: bool) -> Result<MergeReport> {
             "DROP TABLE IF EXISTS temp.merged;
              CREATE TEMP TABLE merged (id TEXT PRIMARY KEY);
              INSERT INTO temp.merged SELECT id FROM src.{table} WHERE id NOT IN (SELECT id FROM main.{table});
-             INSERT INTO main.{table} ({columns}) SELECT {columns} FROM src.{table} WHERE id IN (SELECT id FROM temp.merged);
+             INSERT INTO main.{table} ({columns}) SELECT {select} FROM src.{table} WHERE id IN (SELECT id FROM temp.merged);
              INSERT INTO main.{fts} (rowid, {text}) SELECT rowid, {text} FROM main.{table} WHERE id IN (SELECT id FROM temp.merged) AND {indexed};"
         ))?;
         let added: i64 = tx.query_row("SELECT COUNT(*) FROM temp.merged", [], |r| r.get(0))?;
@@ -1214,6 +1425,14 @@ fn forget_in(tx: &Transaction, target: &ForgetTarget) -> Result<ForgetPlan> {
              WHERE EXISTS (SELECT 1 FROM results WHERE id = c.id)
                AND NOT EXISTS (SELECT 1 FROM iteration_results WHERE result_id = c.id)
                AND NOT EXISTS (SELECT 1 FROM bg_completions WHERE result_id = c.id);",
+    )?;
+    tx.execute(
+        "DELETE FROM memory_uses WHERE iteration_id IN (SELECT id FROM temp.del_it) OR session_id = ?1",
+        params![session],
+    )?;
+    tx.execute(
+        "DELETE FROM injections WHERE session_id = ?1",
+        params![session],
     )?;
     let count = |sql: &str| -> Result<u64> {
         let n: i64 = tx.query_row(sql, [], |r| r.get(0))?;

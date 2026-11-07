@@ -13,9 +13,9 @@ use crate::embed_text::{
     is_hippo_tool,
 };
 use crate::embedder::{EmbedError, Embedder};
-use crate::i18n::Lang;
+use crate::i18n::{Lang, local_time};
 use crate::store::{
-    FtsFilter, RecordKind, RecordStore, StoreError, StoredIteration, StoredToolCall,
+    FtsFilter, InjectOutcome, RecordKind, RecordStore, StoreError, StoredIteration, StoredToolCall,
 };
 use crate::tr;
 use crate::transcript::TASK_NOTIFICATION_TAG;
@@ -198,6 +198,28 @@ pub enum SkipReason {
     VectorUnavailable,
 }
 
+impl SkipReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EmptyPrompt => "empty_prompt",
+            Self::TaskNotification => "task_notification",
+            Self::TooShort => "too_short",
+            Self::NoProject => "no_project",
+            Self::VectorUnavailable => "vector_unavailable",
+        }
+    }
+}
+
+/// 자동 주입 한 번의 결과. 주입 기록(FR-OBS-5)에 쓴다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InjectionRun {
+    pub text: Option<String>,
+    pub outcome: InjectOutcome,
+    pub reason: Option<SkipReason>,
+    /// 주입한 턴의 `prompt_id`. 선택 순서이며 중복이 없다.
+    pub prompt_ids: Vec<String>,
+}
+
 /// 후보 반복 하나의 판정. (FR-RET-3, FR-RET-4, FR-GUI-16)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -241,6 +263,24 @@ pub fn build_injection(
     config: InjectConfig,
     deadline: Instant,
 ) -> Result<Option<String>, SearchError> {
+    run_injection(records, backends, prompt, session_id, config, deadline).map(|r| r.text)
+}
+
+/// 자동 주입을 계산하고 결과의 종류를 함께 돌려준다. (FR-RET-1~4, FR-OBS-5)
+pub fn run_injection(
+    records: &RecordStore,
+    backends: Option<VectorBackends>,
+    prompt: &str,
+    session_id: &str,
+    config: InjectConfig,
+    deadline: Instant,
+) -> Result<InjectionRun, SearchError> {
+    let run = |outcome, reason, text, prompt_ids| InjectionRun {
+        text,
+        outcome,
+        reason,
+        prompt_ids,
+    };
     match plan_injection(
         records,
         backends,
@@ -249,8 +289,26 @@ pub fn build_injection(
         config,
         Some(deadline),
     ) {
-        Ok(InjectionPlan::Planned { text, .. }) => Ok(text),
-        Ok(InjectionPlan::Skipped { .. }) | Err(SearchError::DeadlineExceeded) => Ok(None),
+        Ok(InjectionPlan::Planned { candidates, text }) => {
+            let mut ids: Vec<String> = Vec::new();
+            for c in candidates.iter().filter(|c| c.verdict == Verdict::Selected) {
+                if let Some(p) = &c.prompt_id
+                    && !ids.contains(p)
+                {
+                    ids.push(p.clone());
+                }
+            }
+            Ok(match text {
+                Some(text) => run(InjectOutcome::Injected, None, Some(text), ids),
+                None => run(InjectOutcome::NoMatch, None, None, Vec::new()),
+            })
+        }
+        Ok(InjectionPlan::Skipped { reason }) => {
+            Ok(run(InjectOutcome::Skipped, Some(reason), None, Vec::new()))
+        }
+        Err(SearchError::DeadlineExceeded) => {
+            Ok(run(InjectOutcome::Timeout, None, None, Vec::new()))
+        }
         Err(e) => Err(e),
     }
 }
@@ -685,6 +743,22 @@ pub struct IterationView {
     pub inputs: Vec<String>,
     pub tools: Vec<ToolView>,
     pub response: String,
+    /// 저장 시각(Unix 밀리초)과 저장 경로. 이전 버전이 저장한 반복은 비어 있다. (FR-OBS-4)
+    #[serde(default)]
+    pub stored_at: Option<i64>,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+impl IterationView {
+    /// 반복 머리 줄에 붙이는 `stored <로컬 시각> <경로>`. 두 값이 다 있을 때만 있다. (FR-OBS-4)
+    pub fn stored_label(&self) -> Option<String> {
+        let (at, source) = (self.stored_at?, self.source.as_deref()?);
+        Some(format!(
+            "stored {} {source}",
+            local_time(at.div_euclid(1000))
+        ))
+    }
 }
 
 /// 턴의 반복을 `iteration_index` 순서로 결과 원문과 함께 읽는다. 없으면 빈 목록. (FR-RET-7, FR-GUI-13)
@@ -730,6 +804,8 @@ pub fn turn_views(
             ts: it.ts,
             tools,
             response: it.response_text,
+            stored_at: it.stored_at,
+            source: it.source,
         });
     }
     Ok(views)
@@ -758,7 +834,15 @@ fn render_iteration(it: &IterationView, with_results: bool, lang: Lang, out: &mu
         Lang::En => ("[input]", "[tool]", "[response]"),
         Lang::Ko => ("[입력]", "[툴]", "[응답]"),
     };
-    let _ = writeln!(out, "## [{}] {}  {}", it.iteration_index, it.ts, it.id);
+    let stored = it
+        .stored_label()
+        .map(|l| format!("  {l}"))
+        .unwrap_or_default();
+    let _ = writeln!(
+        out,
+        "## [{}] {}  {}{stored}",
+        it.iteration_index, it.ts, it.id
+    );
     for input in &it.inputs {
         let _ = writeln!(out, "{input_label} {input}");
     }

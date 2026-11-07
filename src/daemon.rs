@@ -16,7 +16,7 @@ use crate::backends::VectorSource;
 use crate::config::{Config, Paths};
 use crate::embed_text::chunk_limit;
 use crate::embedder::{Embedder, InjectGate, YieldingEmbedder};
-use crate::fsutil::{ensure_private_dir, open_private_append, set_private_file};
+use crate::fsutil::{ensure_private_dir, set_private_file};
 use crate::generations::{activate, active_dir, cleanup_inactive, new_generation};
 use crate::i18n::{Lang, local_time};
 use crate::import::{Candidate, candidates, import_status};
@@ -24,9 +24,10 @@ use crate::indexer::{
     ChunkConfig, Compatibility, compatibility, optimize_if_due, process_jobs_until, reindex,
 };
 use crate::ingest::{
-    ImportOutcome, ImportReport, IngestOptions, IngestRequest, import_session, ingest,
-    session_start_cwd,
+    HookEvent, ImportOutcome, ImportReport, IngestOptions, IngestReport, IngestRequest, catch_up,
+    import_session, ingest, session_start_cwd,
 };
+use crate::logfile::append_line;
 use crate::project::{Location, locate, normalize};
 use crate::protocol::{
     COMPAT_MISMATCH, DeleteReport, ImportSessionReport, ProjectStatus, REINDEX_RUNNING, Request,
@@ -34,14 +35,16 @@ use crate::protocol::{
 };
 use crate::queue::{EmbedQueue, Lane, LaneQueue};
 use crate::redact::Redactor;
-use crate::registry::{GIT_DIR_NAME, Registry, RegistryError, is_project_id};
+use crate::registry::{Registry, RegistryError, is_project_id, project_folder};
 use crate::search::{
     InjectConfig, InjectionPlan, ProjectSearch, SearchError, SearchKind, SearchRequest, SkipReason,
-    VectorBackends, build_injection, escape_control, hit_views, missing_turn, plan_injection,
-    render_hits, render_project_hits, render_turn, search, search_projects, turn_views,
+    VectorBackends, escape_control, hit_views, missing_turn, plan_injection, render_hits,
+    render_project_hits, render_turn, run_injection, search, search_projects, turn_views,
 };
 use crate::spool;
-use crate::store::{EmbedJob, ForgetCounts, ForgetTarget, RecordStore};
+use crate::store::{
+    EmbedJob, ForgetCounts, ForgetTarget, InjectOutcome, InjectionRecord, RecordStore,
+};
 use crate::tr;
 use crate::vector::VectorStore;
 
@@ -65,6 +68,9 @@ const DELETE_YIELD: Duration = Duration::from_millis(10);
 const EMBED_RETRY: Duration = Duration::from_secs(5);
 const AWAKE_POLL: Duration = Duration::from_secs(1);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+/// 따라잡기 주기와, 아직 기록 중일 수 있는 transcript를 건너뛰는 시간. (FR-CAP-9)
+const CATCH_UP_INTERVAL: Duration = Duration::from_secs(60);
+const CATCH_UP_SETTLE: Duration = Duration::from_secs(5);
 const REINDEX_PAGE: usize = 256;
 const LOG_FILE: &str = "hippo.log";
 const WARMUP_TEXT: &str = "warmup";
@@ -494,12 +500,7 @@ impl Shared {
     }
 
     fn log(&self, message: &str) {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        if let Ok(mut f) = open_private_append(&self.paths.logs().join(LOG_FILE)) {
-            let _ = writeln!(f, "{ts} {message}");
-        }
+        append_line(&self.paths.logs().join(LOG_FILE), message);
     }
 }
 
@@ -675,6 +676,8 @@ fn spawn_writer(shared: Arc<Shared>, redactor: Redactor, rx: Receiver<WriteJob>)
             Err(e) => shared.log(&format!("spool read failed: {e}")),
         }
         let mut pending = LaneQueue::default();
+        let mut swept = HashMap::new();
+        let mut last_catch_up: Option<Instant> = None;
         while !shared.stop.load(Ordering::SeqCst) {
             let mut disconnected = false;
             if pending.is_empty() {
@@ -747,9 +750,76 @@ fn spawn_writer(shared: Arc<Shared>, redactor: Redactor, rx: Receiver<WriteJob>)
             }
             if handled {
                 shared.writes_pending.fetch_sub(1, Ordering::SeqCst);
+            } else if last_catch_up.is_none_or(|t| t.elapsed() >= CATCH_UP_INTERVAL) {
+                catch_up_all(&shared, &redactor, &options, &mut swept);
+                last_catch_up = Some(Instant::now());
             }
         }
     })
+}
+
+/// hook 처리가 놓친 꼬리를 읽는다. 세션마다 마지막으로 읽은 (길이, 수정 시각)을 `swept`에 둔다. (FR-CAP-9)
+fn catch_up_all(
+    shared: &Shared,
+    redactor: &Redactor,
+    options: &IngestOptions,
+    swept: &mut HashMap<String, (u64, SystemTime)>,
+) {
+    let ids = match shared.project_ids() {
+        Ok(ids) => ids,
+        Err(e) => return shared.log(&format!("catch-up failed: {e}")),
+    };
+    for id in ids {
+        let opened = shared.records(&id).and_then(|records| {
+            let sessions = records.sessions().map_err(|e| e.to_string())?;
+            Ok((records, sessions))
+        });
+        let (mut records, sessions) = match opened {
+            Ok(opened) => opened,
+            Err(e) => {
+                shared.log(&format!("project {id}: catch-up failed: {e}"));
+                continue;
+            }
+        };
+        let mut changed = false;
+        for (session_id, path, state) in sessions {
+            if shared.stop.load(Ordering::SeqCst) {
+                return;
+            }
+            let Ok(meta) = fs::metadata(&path) else {
+                continue;
+            };
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+            let settled = modified.elapsed().is_ok_and(|age| age >= CATCH_UP_SETTLE);
+            let mark = (meta.len(), modified);
+            if !meta.is_file()
+                || meta.len() <= state.safe_offset
+                || !settled
+                || swept.get(&session_id) == Some(&mark)
+            {
+                continue;
+            }
+            swept.insert(session_id.clone(), mark);
+            match catch_up(
+                &mut records,
+                redactor,
+                options,
+                &session_id,
+                Path::new(&path),
+            ) {
+                Ok(report) => {
+                    shared.log(&capture_line("catch-up", &session_id, &id, &report));
+                    changed |= report.iterations + report.completions > 0;
+                }
+                Err(e) => shared.log(&format!("catch-up {session_id} failed: {e}")),
+            }
+        }
+        if changed {
+            shared.enqueue_pending(&id, &records);
+        }
+    }
 }
 
 /// 세션이 고정된 프로젝트. 고정값이 없으면 세션 시작 경로로 정해 기록한다.
@@ -787,16 +857,50 @@ fn ingest_session(
     options: &IngestOptions,
     req: &IngestRequest,
 ) -> Result<(), String> {
+    let kind = event_name(req.event);
     let Some(id) = session_project(shared, req)? else {
+        shared.log(&format!(
+            "capture {kind} session={} project=- skipped={SKIP_NO_START_PATH}",
+            req.session_id
+        ));
         return Ok(());
     };
     let mut records = shared.records(&id)?;
-    ingest(&mut records, redactor, options, req).map_err(|e| e.to_string())?;
+    let report = ingest(&mut records, redactor, options, req).map_err(|e| e.to_string())?;
+    shared.log(&capture_line(kind, &req.session_id, &id, &report));
     lock(&shared.registry)?
         .touch(&id, now_secs())
         .map_err(|e| e.to_string())?;
     shared.enqueue_pending(&id, &records);
     Ok(())
+}
+
+/// 세션 시작 경로를 아직 알 수 없어 처리하지 않음. (FR-OBS-2)
+const SKIP_NO_START_PATH: &str = "no-start-path";
+
+fn event_name(event: HookEvent) -> &'static str {
+    match event {
+        HookEvent::PostToolBatch => "post-tool-batch",
+        HookEvent::Stop => "stop",
+        HookEvent::StopFailure => "stop-failure",
+        HookEvent::SessionEnd => "session-end",
+    }
+}
+
+/// 수집 처리 한 건의 로그 줄. (FR-OBS-2)
+fn capture_line(kind: &str, session: &str, project: &str, report: &IngestReport) -> String {
+    let head = format!("capture {kind} session={session} project={project}");
+    if let Some(reason) = report.skipped {
+        return format!("{head} skipped={reason}");
+    }
+    let offset = |o: Option<u64>| o.map_or_else(|| "-".to_string(), |o| o.to_string());
+    format!(
+        "{head} saved={} completions={} offset={}->{}",
+        report.iterations,
+        report.completions,
+        offset(report.offset_before),
+        offset(report.offset_after)
+    )
 }
 
 /// 가져오기의 원본 경로와 그 프로젝트 위치. `from`이 프로젝트 id이면 그 프로젝트의 위치에서 정한다. (FR-IMP-2)
@@ -809,15 +913,7 @@ fn import_origin(shared: &Shared, from: &str) -> Result<(PathBuf, String), Strin
         None
     };
     Ok(match row {
-        Some(row) => {
-            let location = PathBuf::from(&row.location);
-            let path = match location.file_name() {
-                Some(name) if name == GIT_DIR_NAME => location.parent().map(Path::to_path_buf),
-                _ => None,
-            }
-            .unwrap_or(location);
-            (path, row.location)
-        }
+        Some(row) => (project_folder(&row.location), row.location),
         None => (normalize(Path::new(from)), shared.locate(from).path),
     })
 }
@@ -1036,6 +1132,14 @@ fn import_one(
         bound
     };
     let mut records = shared.records(project_id)?;
+    let offset = |records: &RecordStore| {
+        records
+            .session_state(session_id)
+            .ok()
+            .flatten()
+            .map(|s| s.safe_offset)
+    };
+    let offset_before = offset(&records);
     let report = match bound {
         Some(other) if other != project_id => ImportReport {
             outcome: ImportOutcome::OtherProject,
@@ -1043,8 +1147,20 @@ fn import_one(
             completions: 0,
             fork_skipped: 0,
         },
-        _ => import_session(&mut records, redactor, options, session_id, transcript_path)
-            .map_err(|e| e.to_string())?,
+        _ => {
+            let report =
+                import_session(&mut records, redactor, options, session_id, transcript_path)
+                    .map_err(|e| e.to_string())?;
+            let logged = IngestReport {
+                iterations: report.iterations,
+                completions: report.completions,
+                offset_before,
+                offset_after: offset(&records),
+                skipped: None,
+            };
+            shared.log(&capture_line("import", session_id, project_id, &logged));
+            report
+        }
     };
     shared.enqueue_pending(project_id, &records);
     let pending_embeds = records.counts().map_err(|e| e.to_string())?.embed_jobs;
@@ -1663,14 +1779,16 @@ fn inject(
         .session_project(session_id)
         .map_err(|e| e.to_string())?;
     let Some(id) = bound.map_or_else(|| shared.lookup(cwd), |id| Ok(Some(id)))? else {
+        shared.log(&format!("inject session={session_id} no-project"));
         return Ok(None);
     };
     let handle = shared.project(&id)?;
-    let records = shared.records(&id)?;
+    let mut records = shared.records(&id)?;
     let config = inject_config(shared);
     let budget = Duration::from_millis(budget_ms);
     let deadline = Instant::now() + budget;
-    let result = build_injection(
+    let at_ms = now_millis();
+    let result = run_injection(
         &records,
         handle.backends(
             shared.embedder.as_ref(),
@@ -1692,7 +1810,35 @@ fn inject(
             budget_ms
         ));
     }
-    result
+    let (outcome, reason, prompt_ids, chars) = match &result {
+        Ok(run) => (
+            run.outcome,
+            run.reason.map(|r| r.as_str().to_string()),
+            run.prompt_ids.clone(),
+            run.text.as_deref().map_or(0, |t| t.chars().count()),
+        ),
+        Err(_) => (InjectOutcome::Error, None, Vec::new(), 0),
+    };
+    let record = InjectionRecord {
+        session_id: session_id.to_string(),
+        at_ms,
+        outcome,
+        reason,
+        turns: prompt_ids.len(),
+        chars,
+        elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        prompt_ids,
+    };
+    if let Err(e) = records.record_injection(&record) {
+        shared.log(&format!("project {id}: recording injection failed: {e}"));
+    }
+    result.map(|run| run.text)
+}
+
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// 기록 탭이 다루는 프로젝트. 없으면 오류이다. (FR-GUI-13)
@@ -1953,9 +2099,10 @@ fn status(shared: &Shared) -> Result<StatusInfo, String> {
     let mut projects = Vec::new();
     for row in rows {
         let handle = shared.project(&row.id)?;
-        let counts = shared
-            .records(&row.id)?
-            .counts()
+        let records = shared.records(&row.id)?;
+        let counts = records.counts().map_err(|e| e.to_string())?;
+        let inject = records
+            .inject_stats(now_millis())
             .map_err(|e| e.to_string())?;
         let compatibility = match handle.compat() {
             Compatibility::Empty => "empty",
@@ -1963,6 +2110,7 @@ fn status(shared: &Shared) -> Result<StatusInfo, String> {
             Compatibility::Mismatch { .. } => COMPAT_MISMATCH,
         };
         projects.push(ProjectStatus {
+            inject,
             exists: Path::new(&row.location).exists(),
             embed_per_min: shared.embed_per_min(&row.id),
             id: row.id,

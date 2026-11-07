@@ -280,3 +280,12 @@ fn unbind_session_removes_only_binding_to_that_project() {
     r.unbind_session("s", &a).unwrap();
     assert_eq!(r.session_project("s").unwrap(), None);
 }
+
+#[test]
+fn project_folder_strips_git_dir() {
+    use hippo::registry::project_folder;
+    use std::path::PathBuf;
+    assert_eq!(project_folder("/w/repo/.git"), PathBuf::from("/w/repo"));
+    assert_eq!(project_folder("/w/notes"), PathBuf::from("/w/notes"));
+    assert_eq!(project_folder("/w/x.git"), PathBuf::from("/w/x.git"));
+}

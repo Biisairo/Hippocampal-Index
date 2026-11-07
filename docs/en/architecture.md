@@ -55,6 +55,8 @@ Tool calls that ran `hippo` (such as `hippo search`) are stored in the records b
 - These hooks run with `async: true`, so they do not slow down the session.
 - The hook input is only a signal. The content is read from the session transcript (JSONL).
 - `hippo` keeps a safe offset per session, so it never reads the same line twice or stores the same iteration twice.
+- Claude Code can run the `Stop` hook before it writes the last reply to the transcript. So the turn-end lines of the transcript (`turn_duration`, `stop_hook_summary`) also mark the end of an iteration.
+- When the daemon starts, and every 60 seconds after that, it reads again the sessions that have unread lines (catch-up). It reads only transcripts that have not changed for 5 seconds or more. So a last reply that a hook missed is stored without waiting for the next prompt.
 
 ### Live capture starts at the turn the hook reports
 
@@ -149,7 +151,8 @@ Hooks, CLI commands, and the app never open the DBs. They only send requests to 
 │  ├─ vectors/<name>/ACTIVE
 │  └─ vectors/<name>/<generation>/   LanceDB files
 ├─ spool/                     requests queued while the daemon was down
-├─ logs/hippo.log             daemon error log
+├─ logs/hippo.log             daemon log: errors, capture lines, injections with no project. Moved to hippo.log.1 past 5 MiB
+├─ logs/hook.log              hook results (delivered, spooled, injected chars, ...). Moved to hook.log.1 past 5 MiB
 ├─ logs/daemon.err            start-up errors of an auto-started daemon
 ├─ hippo.sock                 (0600) daemon socket
 └─ hippo.lock                 single-instance lock

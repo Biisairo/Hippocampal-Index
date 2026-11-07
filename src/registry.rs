@@ -2,7 +2,7 @@
 
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
@@ -310,6 +310,15 @@ fn add_roots(tx: &Transaction, id: &str, roots: &[String]) -> Result<()> {
 
 pub fn is_project_id(s: &str) -> bool {
     s.len() == PROJECT_ID_BYTES * 2 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// 프로젝트 위치의 폴더 경로. 위치가 `<경로>/.git`이면 `<경로>`이다. (FR-IMP-2, FR-GUI-7)
+pub fn project_folder(location: &str) -> PathBuf {
+    let location = Path::new(location);
+    match (location.file_name(), location.parent()) {
+        (Some(name), Some(parent)) if name == GIT_DIR_NAME => parent.to_path_buf(),
+        _ => location.to_path_buf(),
+    }
 }
 
 /// 무작위 128비트 값의 소문자 hex. (DR-1)

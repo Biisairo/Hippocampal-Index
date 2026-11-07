@@ -393,3 +393,59 @@ fn api_error_message_text_is_not_stored_as_response() {
         }]
     );
 }
+
+// ---- 턴 종료 표시 라인 (FR-EXT-7 d, FR-EXT-9) ----
+
+fn system_line(subtype: &str) -> String {
+    json!({"type": "system", "subtype": subtype, "sessionId": "S", "timestamp": "2026-11-02T00:00:02Z"})
+        .to_string()
+}
+
+fn text_turn(marker: &str) -> String {
+    joined(&[
+        user_line("u1", "P1", json!("질문")),
+        assistant_line("a1", "M1", json!([{"type": "text", "text": "답"}])),
+        system_line(marker),
+    ])
+}
+
+#[test]
+fn turn_end_markers_complete_the_open_iteration() {
+    for marker in ["turn_duration", "stop_hook_summary"] {
+        let mut ex = Extractor::new(ExtractorState::default());
+        let its = iterations(&feed_all(&mut ex, &text_turn(marker)));
+        assert_eq!(its.len(), 1, "{marker}");
+        assert_eq!(its[0].texts, vec!["답".to_string()]);
+        assert_eq!(its[0].prompt_id.as_deref(), Some("P1"));
+        assert!(iterations(&ex.finish_turn()).is_empty(), "이미 확정됨");
+    }
+}
+
+#[test]
+fn other_system_lines_do_not_complete_the_iteration() {
+    let mut ex = Extractor::new(ExtractorState::default());
+    let its = iterations(&feed_all(&mut ex, &text_turn("away_summary")));
+    assert!(its.is_empty());
+    assert_eq!(iterations(&ex.finish_turn()).len(), 1);
+}
+
+#[test]
+fn turn_end_marker_keeps_unattached_inputs() {
+    let content = joined(&[
+        user_line("u1", "P1", json!("첫 질문")),
+        assistant_line("a1", "M1", json!([{"type": "text", "text": "첫 답"}])),
+        user_line("u2", "P2", json!("둘째 질문")),
+        system_line("turn_duration"),
+        assistant_line("a2", "M2", json!([{"type": "text", "text": "둘째 답"}])),
+        system_line("turn_duration"),
+    ]);
+    let mut ex = Extractor::new(ExtractorState::default());
+    let its = iterations(&feed_all(&mut ex, &content));
+    assert_eq!(its.len(), 2);
+    assert_eq!(
+        its[1].inputs,
+        vec![IterationInput::Prompt {
+            text: "둘째 질문".into()
+        }]
+    );
+}

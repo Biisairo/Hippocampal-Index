@@ -42,9 +42,10 @@ use crate::layout::{
     InstallState, LinkState, default_claude_dir, install_state, link_state, path_link,
 };
 use crate::protocol::{
-    DeleteReport, Request, Response, Scope as QueryScope, StatusInfo, embed_progress,
+    DeleteReport, Request, Response, Scope as QueryScope, StatusInfo, embed_progress, inject_ratio,
     missing_location,
 };
+use crate::registry::project_folder;
 use crate::search::{HitView, InjectionPlan, IterationView, SearchKind};
 use crate::setup::home_dir;
 use crate::store::{Page, RecordKind, SessionSummary, TurnSummary};
@@ -65,6 +66,7 @@ const PATTERN_KIND_WIDTH: f32 = 110.0;
 const MODAL_WIDTH: f32 = 420.0;
 const DEFAULT_LIMIT: usize = 10;
 const BROWSE_WIDTH: f32 = 96.0;
+const PROJECT_MENU_WIDTH: f32 = 110.0;
 const RECORDS_SEARCH_LIMIT: usize = 20;
 const QUERY_HEIGHT: f32 = 220.0;
 const TS_CHARS: usize = 19;
@@ -462,6 +464,32 @@ fn path_input(
     });
 }
 
+/// 저장된 프로젝트를 골라 그 폴더 경로를 입력란에 넣는 목록. (FR-GUI-7)
+fn project_menu(
+    ui: &mut egui::Ui,
+    salt: &str,
+    projects: &[(String, String)],
+    text: &mut String,
+    lang: Lang,
+) {
+    ui.add_enabled_ui(!projects.is_empty(), |ui| {
+        egui::ComboBox::from_id_salt(salt)
+            .width(PROJECT_MENU_WIDTH)
+            .selected_text(tr!(lang, "Project", "프로젝트"))
+            .show_ui(ui, |ui| {
+                ui.set_min_width(TEXT_FIELD_WIDTH);
+                for (id, location) in projects {
+                    if ui
+                        .selectable_label(false, project_label(projects, id))
+                        .clicked()
+                    {
+                        *text = project_folder(location).to_string_lossy().into_owned();
+                    }
+                }
+            });
+    });
+}
+
 pub struct App {
     paths: Paths,
     cwd: String,
@@ -780,6 +808,14 @@ impl App {
         card(ui, &tr!(lang, "Projects", "프로젝트"), |ui| {
             project_table(ui, st, lang, self.art.character.as_ref());
         });
+        if !st.projects.is_empty() {
+            ui.add_space(4.0);
+            card(
+                ui,
+                &tr!(lang, "Injection (last 7 days)", "주입 (최근 7일)"),
+                |ui| inject_table(ui, st, lang),
+            );
+        }
     }
 
     fn settings_tab(&mut self, ui: &mut egui::Ui) {
@@ -1021,23 +1057,44 @@ impl App {
                     home: &self.home,
                     lang,
                 };
+                let projects: Vec<(String, String)> = match &self.status {
+                    Some(Ok(st)) => st
+                        .projects
+                        .iter()
+                        .map(|p| (p.id.clone(), p.location.clone()))
+                        .collect(),
+                    _ => Vec::new(),
+                };
                 let import = &mut self.import;
                 form(ui, "import-args", |ui, w| {
+                    let w = w - PROJECT_MENU_WIDTH - ui.spacing().item_spacing.x;
                     ui.label(tr!(lang, "From", "원본"));
                     ui.add_enabled_ui(!running, |ui| {
-                        path_input(
-                            ui,
-                            w,
-                            &mut import.from,
-                            &hint,
-                            PathField::ImportFrom,
-                            &mut browse,
-                        )
+                        ui.horizontal(|ui| {
+                            path_input(
+                                ui,
+                                w,
+                                &mut import.from,
+                                &hint,
+                                PathField::ImportFrom,
+                                &mut browse,
+                            );
+                            project_menu(
+                                ui,
+                                "import-from-project",
+                                &projects,
+                                &mut import.from,
+                                lang,
+                            );
+                        })
                     });
                     ui.end_row();
                     ui.label(tr!(lang, "To", "대상"));
                     ui.add_enabled_ui(!running, |ui| {
-                        path_input(ui, w, &mut import.to, "", PathField::ImportTo, &mut browse)
+                        ui.horizontal(|ui| {
+                            path_input(ui, w, &mut import.to, "", PathField::ImportTo, &mut browse);
+                            project_menu(ui, "import-to-project", &projects, &mut import.to, lang);
+                        })
                     });
                     ui.end_row();
                 });
@@ -2537,9 +2594,13 @@ fn iteration_view(ui: &mut egui::Ui, it: &IterationView, lang: Lang) {
         Lang::En => ("[input]", "[response]", "result"),
         Lang::Ko => ("[입력]", "[응답]", "결과"),
     };
+    let stored = it
+        .stored_label()
+        .map(|l| format!("  {l}"))
+        .unwrap_or_default();
     ui.label(
         RichText::new(format!(
-            "[{}] {}  {}",
+            "[{}] {}  {}{stored}",
             it.iteration_index,
             ts_label(&it.ts),
             short(&it.session_id)
@@ -2664,6 +2725,71 @@ fn project_table(
                     row.col(|ui| cell(ui, &rate_text(p.embed_jobs, p.embed_per_min, lang)));
                     row.col(|ui| cell(ui, &p.vectors.to_string()));
                     row.col(|ui| cell(ui, &p.compatibility));
+                });
+            }
+        });
+}
+
+/// 프로젝트별 최근 7일 주입 통계와 에이전트의 기억 활용. (FR-OBS-7)
+fn inject_table(ui: &mut egui::Ui, st: &StatusInfo, lang: Lang) {
+    let heads = [
+        "id".to_string(),
+        tr!(lang, "requests", "요청"),
+        tr!(lang, "injected", "주입"),
+        tr!(lang, "no match", "후보 없음"),
+        tr!(lang, "skipped (reason)", "무주입 (사유)"),
+        tr!(lang, "timeout", "시간 초과"),
+        tr!(lang, "error", "오류"),
+        tr!(lang, "opened", "열람"),
+        tr!(lang, "search", "검색"),
+        tr!(lang, "show", "show"),
+    ];
+    TableBuilder::new(ui)
+        .id_salt("inject-table")
+        .striped(true)
+        .resizable(true)
+        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+        .column(Column::auto().at_least(80.0))
+        .columns(Column::auto().at_least(60.0), 3)
+        .column(Column::remainder().at_least(200.0).clip(true))
+        .columns(Column::auto().at_least(60.0), 5)
+        .header(ROW_HEIGHT, |mut header| {
+            for head in &heads {
+                header.col(|ui| {
+                    ui.strong(head);
+                });
+            }
+        })
+        .body(|mut body| {
+            for p in &st.projects {
+                let s = &p.inject;
+                let injected = match inject_ratio(s) {
+                    Some(p) => format!("{} ({p}%)", s.injected),
+                    None => s.injected.to_string(),
+                };
+                let reasons: Vec<String> = s
+                    .skip_reasons
+                    .iter()
+                    .map(|(r, n)| format!("{r} {n}"))
+                    .collect();
+                let skipped = if reasons.is_empty() {
+                    s.skipped.to_string()
+                } else {
+                    format!("{} ({})", s.skipped, reasons.join(", "))
+                };
+                body.row(ROW_HEIGHT, |mut row| {
+                    row.col(|ui| {
+                        mono_cell(ui, &p.id.chars().take(SESSION_ID_SHORT).collect::<String>())
+                    });
+                    row.col(|ui| cell(ui, &s.requests.to_string()));
+                    row.col(|ui| cell(ui, &injected));
+                    row.col(|ui| cell(ui, &s.no_match.to_string()));
+                    row.col(|ui| cell(ui, &skipped));
+                    row.col(|ui| cell(ui, &s.timeout.to_string()));
+                    row.col(|ui| cell(ui, &s.error.to_string()));
+                    row.col(|ui| cell(ui, &s.opened.to_string()));
+                    row.col(|ui| cell(ui, &s.search.to_string()));
+                    row.col(|ui| cell(ui, &s.show.to_string()));
                 });
             }
         });

@@ -58,6 +58,7 @@ Shows the daemon and embedding progress, refreshed every 2 seconds.
 | Daemon, Spool pending, Reindex, Embedding model | Daemon state, requests queued while the daemon was down, reindex state, the embedding model in use |
 | **Embedding queue** | Pending embeddings in all projects, split into live and import work. If work was done in the last 5 minutes, the rate and time left are shown too |
 | **Projects** table | Per project: iteration and result counts, live and import queues, rate and time left, vector count, compatibility (`empty`, `compatible`, `mismatch`) |
+| **Injection (last 7 days)** table | Per project: automatic injection requests, injections (and ratio), no match, skipped (by reason), timeouts, errors. And how the agent used memory: **opened** (ran `hippo show` on a turn it was given), **search** (`hippo search`), **show** (any other `hippo show`) |
 
 While the window is open, the daemon does not stop for being idle.
 
@@ -145,6 +146,7 @@ Brings in conversations from before you installed `hippo`, or from before you mo
 
 1. **From**: the folder where the conversations took place. It does not need to exist now. For a git repository, sessions opened in its worktrees are included.
 2. **To**: the folder of the project that receives the records. Usually the same as From. If you moved a folder, put the old path in From and the new path in To.
+   - The **Project** list on the right of both fields shows the stored projects. Pick one to put its folder path in the field.
 3. Press **Preview**. It changes nothing. It shows what will happen (create a project, move a location, merge) and the **Candidate sessions** table.
 4. Choose the sessions to import in the table. Sessions that are `new` or `live-only` are selected at first.
 5. Press **Import N selected**. **Stop** stops after the session in progress.
