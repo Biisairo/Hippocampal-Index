@@ -12,15 +12,14 @@ fn hippo(root: &Path, args: &[&str], stdin: &str) -> Output {
     hippo_in(root, Path::new("/"), args, stdin)
 }
 
-/// 데이터 루트는 실행 파일 위치로 정하므로, `<root>/bin/hippo`에 빌드한 실행 파일의 하드 링크를 둔다.
-/// 하드 링크를 만들 수 없으면 복사한다. (FR-ROOT-2)
+/// 데이터 루트는 실행 파일 위치로 정하므로, `<root>/bin/hippo`에 빌드한 실행 파일의 복사본을 둔다.
+/// 하드 링크는 inode를 공유하므로, 병렬 테스트가 새 경로로 동시에 실행하면 macOS AMFI가 서명 검사에
+/// 실패해 프로세스를 SIGKILL로 끝내는 일이 있다. (FR-ROOT-2)
 fn installed_bin(root: &Path) -> PathBuf {
     let bin = root.join("bin/hippo");
     if !bin.exists() {
         fs::create_dir_all(bin.parent().unwrap()).unwrap();
-        if fs::hard_link(BIN, &bin).is_err() {
-            fs::copy(BIN, &bin).unwrap();
-        }
+        fs::copy(BIN, &bin).unwrap();
     }
     bin
 }
