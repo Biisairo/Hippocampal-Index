@@ -222,6 +222,33 @@ fn candidate_carries_preview_info() {
 }
 
 #[test]
+fn candidate_entrypoint_is_the_first_top_level_entrypoint() {
+    let f = fixture();
+    let repo = f.base.join("repo");
+    let body = lines(&[
+        json!({"type": "queue-operation", "timestamp": "2026-10-01T00:00:00Z", "message": {"entrypoint": "nested"}}),
+        user_line(
+            Some(&repo),
+            json!({"entrypoint": "sdk-py", "message": {"role": "user", "content": "hi"}}),
+        ),
+        user_line(
+            None,
+            json!({"entrypoint": "cli", "message": {"role": "user", "content": "again"}}),
+        ),
+    ]);
+    put(&f.transcripts, "slug", "s1", &body);
+    let body = lines(&[user_line(
+        Some(&repo),
+        json!({"entrypoint": 3, "message": {"role": "user", "content": "x"}}),
+    )]);
+    put(&f.transcripts, "slug", "s2", &body);
+    let locate = fake_locate(f.base.clone());
+    let found = candidates(&f.transcripts, &repo, &locate(&repo).path, &locate, &keep);
+    let entry: Vec<&str> = found.iter().map(|c| c.entrypoint.as_str()).collect();
+    assert_eq!(entry, vec!["sdk-py", ""]);
+}
+
+#[test]
 fn first_prompt_is_masked_before_cut_to_80_chars() {
     let f = fixture();
     let repo = f.base.join("repo");
@@ -295,6 +322,7 @@ fn candidate(id: &str, status: ImportStatus, prompt: &str) -> Candidate {
         size: 2_560,
         first_prompt: prompt.into(),
         status,
+        entrypoint: "cli".into(),
     }
 }
 

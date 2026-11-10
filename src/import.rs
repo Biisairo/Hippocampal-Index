@@ -19,6 +19,7 @@ const PROMPT_PREVIEW_CHARS: usize = 80;
 const TASK_NOTIFICATION: &str = "<task-notification>";
 const SESSION_ID_SHORT: usize = 8;
 const KIB: u64 = 1024;
+const SDK_ENTRYPOINT_PREFIX: &str = "sdk-";
 
 /// 후보 세션과 대상 프로젝트의 관계. (FR-IMP-8)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +63,16 @@ pub struct Candidate {
     pub first_prompt: String,
     #[serde(default)]
     pub status: ImportStatus,
+    /// 첫 최상위 `entrypoint`. 없으면 비어 있다. (FR-IMP-8)
+    #[serde(default)]
+    pub entrypoint: String,
+}
+
+impl Candidate {
+    /// 실행 방식이 `sdk-`로 시작하는 세션. (FR-GUI-7)
+    pub fn is_sdk(&self) -> bool {
+        self.entrypoint.starts_with(SDK_ENTRYPOINT_PREFIX)
+    }
 }
 
 /// `pin`은 세션 고정값, `owners`는 대상 프로젝트로 볼 프로젝트들, `state`는 그 저장소의 세션 상태이다. (FR-IMP-8, FR-IMP-9)
@@ -121,6 +132,7 @@ pub fn candidates(
                     size: bytes.len() as u64,
                     first_prompt,
                     status: ImportStatus::New,
+                    entrypoint: entrypoint(&bytes).unwrap_or_default(),
                 },
             ))
         })
@@ -155,6 +167,16 @@ fn first_timestamp(bytes: &[u8]) -> Option<String> {
 }
 
 /// timestamp가 없는 transcript의 정렬 키. `~`는 숫자보다 뒤이므로 timestamp가 있는 것 뒤에 수정 시각 순으로 온다.
+fn entrypoint(bytes: &[u8]) -> Option<String> {
+    bytes.split(|b| *b == b'\n').find_map(|raw| {
+        serde_json::from_slice::<Value>(raw)
+            .ok()?
+            .get("entrypoint")?
+            .as_str()
+            .map(str::to_string)
+    })
+}
+
 fn modified(path: &Path) -> String {
     let secs = fs::metadata(path)
         .and_then(|m| m.modified())

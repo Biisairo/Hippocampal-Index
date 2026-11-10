@@ -1212,7 +1212,7 @@ impl App {
                 "Candidate sessions ({} of {} selected)",
                 "후보 세션 ({}개 중 {}개 선택)",
                 self.import.selected_ids().len(),
-                self.import.candidates.len()
+                self.import.visible_count()
             );
             card(ui, &title, |ui| {
                 ui.horizontal(|ui| {
@@ -1221,6 +1221,14 @@ impl App {
                     }
                     if ui.button(tr!(lang, "Select none", "전체 해제")).clicked() {
                         self.import.set_all(false);
+                    }
+                    ui.checkbox(
+                        &mut self.import.show_sdk,
+                        tr!(lang, "Show SDK sessions", "SDK 세션 보기"),
+                    );
+                    let hidden = self.import.hidden_count();
+                    if hidden > 0 {
+                        ui.weak(tr!(lang, "{} hidden", "{}개 숨김", hidden));
                     }
                 });
                 candidate_table(ui, &mut self.import, lang);
@@ -2848,6 +2856,7 @@ fn candidate_table(ui: &mut egui::Ui, form: &mut ImportForm, lang: Lang) {
         tr!(lang, "started", "시작 시각"),
         "session".to_string(),
         tr!(lang, "status", "상태"),
+        tr!(lang, "entrypoint", "실행 방식"),
         tr!(lang, "size", "크기"),
         tr!(lang, "start path", "시작 경로"),
         tr!(lang, "first prompt", "첫 프롬프트"),
@@ -2863,6 +2872,7 @@ fn candidate_table(ui: &mut egui::Ui, form: &mut ImportForm, lang: Lang) {
         .column(Column::auto().at_least(80.0))
         .column(Column::auto().at_least(90.0))
         .column(Column::auto().at_least(70.0))
+        .column(Column::auto().at_least(70.0))
         .column(Column::initial(240.0).at_least(80.0).clip(true))
         .column(Column::remainder().at_least(160.0).clip(true))
         .header(ROW_HEIGHT, |mut header| {
@@ -2873,7 +2883,13 @@ fn candidate_table(ui: &mut egui::Ui, form: &mut ImportForm, lang: Lang) {
             }
         })
         .body(|mut body| {
-            for (c, on) in form.candidates.iter().zip(form.selected.iter_mut()) {
+            let show_sdk = form.show_sdk;
+            for (c, on) in form
+                .candidates
+                .iter()
+                .zip(form.selected.iter_mut())
+                .filter(|(c, _)| show_sdk || !c.is_sdk())
+            {
                 body.row(ROW_HEIGHT, |mut row| {
                     row.col(|ui| {
                         ui.checkbox(on, "");
@@ -2898,6 +2914,7 @@ fn candidate_table(ui: &mut egui::Ui, form: &mut ImportForm, lang: Lang) {
                         };
                         ui.colored_label(color, c.status.label(lang));
                     });
+                    row.col(|ui| cell(ui, &c.entrypoint));
                     row.col(|ui| cell(ui, &size_label(c.size)));
                     row.col(|ui| cell(ui, &c.start_cwd));
                     row.col(|ui| cell(ui, &c.first_prompt));

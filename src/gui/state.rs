@@ -106,6 +106,8 @@ pub struct ImportForm {
     pub summary: String,
     pub candidates: Vec<Candidate>,
     pub selected: Vec<bool>,
+    /// SDK 세션도 후보 표에 보일지. 미리 보기를 다시 해도 유지한다.
+    pub show_sdk: bool,
     previewed: Option<(String, String)>,
 }
 
@@ -118,7 +120,7 @@ impl ImportForm {
         }
     }
 
-    /// 미리 보기 결과를 넣는다. `새 세션`과 `실시간만`을 처음에 선택한다.
+    /// 미리 보기 결과를 넣는다. SDK 세션이 아닌 `새 세션`과 `실시간만`을 처음에 선택한다.
     pub fn apply_preview(
         &mut self,
         from: String,
@@ -128,7 +130,7 @@ impl ImportForm {
     ) {
         self.selected = candidates
             .iter()
-            .map(|c| matches!(c.status, ImportStatus::New | ImportStatus::LiveOnly))
+            .map(|c| !c.is_sdk() && matches!(c.status, ImportStatus::New | ImportStatus::LiveOnly))
             .collect();
         self.candidates = candidates;
         self.summary = summary;
@@ -142,15 +144,37 @@ impl ImportForm {
             .is_some_and(|(from, to)| *from == self.from && *to == self.to)
     }
 
-    pub fn set_all(&mut self, on: bool) {
-        self.selected.iter_mut().for_each(|s| *s = on);
+    pub fn is_visible(&self, c: &Candidate) -> bool {
+        self.show_sdk || !c.is_sdk()
     }
 
+    pub fn visible_count(&self) -> usize {
+        self.candidates
+            .iter()
+            .filter(|c| self.is_visible(c))
+            .count()
+    }
+
+    pub fn hidden_count(&self) -> usize {
+        self.candidates.len() - self.visible_count()
+    }
+
+    /// 보이는 후보만 바꾼다. 숨긴 후보의 선택 값은 유지한다.
+    pub fn set_all(&mut self, on: bool) {
+        let show_sdk = self.show_sdk;
+        self.candidates
+            .iter()
+            .zip(self.selected.iter_mut())
+            .filter(|(c, _)| show_sdk || !c.is_sdk())
+            .for_each(|(_, s)| *s = on);
+    }
+
+    /// 선택한 보이는 후보의 session id.
     pub fn selected_ids(&self) -> Vec<String> {
         self.candidates
             .iter()
             .zip(&self.selected)
-            .filter(|(_, on)| **on)
+            .filter(|(c, on)| **on && self.is_visible(c))
             .map(|(c, _)| c.session_id.clone())
             .collect()
     }

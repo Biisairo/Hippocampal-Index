@@ -12,6 +12,10 @@ use hippo::ingest::ImportOutcome;
 use hippo::protocol::{ImportSessionReport, Request, Response};
 
 fn candidate(id: &str, status: ImportStatus) -> Candidate {
+    entry_candidate(id, status, "cli")
+}
+
+fn entry_candidate(id: &str, status: ImportStatus, entrypoint: &str) -> Candidate {
     Candidate {
         session_id: id.into(),
         transcript_path: PathBuf::from(format!("/t/{id}.jsonl")),
@@ -20,6 +24,7 @@ fn candidate(id: &str, status: ImportStatus) -> Candidate {
         size: 1,
         first_prompt: String::new(),
         status,
+        entrypoint: entrypoint.into(),
     }
 }
 
@@ -68,6 +73,77 @@ fn preview_selects_new_and_live_only_sessions() {
     assert_eq!(form.selected_ids().len(), 4);
     form.set_all(false);
     assert!(form.selected_ids().is_empty());
+}
+
+fn sdk_form() -> ImportForm {
+    let mut form = ImportForm::new("/w");
+    let sessions = vec![
+        entry_candidate("a", ImportStatus::New, "cli"),
+        entry_candidate("b", ImportStatus::New, "sdk-py"),
+        entry_candidate("c", ImportStatus::LiveOnly, "sdk-cli"),
+        entry_candidate("d", ImportStatus::New, ""),
+        entry_candidate("e", ImportStatus::Imported, "sdk-py"),
+    ];
+    form.apply_preview("/w".into(), "/w".into(), String::new(), sessions);
+    form
+}
+
+#[test]
+fn sdk_sessions_are_not_selected_and_hidden_by_default() {
+    let form = sdk_form();
+    assert!(!form.show_sdk);
+    assert_eq!(form.selected, vec![true, false, false, true, false]);
+    assert_eq!(form.visible_count(), 2);
+    assert_eq!(form.hidden_count(), 3);
+    assert_eq!(form.selected_ids(), vec!["a", "d"]);
+}
+
+#[test]
+fn select_all_and_import_cover_only_visible_sessions() {
+    let mut form = sdk_form();
+    form.set_all(false);
+    assert!(form.selected_ids().is_empty());
+    form.set_all(true);
+    assert_eq!(form.selected_ids(), vec!["a", "d"]);
+    assert_eq!(form.selected, vec![true, false, false, true, false]);
+
+    form.show_sdk = true;
+    assert_eq!((form.visible_count(), form.hidden_count()), (5, 0));
+    assert_eq!(form.selected_ids(), vec!["a", "d"]);
+    form.set_all(true);
+    assert_eq!(form.selected_ids(), vec!["a", "b", "c", "d", "e"]);
+}
+
+#[test]
+fn hidden_selection_is_kept_and_show_sdk_survives_new_preview() {
+    let mut form = sdk_form();
+    form.show_sdk = true;
+    form.selected[1] = true;
+    form.show_sdk = false;
+    assert_eq!(form.selected_ids(), vec!["a", "d"]);
+    assert!(form.selected[1]);
+    form.show_sdk = true;
+    assert_eq!(form.selected_ids(), vec!["a", "b", "d"]);
+
+    form.apply_preview(
+        "/w".into(),
+        "/w".into(),
+        String::new(),
+        vec![entry_candidate("x", ImportStatus::New, "sdk-py")],
+    );
+    assert!(form.show_sdk);
+    assert_eq!(form.selected, vec![false]);
+}
+
+#[test]
+fn sdk_session_is_an_entrypoint_starting_with_sdk_dash() {
+    let sdk = |e: &str| entry_candidate("s", ImportStatus::New, e).is_sdk();
+    assert!(sdk("sdk-py"));
+    assert!(sdk("sdk-ts"));
+    assert!(sdk("sdk-cli"));
+    assert!(!sdk("cli"));
+    assert!(!sdk(""));
+    assert!(!sdk("sdk"));
 }
 
 #[test]

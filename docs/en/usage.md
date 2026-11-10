@@ -148,7 +148,7 @@ Brings in conversations from before you installed `hippo`, or from before you mo
 2. **To**: the folder of the project that receives the records. Usually the same as From. If you moved a folder, put the old path in From and the new path in To.
    - The **Project** list on the right of both fields shows the stored projects. Pick one to put its folder path in the field.
 3. Press **Preview**. It changes nothing. It shows what will happen (create a project, move a location, merge) and the **Candidate sessions** table.
-4. Choose the sessions to import in the table. Sessions that are `new` or `live-only` are selected at first.
+4. Choose the sessions to import in the table. Sessions that are `new` or `live-only` are selected at first. SDK sessions are not selected at first.
 5. Press **Import N selected**. **Stop** stops after the session in progress.
 
 The **status** column of the candidate table is one of these:
@@ -160,6 +160,8 @@ The **status** column of the candidate table is one of these:
 | `imported` | Already fully imported |
 | `other project` | Pinned to another project. Skipped |
 
+- **entrypoint** is the `entrypoint` value in the transcript. Sessions opened in a terminal are `cli`.
+- Sessions whose entrypoint starts with `sdk-` (SDK sessions) are hidden from the table. Most of them are sessions started by the Agent SDK, such as automatic security reviews. These sessions do not run hooks, so they are not captured live and stay `new`. Turn on **Show SDK sessions** to show them. The number of hidden sessions is shown next to it. **Select all**, **Select none**, and the import apply only to the sessions shown in the table.
 - The first prompt is shown with secrets masked, and only its start.
 - You can follow the embedding progress of imported records in the **Import** queue of the [Status tab](#status-tab). The daemon handles live work before import work, so new conversations are still saved and searchable on time during an import.
 - You can stop at any time. Importing again skips finished sessions and continues with the rest.
