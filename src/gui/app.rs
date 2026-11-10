@@ -1210,7 +1210,7 @@ impl App {
             let title = tr!(
                 lang,
                 "Candidate sessions ({} of {} selected)",
-                "후보 세션 ({}개 중 {}개 선택)",
+                "후보 세션 ({1}개 중 {0}개 선택)",
                 self.import.selected_ids().len(),
                 self.import.visible_count()
             );
