@@ -1,6 +1,6 @@
 [package]
 name = "hippo"
-version = "0.0.2"
+version = "0.0.3"
 description = "Hippocampal Index: long-term memory for Claude Code sessions"
 edition = "2024"
 license = "MIT"
