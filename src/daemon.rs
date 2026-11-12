@@ -1091,7 +1091,7 @@ fn annotated_candidates(
         let state = stores
             .iter()
             .find_map(|r| r.session_state(&c.session_id).ok().flatten());
-        c.status = import_status(pin.as_deref(), owners, state.as_ref());
+        c.status = import_status(pin.as_deref(), owners, state.as_ref(), c.prompt_offset);
     }
     Ok(sessions)
 }

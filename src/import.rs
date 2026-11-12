@@ -66,6 +66,9 @@ pub struct Candidate {
     /// 첫 최상위 `entrypoint`. 없으면 비어 있다. (FR-IMP-8)
     #[serde(default)]
     pub entrypoint: String,
+    /// `promptId`가 있는 첫 user 라인의 시작 위치. 가져오기 상태를 정하는 데만 쓴다. (FR-IMP-8)
+    #[serde(skip)]
+    pub prompt_offset: Option<u64>,
 }
 
 impl Candidate {
@@ -75,18 +78,20 @@ impl Candidate {
     }
 }
 
-/// `pin`은 세션 고정값, `owners`는 대상 프로젝트로 볼 프로젝트들, `state`는 그 저장소의 세션 상태이다. (FR-IMP-8, FR-IMP-9)
+/// `pin`은 세션 고정값, `owners`는 대상 프로젝트로 볼 프로젝트들, `state`는 그 저장소의 세션 상태,
+/// `prompt_offset`은 `promptId`가 있는 첫 user 라인의 시작 위치이다. (FR-IMP-8, FR-IMP-9)
 pub fn import_status(
     pin: Option<&str>,
     owners: &[&str],
     state: Option<&ExtractorState>,
+    prompt_offset: Option<u64>,
 ) -> ImportStatus {
     if pin.is_some_and(|p| !owners.contains(&p)) {
         return ImportStatus::OtherProject;
     }
     match state {
         None => ImportStatus::New,
-        Some(s) if s.start_offset > 0 => ImportStatus::LiveOnly,
+        Some(s) if prompt_offset.is_some_and(|p| s.start_offset > p) => ImportStatus::LiveOnly,
         Some(_) => ImportStatus::Imported,
     }
 }
@@ -133,6 +138,7 @@ pub fn candidates(
                     first_prompt,
                     status: ImportStatus::New,
                     entrypoint: entrypoint(&bytes).unwrap_or_default(),
+                    prompt_offset: prompt_offset(&bytes),
                 },
             ))
         })
@@ -175,6 +181,23 @@ fn entrypoint(bytes: &[u8]) -> Option<String> {
             .as_str()
             .map(str::to_string)
     })
+}
+
+fn prompt_offset(bytes: &[u8]) -> Option<u64> {
+    let mut pos = 0u64;
+    for raw in bytes.split_inclusive(|b| *b == b'\n') {
+        let start = pos;
+        pos += raw.len() as u64;
+        let Ok(v) = serde_json::from_slice::<Value>(raw) else {
+            continue;
+        };
+        if v.get("type").and_then(Value::as_str) == Some("user")
+            && v.get("promptId").and_then(Value::as_str).is_some()
+        {
+            return Some(start);
+        }
+    }
+    None
 }
 
 fn modified(path: &Path) -> String {

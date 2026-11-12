@@ -25,6 +25,7 @@ fn entry_candidate(id: &str, status: ImportStatus, entrypoint: &str) -> Candidat
         first_prompt: String::new(),
         status,
         entrypoint: entrypoint.into(),
+        prompt_offset: None,
     }
 }
 

@@ -202,6 +202,7 @@ fn protocol_roundtrip() {
                 first_prompt: "hi".into(),
                 status: ImportStatus::LiveOnly,
                 entrypoint: "sdk-py".into(),
+                prompt_offset: None,
             }],
         },
         Response::ImportSession(ImportSessionReport {

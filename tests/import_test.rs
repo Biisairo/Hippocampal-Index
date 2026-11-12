@@ -292,25 +292,79 @@ fn state(start_offset: u64) -> ExtractorState {
 #[test]
 fn import_status_follows_pin_and_start_offset() {
     let target = ["T"];
-    assert_eq!(import_status(None, &target, None), ImportStatus::New);
-    assert_eq!(import_status(Some("T"), &target, None), ImportStatus::New);
     assert_eq!(
-        import_status(Some("T"), &target, Some(&state(10))),
+        import_status(None, &target, None, Some(0)),
+        ImportStatus::New
+    );
+    assert_eq!(
+        import_status(Some("T"), &target, None, Some(0)),
+        ImportStatus::New
+    );
+    assert_eq!(
+        import_status(Some("T"), &target, Some(&state(10)), Some(0)),
         ImportStatus::LiveOnly
     );
     assert_eq!(
-        import_status(Some("T"), &target, Some(&state(0))),
+        import_status(Some("T"), &target, Some(&state(0)), Some(0)),
         ImportStatus::Imported
     );
     assert_eq!(
-        import_status(Some("X"), &target, Some(&state(0))),
+        import_status(Some("X"), &target, Some(&state(0)), Some(0)),
         ImportStatus::OtherProject
     );
     assert_eq!(
-        import_status(Some("S"), &["T", "S"], Some(&state(0))),
+        import_status(Some("S"), &["T", "S"], Some(&state(0)), Some(0)),
         ImportStatus::Imported,
         "병합 예정 원본의 세션은 대상으로 봄"
     );
+}
+
+#[test]
+fn import_status_ignores_metadata_lines_before_first_prompt() {
+    let target = ["T"];
+    assert_eq!(
+        import_status(Some("T"), &target, Some(&state(8_444)), Some(8_444)),
+        ImportStatus::Imported,
+        "첫 프롬프트부터 저장한 세션"
+    );
+    assert_eq!(
+        import_status(Some("T"), &target, Some(&state(9_000)), Some(8_444)),
+        ImportStatus::LiveOnly,
+        "앞에 프롬프트가 있음"
+    );
+    assert_eq!(
+        import_status(Some("T"), &target, Some(&state(10)), None),
+        ImportStatus::Imported,
+        "프롬프트 라인이 없음"
+    );
+}
+
+#[test]
+fn candidate_carries_first_prompt_line_offset() {
+    let f = fixture();
+    let repo = f.base.join("repo");
+    let head = lines(&[
+        json!({"type": "permission-mode", "permissionMode": "auto"}),
+        json!({"type": "attachment", "cwd": repo.to_string_lossy(), "timestamp": "2026-10-01T00:00:00Z"}),
+        json!({"type": "file-history-snapshot", "snapshot": {}}),
+        user_line(
+            Some(&repo),
+            json!({"message": {"role": "user", "content": "no prompt id"}}),
+        ),
+    ]);
+    let body = format!(
+        "{head}{}",
+        lines(&[user_line(
+            Some(&repo),
+            json!({"promptId": "p1", "message": {"role": "user", "content": "hi"}}),
+        )])
+    );
+    put(&f.transcripts, "slug", "s1", &body);
+    put(&f.transcripts, "slug", "s2", &head);
+    let locate = fake_locate(f.base.clone());
+    let found = candidates(&f.transcripts, &repo, &locate(&repo).path, &locate, &keep);
+    let offsets: Vec<Option<u64>> = found.iter().map(|c| c.prompt_offset).collect();
+    assert_eq!(offsets, vec![Some(head.len() as u64), None]);
 }
 
 fn candidate(id: &str, status: ImportStatus, prompt: &str) -> Candidate {
@@ -323,6 +377,7 @@ fn candidate(id: &str, status: ImportStatus, prompt: &str) -> Candidate {
         first_prompt: prompt.into(),
         status,
         entrypoint: "cli".into(),
+        prompt_offset: None,
     }
 }
 
